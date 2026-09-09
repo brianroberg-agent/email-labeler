@@ -77,7 +77,8 @@ or our own config/code): no strikes for anyone, get loud, keep the backlog.
 (e.g. its LLM provider's balance) stops that function loudly; the other
 function continues. A halt is not permanent: the halted function re-probes
 its provider on a slow schedule and resumes when it answers, and the operator
-is notified at halt and at resume (registry D22).
+is notified at halt and at resume when `NTFY_URL`/`NTFY_TOKEN` are configured
+(registry D22); otherwise the halt is logged only.
 
 The registry entry D5 lists the corollaries — all implemented (Wave 2), each
 naming its commit. The code obeys this model; a deviation from it is a bug,
