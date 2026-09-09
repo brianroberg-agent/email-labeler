@@ -101,6 +101,72 @@ class TestInferGroundTruth:
         assert sender_type == ""
         assert label == ""
 
+    # Issue #84: a thread the daemon upgraded (e.g. fyi -> needs_response) carries BOTH
+    # classification labels, and Gmail's labelIds are unordered. Ground truth must be
+    # the highest-priority label regardless of listing order, never last-wins.
+
+    def test_two_labels_needs_response_listed_first(self):
+        messages = [{"labelIds": ["Label_1", "Label_2"]}]  # needs_response, fyi
+        _, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
+        assert label == "needs_response"
+
+    def test_two_labels_needs_response_listed_last(self):
+        messages = [{"labelIds": ["Label_2", "Label_1"]}]  # fyi, needs_response
+        _, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
+        assert label == "needs_response"
+
+    def test_three_labels_across_messages_prefers_highest(self):
+        """Lower labels listed later, on later messages, must not win."""
+        messages = [
+            {"labelIds": ["Label_1", "Label_4"]},  # needs_response on the first message
+            {"labelIds": ["Label_2"]},  # fyi added later
+            {"labelIds": ["Label_3"]},  # low_priority added later still
+        ]
+        _, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
+        assert label == "needs_response"
+
+    def test_fyi_beats_low_priority_either_order(self):
+        for ids in (["Label_2", "Label_3"], ["Label_3", "Label_2"]):
+            _, label = infer_ground_truth([{"labelIds": ids}], LABEL_ID_TO_NAME, LABELS_CONFIG)
+            assert label == "fyi", ids
+
+    def test_priority_parity_with_daemon(self):
+        """Harvest's preference must equal the daemon's own never-downgrade rule.
+
+        Oracle: ``LabelManager.get_existing_priority`` ranks the same labelIds; the
+        harvest answer must be the label at that rank in ``labeler._PRIORITY_ORDER``
+        (or "" when the daemon sees no classification label). Every subset of the
+        three labels, in every order, so the two cannot drift apart silently.
+        """
+        # Imports are local so this test adds no module-level import lines (PR #76
+        # rewrites this file's import block; keeping the rebase trivial).
+        from itertools import permutations
+        from unittest.mock import MagicMock
+
+        from classifier import EmailLabel
+        from evals.harvest import _CLASSIFICATION_LABELS
+        from labeler import _PRIORITY_ORDER, LabelManager
+
+        # Vocabulary parity: a daemon label harvest does not know would be silently
+        # ignored; a harvest label the daemon does not know has no priority.
+        assert set(_CLASSIFICATION_LABELS) == {e.value for e in EmailLabel}
+        assert set(_PRIORITY_ORDER) == set(EmailLabel)
+
+        lm = LabelManager(MagicMock(), {"labels": LABELS_CONFIG})
+        lm.label_ids = {name: label_id for label_id, name in LABEL_ID_TO_NAME.items()}
+
+        classification_ids = ["Label_1", "Label_2", "Label_3"]
+        checked = 0
+        for n in range(len(classification_ids) + 1):
+            for ids in permutations(classification_ids, n):
+                messages = [{"labelIds": ["Label_5", *ids, "Label_4"]}]
+                rank = lm.get_existing_priority(messages)
+                expected = _PRIORITY_ORDER[rank].value if rank is not None else ""
+                _, label = infer_ground_truth(messages, LABEL_ID_TO_NAME, LABELS_CONFIG)
+                assert label == expected, (ids, label, expected)
+                checked += 1
+        assert checked == 16  # 1 + 3 + 6 + 6 orderings
+
 
 class TestDeduplicate:
     def _make_golden(self, thread_id: str) -> GoldenThread:
