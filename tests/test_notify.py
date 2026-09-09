@@ -61,6 +61,45 @@ class TestFromEnv:
         assert HaltNotifier.from_env().enabled is False
 
 
+class TestNoRealNetwork:
+    """The suite must never POST to a real ntfy topic (review of #81).
+
+    ``daemon.py`` calls ``load_dotenv()`` at import: a populated ``.env`` in the
+    checkout is enough to hand every test a live ``NTFY_URL``/``NTFY_TOKEN``,
+    and a test that then builds the notifier from the environment and sends
+    would push to the operator's real phone. The autouse
+    ``no_real_ntfy_credentials`` fixture in ``tests/conftest.py`` clears both.
+    """
+
+    def test_the_environment_never_enables_the_notifier(self):
+        """No setenv anywhere in this test: enabled here would mean the process
+        env (or a checked-out .env) supplied real credentials."""
+        assert HaltNotifier.from_env().enabled is False
+
+    async def test_a_notifier_built_from_env_posts_through_the_patched_client(
+        self, monkeypatch
+    ):
+        """A test that DOES enable the notifier must also fake the HTTP layer.
+        The URL here is deliberately unroutable, so a real POST would fail
+        rather than reach anyone; the assertions pin that no real client is
+        constructed at all."""
+        fake_url = "http://127.0.0.1:9/labeler-alerts"
+        monkeypatch.setenv("NTFY_URL", fake_url)
+        monkeypatch.setenv("NTFY_TOKEN", "tk_secret")
+        cm, client = _patched_client(response=_response(200))
+        try:
+            notifier = HaltNotifier.from_env()
+            assert notifier.enabled is True
+            ok = await notifier.send("a title", "a body")
+        finally:
+            cm.stop()
+        assert ok is True
+        # The send went to the mock, not to a socket: a real httpx.AsyncClient
+        # would have raised ConnectError on port 9 and returned False.
+        client.post.assert_awaited_once()
+        assert client.post.call_args.args[0] == fake_url
+
+
 class TestSend:
     async def test_posts_title_and_body_with_bearer_token(self):
         cm, client = _patched_client(response=_response(200))

@@ -7,6 +7,22 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def no_real_ntfy_credentials(monkeypatch):
+    """No test may reach the real ntfy topic (review of #81).
+
+    ``daemon.py`` calls ``load_dotenv()`` at import, so a populated ``.env`` in
+    the checkout — never mind an exported shell variable — is enough for
+    ``HaltNotifier.from_env()`` to return an *enabled* notifier pointed at the
+    operator's real topic, and any test that then sends would POST to it.
+    Clearing both variables for every test makes the notifier disabled unless
+    the test sets them itself, in which case it is also responsible for
+    patching the HTTP client.
+    """
+    monkeypatch.delenv("NTFY_URL", raising=False)
+    monkeypatch.delenv("NTFY_TOKEN", raising=False)
+
+
 @pytest.fixture
 def mock_proxy():
     return AsyncMock()
