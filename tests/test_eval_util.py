@@ -1,6 +1,8 @@
 """Tests for shared evals helpers."""
 
 import json
+import os
+import stat
 
 import pytest
 
@@ -53,6 +55,29 @@ class TestAtomicWriteJsonl:
 
         assert json.loads(path.read_text().strip()) == {"value": "original"}
         assert [p.name for p in tmp_path.iterdir()] == ["out.jsonl"]  # no temp left
+
+    def test_preserves_existing_file_mode(self, tmp_path):
+        # mkstemp creates the temp file 0600; the rename must not silently
+        # narrow the permissions the owner had set on the real file (issue: the
+        # golden set became root-only after every review session, and a second
+        # user had to chmod o+r it each time).
+        path = tmp_path / "out.jsonl"
+        atomic_write_jsonl([_Rec(1)], path)
+        path.chmod(0o664)
+        atomic_write_jsonl([_Rec(2)], path)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o664
+
+    def test_new_file_gets_umask_default_mode_not_0600(self, tmp_path):
+        # A file that did not exist before should come out the way a plain
+        # open(path, "w") would leave it, i.e. 0666 minus the umask — not the
+        # 0600 that mkstemp defaults to.
+        path = tmp_path / "fresh.jsonl"
+        old = os.umask(0o022)
+        try:
+            atomic_write_jsonl([_Rec(1)], path)
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 
 class TestPlural:
