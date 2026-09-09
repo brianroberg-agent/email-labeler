@@ -76,6 +76,31 @@ class TestAtomicWriteJsonl:
         atomic_write_jsonl([_Rec(2)], path)
         assert stat.S_IMODE(path.stat().st_mode) == mode
 
+    def test_symlink_loop_target_still_writes_with_new_file_mode(self, tmp_path):
+        # stat() on a target that is a symlink loop raises ELOOP, not ENOENT.
+        # That must not escape after the records are already in the temp file
+        # and throw the write away (an unguarded end-of-run save would lose the
+        # session). The write proceeds as a new file: rename(2) replaces the
+        # link itself, so the loop's path becomes a regular file with the
+        # new-file mode.
+        loop_a = tmp_path / "loop_a.jsonl"
+        loop_b = tmp_path / "loop_b.jsonl"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        with pytest.raises(OSError):
+            loop_a.stat()  # precondition: the target really is a loop
+
+        old = os.umask(0o022)
+        try:
+            atomic_write_jsonl([_Rec(1)], loop_a)
+        finally:
+            os.umask(old)
+
+        assert not loop_a.is_symlink()
+        assert json.loads(loop_a.read_text().strip()) == {"value": 1}
+        assert stat.S_IMODE(loop_a.stat().st_mode) == 0o644
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["loop_a.jsonl", "loop_b.jsonl"]
+
     def test_new_file_gets_umask_default_mode_not_0600(self, tmp_path):
         # A file that did not exist before should come out the way a plain
         # open(path, "w") would leave it, i.e. 0666 minus the umask — not the

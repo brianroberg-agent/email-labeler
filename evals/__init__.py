@@ -43,10 +43,16 @@ def _target_mode(path: Path) -> int:
     """Permission bits the atomically written file should end up with.
 
     The existing file's mode if there is one; otherwise 0666 masked by the
-    process umask, i.e. what ``open(path, "w")`` would have created."""
+    process umask, i.e. what ``open(path, "w")`` would have created.
+
+    Any ``stat()`` failure takes the new-file branch, not just ENOENT: by the
+    time this runs the records are already in the temp file, and a symlink
+    loop or an unreadable link target (ELOOP, EACCES) should not throw that
+    write away. The rename still goes ahead -- it replaces the link itself --
+    so the content lands, with the same mode a fresh file would get."""
     try:
         return stat.S_IMODE(path.stat().st_mode)
-    except FileNotFoundError:
+    except OSError:
         current_umask = os.umask(0)
         os.umask(current_umask)
         return 0o666 & ~current_umask
