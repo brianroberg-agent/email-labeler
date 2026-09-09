@@ -318,6 +318,10 @@ async def evaluate_single(
         thread_id=golden.thread_id,
         expected_sender_type=golden.expected_sender_type,
         expected_label=golden.expected_label,
+        # Carried through so the report can score the assistant field without
+        # re-reading the golden set. Nothing predicts it yet (issue #78
+        # groundwork), so predicted_assistant/assistant_correct stay None.
+        expected_assistant=golden.expected_assistant,
     )
     thinking = ThinkingEntry(thread_id=golden.thread_id)
 

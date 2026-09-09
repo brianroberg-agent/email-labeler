@@ -653,3 +653,57 @@ class TestMainPreflightTimeoutWiring:
         assert captured["local_timeout"] == cfg["llm"]["local"]["timeout"]
         assert captured["cloud_timeout"] == cfg["llm"]["cloud"]["timeout"]
         assert captured["local_timeout"] > 10
+
+
+# ---------------------------------------------------------------------------
+# Assistant field carried onto the result record (issue #78 groundwork)
+# ---------------------------------------------------------------------------
+
+class _StubClassifier:
+    """Minimal stand-in for EmailClassifier: fixed answers, no network."""
+
+    def __init__(self, sender="person", label="needs_response"):
+        from classifier import EmailLabel, SenderType
+
+        self._sender = SenderType(sender)
+        self._label = EmailLabel(label)
+        self.cloud_llm = object()
+        self.local_llm = object()
+
+    async def classify_sender(self, metadata):
+        return self._sender, self._sender.value.upper(), ""
+
+    async def classify_email(self, metadata, transcript, sender_type, vip=False):
+        return self._label, self._label.value.upper(), ""
+
+    def _is_vip(self, metadata):
+        return False
+
+
+class TestEvaluateSingleAssistantField:
+    def _run(self, golden, stages="full"):
+        return asyncio.run(
+            run_eval.evaluate_single(golden, _StubClassifier(), stages, DEFAULT_MAX_THREAD_CHARS)
+        )[0]
+
+    def test_expected_assistant_is_copied_onto_the_result(self):
+        result = self._run(
+            _golden("t1", expected_label="needs_response", expected_assistant=True)
+        )
+        assert result.expected_assistant is True
+
+    def test_unannotated_thread_leaves_the_field_none(self):
+        result = self._run(_golden("t2", expected_label="needs_response"))
+        assert result.expected_assistant is None
+
+    def test_nothing_predicts_the_assistant_field_yet(self):
+        # This slice is plumbing only: no model is asked the question, so the
+        # prediction and its correctness stay unset on every path.
+        for stages in ("full", "stage1_only", "stage2_only"):
+            result = self._run(
+                _golden("t3", expected_label="needs_response", expected_assistant=False),
+                stages=stages,
+            )
+            assert result.predicted_assistant is None, stages
+            assert result.assistant_correct is None, stages
+            assert result.expected_assistant is False, stages
