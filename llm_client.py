@@ -125,16 +125,39 @@ class LLMBalanceError(RuntimeError):
 
     Account-wide, not request-specific: if one request fails for lack of balance,
     every subsequent request to the same provider will too. The daemon therefore
-    treats this as a halt condition (stop the affected function, tell the admin to
-    add funds and restart) rather than a per-thread give-up — the failing thread is
-    left unprocessed so it's retried after restart. The halt is per-FUNCTION
-    (decision D5's scope rule, D19): this error carries no function provenance, so
-    the daemon's call site decides which function stops — email triage keeps
-    running when the newsletter provider is the broke one, and vice versa.
-    Subclasses ``RuntimeError`` so callers unaware of it (evals) still see a
-    generic LLM failure; the daemon must catch it *before* its
+    treats this as a halt condition (stop the affected function, notify the
+    operator, re-probe the provider on a slow schedule and resume when it
+    answers — decision D22) rather than a per-thread give-up: the failing thread
+    is left unprocessed so it is retried once the function resumes. The halt is
+    per-FUNCTION (decision D5's scope rule, D19): this error carries no function
+    provenance, so the daemon's call site decides which function stops — email
+    triage keeps running when the newsletter provider is the broke one, and vice
+    versa. Subclasses ``RuntimeError`` so callers unaware of it (evals) still see
+    a generic LLM failure; the daemon must catch it *before* its
     ``except RuntimeError`` arm.
+
+    Structured provenance (issue #73), all optional so a bare
+    ``LLMBalanceError("msg")`` still constructs: ``tier`` (the raising client's
+    tier — which of the email function's two clients to re-probe), ``model``,
+    ``status_code`` and ``detail`` (the provider's response body, truncated) —
+    the fields the halt notification is composed from, without parsing the
+    message text.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tier: str | None = None,
+        model: str | None = None,
+        status_code: int | None = None,
+        detail: str = "",
+    ):
+        super().__init__(message)
+        self.tier = tier
+        self.model = model
+        self.status_code = status_code
+        self.detail = detail
 
 
 class LLMClient:
@@ -292,7 +315,11 @@ class LLMClient:
             ):
                 raise LLMBalanceError(
                     f"LLM provider out of funds — status {response.status_code} "
-                    f"[{self._provider()}]: {resp_body}"
+                    f"[{self._provider()}]: {resp_body}",
+                    tier=self.tier,
+                    model=self.model,
+                    status_code=response.status_code,
+                    detail=resp_body,
                 )
             if response.status_code == 429 or response.status_code >= 500:
                 # Provider-shaped (decision D5): an exhausted 429 (retry.py already

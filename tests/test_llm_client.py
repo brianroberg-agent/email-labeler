@@ -1473,3 +1473,33 @@ class TestSeparateReasoningFieldCapture:
                 "sys", "user", include_thinking=True,
             )
             assert thinking == "SAME TEXT"
+
+
+class TestBalanceErrorProvenance:
+    """LLMBalanceError carries structured provenance (issue #73, D22): the daemon
+    composes the halt notification — provider tier, model, HTTP status, the
+    provider's reason text — from attributes, not by parsing the message, and
+    picks which client to re-probe by ``tier``."""
+
+    async def test_balance_error_carries_tier_model_status_and_detail(self):
+        client = LLMClient(
+            base_url="https://api.cloud.example.com/v1/chat/completions",
+            api_key="sk-test-key", model="zai-org/glm-5", tier="cloud",
+        )
+        with pytest.raises(LLMBalanceError) as exc_info:
+            await _post_canned(client, _mock_response(403, NOVITA_BALANCE_BODY))
+        exc = exc_info.value
+        assert exc.tier == "cloud"
+        assert exc.model == "zai-org/glm-5"
+        assert exc.status_code == 403
+        assert "NOT_ENOUGH_BALANCE" in exc.detail
+        # The message text the logs already carry is unchanged.
+        assert "status 403" in str(exc)
+
+    def test_bare_construction_still_works(self):
+        """Tests and evals raise it with a message alone; provenance defaults empty."""
+        exc = LLMBalanceError("out of funds")
+        assert exc.tier is None
+        assert exc.model is None
+        assert exc.status_code is None
+        assert exc.detail == ""
