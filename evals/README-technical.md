@@ -11,12 +11,12 @@ Complete CLI flag references, cache internals, and chain-of-thought capture deta
 | `--output` | Output JSONL path (default: `evals/golden_set.jsonl`) |
 | `--max-threads` | Max threads to fetch (default: `200`) |
 | `--sender-type` | Filter: `person` or `service` |
-| `--label` | Filter by config **key**: `needs_response`, `fyi`, `low_priority` (not the Gmail label name — the key is mapped via `[labels]` in config.toml, e.g. `needs_response` → `agent/needs-response`). ANDed into the Gmail query (e.g. `label:agent/processed label:agent/needs-response`) so the fetch returns a dense pool of matching threads — useful for boosting a rare class like `needs_response` in the golden set |
-| `--gmail-label` | Only harvest threads that ALSO carry this Gmail label (e.g. `eval/harvest`). Takes the Gmail label **name** as-is (any user label — not a config key), quoted in the query so `/`, `-` and spaces are safe. ANDed with `agent/processed` and `--label`. Ground truth is still inferred from the daemon's labels; correct it in `evals.review` |
+| `--label` | Filter by config **key**: `needs_response`, `fyi`, `low_priority` (not the Gmail label name — the key is mapped via `[labels]` in config.toml, e.g. `needs_response` → `agent/needs-response`). ANDed into the Gmail query so the fetch returns a dense pool of matching threads — useful for boosting a rare class like `needs_response` in the golden set. A key with no `[labels]` mapping is an error |
+| `--gmail-label` | Only harvest threads that ALSO carry this Gmail label (e.g. `eval/harvest`). Takes the Gmail label **name** (any user label — not a config key); it must exist in the account (checked before fetching, case-insensitively) and is passed quoted in the query, ANDed with `agent/processed` and `--label`. Only threads the daemon has already labeled (`agent/processed` plus sender-type and classification labels) are found — picks under `agent/attempted` or not yet processed are absent, and every per-thread skip is reported on stderr. Ground truth is still inferred from the daemon's labels; each row's `notes` names the Gmail label, and the labels are corrected in `evals.review` |
 | `--config` | Path to config.toml (default: `./config.toml`) |
 | `--proxy-url` | API proxy URL (overrides `PROXY_URL` env var) |
 
-Harvest always appends to `--output`, deduplicating by thread ID. There is no overwrite mode: the golden set also stores manual review state (confirmed labels, exclusions, notes), so harvest never truncates it. To rebuild from scratch, delete the file manually.
+Harvest always appends to `--output`, deduplicating by thread ID: threads already in the file are skipped before they are fetched and do not count against `--max-threads`. There is no overwrite mode: the golden set also stores manual review state (confirmed labels, exclusions, notes), so harvest never truncates it. To rebuild from scratch, delete the file manually.
 
 ### review
 

@@ -50,19 +50,19 @@ manual confirmation, so the manual classification step is not bypassed.
 **Hand-picking threads.** Sometimes the threads you want are ones the daemon
 got wrong — cold sales pitches it filed as `service`/`low_priority`, say — so
 no `--sender-type`/`--label` combination will find them. Instead, pick them in
-Gmail: create a label (e.g. `eval/harvest`), apply it to the threads you want,
-then harvest exactly those:
+Gmail: create a label (e.g. `eval/harvest`), apply it to threads the daemon
+has already processed, then harvest exactly those and correct their labels:
 
 ```bash
 uv run python -m evals.harvest --proxy-url http://localhost:8000 --gmail-label eval/harvest
 uv run python -m evals.review --unreviewed-only
 ```
 
-`--gmail-label` takes the Gmail label name as-is and is ANDed with
-`agent/processed` (and `--label`, if given). The harvested entries still carry
-the daemon's inferred labels as ground truth, so correct the sender type and
-label in `evals.review` afterward. Leave the Gmail label in place: re-running
-the harvest dedupes by thread ID, so already-harvested threads are skipped.
+The new rows carry the daemon's inferred labels as ground truth and a note
+naming the Gmail label, so they are recognizable in `evals.review`. Leave the
+Gmail label in place: a re-run skips threads already in the golden set before
+fetching them. Flag semantics, and what the harvest can and cannot reach:
+[README-technical.md](README-technical.md#harvest).
 
 ## 2. Review — Manually verify ground truth labels
 

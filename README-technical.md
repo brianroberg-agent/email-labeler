@@ -53,7 +53,7 @@ email-labeler/
     ├── test_config_utils.py Config loading tests
     ├── test_newsletter.py   Newsletter pipeline tests
     ├── test_eval_schemas.py Golden set and result serialization tests
-    ├── test_eval_harvest.py Ground truth inference and deduplication tests
+    ├── test_eval_harvest.py Ground truth inference, dedup, and query-building tests
     └── test_eval_report.py  Metrics computation and report formatting tests
 ```
 
@@ -508,7 +508,7 @@ Conventions shared by every TUI:
 | `test_env_example_docs.py` | `.env.example` (meta-test) | Every var the example declares is documented in the env table; every Required var has an active line in the example |
 | `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing (incl. the `schema_version` stamp), sink persistence/writability diagnostics, and the Rule-1 raises that keep `no-stories` to a successful zero-story extraction (unparseable extraction reply; every story failing to grade — decisions D5/D20) |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
-| `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication |
+| `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication and pre-fetch skip of known threads, Gmail query building (`--label`/`--gmail-label` resolution, quoting, ordering, validation), append-only writes, `main()` wiring |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
 | `test_eval_newsletter_schemas.py` | `evals/newsletter_schemas.py` | Golden-set/result dataclass round-trips, missing-key tolerance |
 | `test_eval_newsletter_harvest.py` | `evals/newsletter_harvest.py` | Newsletter filtering, body build, dedup, no ground-truth inference |

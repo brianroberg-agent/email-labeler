@@ -3,12 +3,16 @@
 import argparse
 import json
 
+import pytest
+
 import evals.harvest as harvest_mod
 from evals.harvest import (
     build_query,
     deduplicate,
+    gmail_label_arg,
     harvest_threads,
     infer_ground_truth,
+    load_existing_thread_ids,
     write_golden_set,
 )
 from evals.schemas import GoldenThread
@@ -31,6 +35,7 @@ LABEL_ID_TO_NAME = {
     "Label_4": "agent/processed",
     "Label_5": "agent/personal",
     "Label_6": "agent/non-personal",
+    "Label_7": "eval/harvest",  # a user label for hand-picked threads
 }
 
 
@@ -198,63 +203,58 @@ class FakeProxy:
 
 
 class TestBuildQuery:
-    """build_query is the pure query builder behind harvest_threads."""
+    """build_query is the pure quote-and-join over resolved Gmail label names."""
 
     def test_base_query_is_processed_only(self):
-        assert build_query(LABELS_CONFIG, None) == "label:agent/processed"
+        assert build_query("agent/processed") == "label:agent/processed"
 
-    def test_label_filter_appends_quoted_classification_label(self):
-        assert build_query(LABELS_CONFIG, "needs_response") == (
+    def test_filter_label_appended_quoted(self):
+        assert build_query("agent/processed", "agent/needs-response") == (
             'label:agent/processed label:"agent/needs-response"'
         )
 
-    def test_gmail_label_appends_quoted_user_label(self):
-        assert build_query(LABELS_CONFIG, None, gmail_label="eval/harvest") == (
-            'label:agent/processed label:"eval/harvest"'
-        )
-
-    def test_both_filters_ordered_processed_classification_gmail(self):
-        assert build_query(LABELS_CONFIG, "low_priority", gmail_label="eval/harvest") == (
+    def test_both_labels_ordered_processed_classification_gmail(self):
+        assert build_query("agent/processed", "agent/low-priority", "eval/harvest") == (
             'label:agent/processed label:"agent/low-priority" label:"eval/harvest"'
         )
 
-    def test_gmail_label_with_slash_and_hyphen_is_quoted(self):
-        # An unquoted '-' can be read by Gmail as the NOT operator, so the
-        # user-supplied label must be quoted verbatim.
-        assert build_query(LABELS_CONFIG, None, gmail_label="eval/cold-pitch") == (
-            'label:agent/processed label:"eval/cold-pitch"'
+    def test_user_label_with_slash_and_space_is_one_quoted_term(self):
+        # Unquoted, a name with a space would split into two search terms.
+        assert build_query("agent/processed", gmail_label="eval/cold pitch") == (
+            'label:agent/processed label:"eval/cold pitch"'
         )
 
-    def test_unmapped_label_filter_yields_processed_only(self):
-        assert build_query(LABELS_CONFIG, "bogus") == "label:agent/processed"
 
-    def test_empty_gmail_label_is_ignored(self):
-        assert build_query(LABELS_CONFIG, None, gmail_label="") == "label:agent/processed"
+class TestGmailLabelArg:
+    """--gmail-label must be a real, non-empty label name (argparse type)."""
+
+    def test_strips_surrounding_whitespace(self):
+        assert gmail_label_arg("  eval/harvest ") == "eval/harvest"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_rejects_empty(self, value):
+        # An unset shell variable must not silently widen the harvest to the
+        # whole processed pool.
+        with pytest.raises(argparse.ArgumentTypeError):
+            gmail_label_arg(value)
+
+    def test_rejects_double_quote(self):
+        # The name is embedded in a quoted Gmail term and Gmail has no escape.
+        with pytest.raises(argparse.ArgumentTypeError):
+            gmail_label_arg('eval/"hot" leads')
 
 
 class TestHarvestQuery:
-    """The Gmail query should AND in the classification label when filtering."""
+    """harvest_threads resolves config keys and user labels into the Gmail query."""
 
     CONFIG = {"labels": LABELS_CONFIG}
 
-    async def test_no_label_filter_queries_processed_only(self):
+    async def test_no_filters_queries_processed_only(self):
         proxy = FakeProxy()
         await harvest_threads(proxy, self.CONFIG, max_threads=10)
         assert proxy.last_query == "label:agent/processed"
 
-    async def test_label_filter_anded_into_query(self):
-        proxy = FakeProxy()
-        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="needs_response")
-        # The classification label is quoted: its internal hyphen must not be
-        # read by Gmail as the NOT operator.
-        assert proxy.last_query == 'label:agent/processed label:"agent/needs-response"'
-
-    async def test_unknown_label_filter_falls_back_to_processed(self):
-        proxy = FakeProxy()
-        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
-        assert proxy.last_query == "label:agent/processed"
-
-    async def test_gmail_label_anded_into_query(self):
+    async def test_label_filter_and_gmail_label_anded_into_query(self, capsys):
         proxy = FakeProxy()
         await harvest_threads(
             proxy, self.CONFIG, max_threads=10, label_filter="low_priority", gmail_label="eval/harvest",
@@ -262,11 +262,31 @@ class TestHarvestQuery:
         assert proxy.last_query == (
             'label:agent/processed label:"agent/low-priority" label:"eval/harvest"'
         )
+        assert "Error" not in capsys.readouterr().err
 
-    async def test_unknown_label_filter_still_warns(self, capsys):
+    async def test_unmapped_label_filter_is_an_error_before_fetching(self, capsys):
+        # An unmapped key can never match a thread (infer_ground_truth only
+        # knows mapped keys), so a degraded query would just fetch and drop.
         proxy = FakeProxy()
-        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
+        with pytest.raises(SystemExit):
+            await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
+        assert proxy.last_query is None
         assert "has no mapping in [labels]" in capsys.readouterr().err
+
+    async def test_unknown_gmail_label_is_an_error_before_fetching(self, capsys):
+        # A typo must not be reported as "no messages found".
+        proxy = FakeProxy()
+        with pytest.raises(SystemExit):
+            await harvest_threads(proxy, self.CONFIG, max_threads=10, gmail_label="eval/harvst")
+        assert proxy.last_query is None
+        assert "eval/harvst" in capsys.readouterr().err
+
+    async def test_gmail_label_check_is_case_insensitive(self):
+        # Gmail's label: search is case-insensitive, so the check must not
+        # reject a name Gmail would accept.
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10, gmail_label="Eval/Harvest")
+        assert proxy.last_query == 'label:agent/processed label:"Eval/Harvest"'
 
 
 class TestWriteGoldenSet:
@@ -305,23 +325,35 @@ class TestWriteGoldenSet:
         assert ids == ["t1"]
 
 
-class _OneThreadProxy:
-    """Fake proxy that always surfaces a single harvestable processed thread."""
+class _StubProxy:
+    """Fake proxy serving harvestable processed threads (person + needs_response).
 
-    def __init__(self, *args, **kwargs):
-        pass
+    Records the query and every get_thread call so tests can assert on what
+    was fetched, not just on what came back.
+    """
+
+    def __init__(self, *args, thread_ids=("t1",), next_page_token=None, **kwargs):
+        self.thread_ids = list(thread_ids)
+        self.next_page_token = next_page_token
+        self.last_query = None
+        self.get_thread_calls: list[str] = []
 
     async def list_labels(self, user_id="me"):
         return {"labels": [{"id": lid, "name": name} for lid, name in LABEL_ID_TO_NAME.items()]}
 
     async def list_messages(self, user_id="me", max_results=10, q=None, label_ids=None):
-        return {"messages": [{"id": "m1", "threadId": "t1"}]}
+        self.last_query = q
+        response = {"messages": [{"id": f"m-{tid}", "threadId": tid} for tid in self.thread_ids]}
+        if self.next_page_token:
+            response["nextPageToken"] = self.next_page_token
+        return response
 
     async def get_thread(self, thread_id, user_id="me", format="full"):
+        self.get_thread_calls.append(thread_id)
         return {
             "messages": [
                 {
-                    "id": "m1",
+                    "id": f"m-{thread_id}",
                     "internalDate": "1000",
                     "snippet": "hello",
                     # personal + needs-response + processed -> a valid golden thread
@@ -337,28 +369,126 @@ class _OneThreadProxy:
         }
 
 
-class TestMainDeduplicates:
-    """main() must dedup on EVERY run, not only under the (removed) --append flag.
+class TestHarvestLoop:
+    """Per-thread behavior of harvest_threads: skips, caps, diagnostics, tagging."""
 
-    Guards the central behavior flip of this change: a second harvest of an
-    already-present thread must not append a duplicate row.
-    """
+    CONFIG = {"labels": LABELS_CONFIG}
+
+    async def test_known_threads_are_skipped_before_fetching(self, capsys):
+        # Re-running with the Gmail label left in place must not re-download
+        # threads already in the golden set.
+        proxy = _StubProxy(thread_ids=("t1", "t2"))
+        results = await harvest_threads(
+            proxy, self.CONFIG, max_threads=10, skip_thread_ids={"t1"},
+        )
+        assert proxy.get_thread_calls == ["t2"]
+        assert [t.thread_id for t in results] == ["t2"]
+        assert "already in the golden set" in capsys.readouterr().err
+
+    async def test_known_threads_do_not_consume_the_cap(self):
+        # Otherwise a label larger than --max-threads could never reach its
+        # older, not-yet-harvested picks on a re-run.
+        proxy = _StubProxy(thread_ids=("t1", "t2"))
+        results = await harvest_threads(
+            proxy, self.CONFIG, max_threads=1, skip_thread_ids={"t1"},
+        )
+        assert [t.thread_id for t in results] == ["t2"]
+
+    async def test_warns_when_message_budget_exhausted_below_cap(self, capsys):
+        # The fetch is a message-level budget with no pagination; when Gmail
+        # reports more pages and fewer threads than the cap came back, some
+        # matching threads were silently left behind.
+        proxy = _StubProxy(thread_ids=("t1",), next_page_token="abc")
+        await harvest_threads(proxy, self.CONFIG, max_threads=10)
+        assert "budget exhausted" in capsys.readouterr().err
+
+    async def test_no_budget_warning_when_cap_reached(self, capsys):
+        proxy = _StubProxy(thread_ids=("t1", "t2"), next_page_token="abc")
+        await harvest_threads(proxy, self.CONFIG, max_threads=2)
+        assert "budget exhausted" not in capsys.readouterr().err
+
+    async def test_filter_mismatch_names_the_skipped_thread(self, capsys):
+        # "Labelled 10, harvested 7" must be diagnosable per thread.
+        proxy = _StubProxy(thread_ids=("t1",))
+        results = await harvest_threads(
+            proxy, self.CONFIG, max_threads=10, sender_type_filter="service",
+        )
+        assert results == []
+        assert "Skipping thread t1" in capsys.readouterr().err
+
+    async def test_hand_picked_rows_are_tagged_in_notes(self):
+        # Hand-picked rows carry labels the daemon (by hypothesis) got wrong;
+        # the review TUI shows notes, so name the label there.
+        proxy = _StubProxy(thread_ids=("t1",))
+        results = await harvest_threads(proxy, self.CONFIG, max_threads=10, gmail_label="eval/harvest")
+        assert "eval/harvest" in results[0].notes
+
+    async def test_bulk_rows_have_no_notes(self):
+        proxy = _StubProxy(thread_ids=("t1",))
+        results = await harvest_threads(proxy, self.CONFIG, max_threads=10)
+        assert results[0].notes == ""
+
+
+class TestLoadExistingThreadIds:
+    def test_reads_ids_and_tolerates_bad_rows(self, tmp_path):
+        path = tmp_path / "golden.jsonl"
+        path.write_text(
+            json.dumps({"thread_id": "t1"}) + "\n"
+            + '{"thread_id": "t2", "messages":\n'  # truncated
+            + json.dumps({"subject": "no id"}) + "\n"
+        )
+        assert load_existing_thread_ids(path) == {"t1"}
+
+    def test_missing_file_is_empty(self, tmp_path):
+        assert load_existing_thread_ids(tmp_path / "nope.jsonl") == set()
+
+
+def _main_args(output, **overrides) -> argparse.Namespace:
+    """A Namespace shaped like cli()'s parser output (no getattr defaults in main)."""
+    fields = dict(
+        output=str(output), max_threads=10, sender_type=None, label=None,
+        gmail_label=None, config=None, proxy_url="http://x",
+    )
+    fields.update(overrides)
+    return argparse.Namespace(**fields)
+
+
+class TestMain:
+    """main() wiring: dedup on every run, no refetch of known threads, flag forwarding."""
 
     async def test_rerun_does_not_duplicate_thread(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(harvest_mod, "GmailProxyClient", _OneThreadProxy)
+        # Guards the always-append behavior: a second harvest of an
+        # already-present thread must not append a duplicate row.
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", _StubProxy)
         output = tmp_path / "golden.jsonl"
-        args = argparse.Namespace(
-            output=str(output),
-            max_threads=10,
-            sender_type=None,
-            label=None,
-            gmail_label=None,
-            config=None,
-            proxy_url="http://x",
-        )
+        args = _main_args(output)
 
         await harvest_mod.main(args)
         await harvest_mod.main(args)
 
         ids = [json.loads(line)["thread_id"] for line in output.read_text().splitlines() if line]
         assert ids == ["t1"]
+
+    async def test_rerun_does_not_refetch_known_threads(self, tmp_path, monkeypatch):
+        proxies: list[_StubProxy] = []
+
+        def make_proxy(*args, **kwargs):
+            proxies.append(_StubProxy())
+            return proxies[-1]
+
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", make_proxy)
+        args = _main_args(tmp_path / "golden.jsonl")
+
+        await harvest_mod.main(args)
+        await harvest_mod.main(args)
+
+        assert proxies[0].get_thread_calls == ["t1"]
+        assert proxies[1].get_thread_calls == []
+
+    async def test_gmail_label_reaches_the_query(self, tmp_path, monkeypatch):
+        proxy = _StubProxy()
+        monkeypatch.setattr(harvest_mod, "GmailProxyClient", lambda *a, **kw: proxy)
+
+        await harvest_mod.main(_main_args(tmp_path / "golden.jsonl", gmail_label="eval/harvest"))
+
+        assert proxy.last_query == 'label:agent/processed label:"eval/harvest"'
