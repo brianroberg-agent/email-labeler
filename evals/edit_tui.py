@@ -16,7 +16,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 # Hotkey maps come from evals.review so the two tools stay in lock-step
 # (needs_response is `r`, not `n`). No cycle: review imports edit_tui lazily.
-from evals.review import _LABEL_KEY_MAP, _SENDER_KEY_MAP, save_golden_set
+from evals.review import _LABEL_KEY_MAP, _SENDER_KEY_MAP, apply_label, save_golden_set
 from evals.schemas import GoldenThread
 from gmail_utils import decode_body
 from tui_common import CANCEL, HintScreen, KeyMenuScreen, PageListView
@@ -25,6 +25,10 @@ from tui_common import truncate as _truncate
 # Abbreviation maps for compact list display
 _SENDER_ABBREV = {"person": "PER", "service": "SVC"}
 _LABEL_ABBREV = {"needs_response": "NR", "fyi": "FYI", "low_priority": "LP"}
+# Tri-state assistant annotation (issue #78), for display.
+_ASSISTANT_DISPLAY = {None: "unset", True: "yes", False: "no"}
+# The `a` cycle: unset -> yes -> no -> unset.
+_ASSISTANT_CYCLE = {None: True, True: False, False: None}
 
 # Column widths for list view
 _COL_FLAG = 1     # "X" for excluded threads, else blank
@@ -79,6 +83,7 @@ def _build_detail_lines(thread: GoldenThread, index: int, total: int) -> list[st
     lines.append("")
     lines.append(f"Sender type: {thread.expected_sender_type}")
     lines.append(f"Label:       {thread.expected_label}")
+    lines.append(f"Assistant:   {_ASSISTANT_DISPLAY[thread.expected_assistant]}")
     lines.append("")
     lines.append("--- Body ---")
 
@@ -101,7 +106,7 @@ _LABEL_PROMPT = "[r] needs_response  [f]yi  [l]ow_priority  (other key cancels)"
 
 
 class DetailScreen(Screen):
-    """One thread: scrollable detail + s/l/e edit actions with auto-save."""
+    """One thread: scrollable detail + s/l/e/a edit actions with auto-save."""
 
     AUTO_FOCUS = None  # keys go to the screen bindings, not the scroll container
 
@@ -111,6 +116,7 @@ class DetailScreen(Screen):
         Binding("s", "edit_sender", "Sender", show=False),
         Binding("l", "edit_label", "Label", show=False),
         Binding("e", "toggle_excluded", "Toggle exclude", show=False),
+        Binding("a", "cycle_assistant", "Cycle assistant", show=False),
         Binding("up", "scroll_up", "Scroll up", show=False),
         Binding("down", "scroll_down", "Scroll down", show=False),
         Binding("pageup", "page_up", "Page up", show=False),
@@ -151,9 +157,14 @@ class DetailScreen(Screen):
         lines = _build_detail_lines(self.thread, self.index, self.total)
         self.query_one("#detail-content", Static).update("\n".join(lines))
         excl = "[e]unexclude" if self.thread.excluded else "[e]exclude"
-        help_text = f"\u2191/\u2193:Scroll  [s]ender  [l]abel  {excl}  Esc:Back  q:Quit"
+        help_text = (
+            f"\u2191/\u2193:Scroll  [s]ender  [l]abel  [a]ssistant  {excl}  Esc:Back  q:Quit"
+        )
         self.query_one("#detail-help", Static).update(help_text)
-        status = f"Sender: {self.thread.expected_sender_type}  Label: {self.thread.expected_label}"
+        status = (
+            f"Sender: {self.thread.expected_sender_type}  Label: {self.thread.expected_label}"
+            f"  Assistant: {_ASSISTANT_DISPLAY[self.thread.expected_assistant]}"
+        )
         self.query_one("#detail-status", Static).update(status)
 
     def _auto_save(self) -> None:
@@ -178,7 +189,9 @@ class DetailScreen(Screen):
     def action_edit_label(self) -> None:
         def apply(result) -> None:
             if result != CANCEL:
-                self.thread.expected_label = result
+                # apply_label drops the assistant annotation when the label
+                # moves off needs_response (issue #78 relabel invariant).
+                apply_label(self.thread, result)
                 self._auto_save()
                 self._refresh()
 
@@ -189,6 +202,14 @@ class DetailScreen(Screen):
         # untouched — excluded is orthogonal to reviewed, matching the newsletter
         # labeler's toggle. Reversible by pressing `e` again.
         self.thread.excluded = not self.thread.excluded
+        self._auto_save()
+        self._refresh()
+
+    def action_cycle_assistant(self) -> None:
+        # Tri-state cycle unset -> yes -> no -> unset, mirroring the `e` toggle:
+        # same auto-save, `reviewed` and `excluded` left untouched. Reversible
+        # by pressing `a` until the value comes round again.
+        self.thread.expected_assistant = _ASSISTANT_CYCLE[self.thread.expected_assistant]
         self._auto_save()
         self._refresh()
 

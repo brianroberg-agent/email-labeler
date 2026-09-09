@@ -268,3 +268,64 @@ class TestEditAppReviewFindings:
             await pilot.resize_terminal(160, 24)
             await pilot.pause()
             assert long_subject in _screen_text(app)  # re-rendered wider
+
+
+class TestAssistantKey:
+    """Issue #78: `a` cycles the tri-state annotation, mirroring `e`."""
+
+    async def test_a_cycles_unset_yes_no_unset_and_saves(self, tmp_path):
+        thread = _golden("t1", expected_label="needs_response")
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert thread.expected_assistant is None
+            await pilot.press("a")
+            assert thread.expected_assistant is True
+            assert load_golden_set(tmp_path / "golden.jsonl")[0].expected_assistant is True
+            await pilot.press("a")
+            assert thread.expected_assistant is False
+            assert load_golden_set(tmp_path / "golden.jsonl")[0].expected_assistant is False
+            await pilot.press("a")
+            assert thread.expected_assistant is None
+            assert load_golden_set(tmp_path / "golden.jsonl")[0].expected_assistant is None
+
+    async def test_detail_shows_the_annotation_and_offers_the_key(self, tmp_path):
+        thread = _golden("t1", expected_label="needs_response")
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert "[a]ssistant" in _screen_text(app)
+            assert "Assistant: unset" in _screen_text(app)
+            await pilot.press("a")
+            assert "Assistant: yes" in _screen_text(app)
+            await pilot.press("a")
+            assert "Assistant: no" in _screen_text(app)
+
+    async def test_a_leaves_reviewed_and_excluded_untouched(self, tmp_path):
+        thread = _golden("t1", expected_label="needs_response", reviewed=True, excluded=False)
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("a")
+            assert thread.reviewed is True
+            assert thread.excluded is False
+
+
+class TestRelabelClearsAssistantInEditTui:
+    async def test_relabel_away_from_needs_response_clears_it(self, tmp_path):
+        thread = _golden("t1", expected_label="needs_response", expected_assistant=True)
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "f")  # label submenu -> fyi
+            assert thread.expected_label == "fyi"
+            assert thread.expected_assistant is None
+            assert load_golden_set(tmp_path / "golden.jsonl")[0].expected_assistant is None
+
+    async def test_relabel_to_needs_response_keeps_it(self, tmp_path):
+        thread = _golden("t1", expected_label="fyi", expected_assistant=True)
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            await pilot.press("l", "r")  # label submenu -> needs_response
+            assert thread.expected_assistant is True
