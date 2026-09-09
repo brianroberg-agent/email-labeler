@@ -80,18 +80,22 @@ should choose the cheaper error — keep it, and lean toward needs_response.
   events are FYI.** (Invitations are SERVICE at stage 1, so this reaches the service path;
   recorded here because it defines the category.)
 
-**Proposed, not yet ruled (from the 2026-09-08 review and the 2026-09-09 eval):**
+- **P6 (2026-09-09).** Group mail that asks **every** recipient to act (RSVP, vote, complete
+  an evaluation, register) is NEEDS_RESPONSE — the "each of you" half of P3 made explicit.
+  Golden-set consequence: "[DM Staff] Fall Conference Registration: A Few Clarifications"
+  ("please register yourself ASAP") flips fyi → needs_response, matching the conference
+  eval thread.
+- **P7 (2026-09-09).** A request addressed to someone else with Brian copied is FYI.
+- **P8 (2026-09-09).** A known-person **newsletter or prayer letter** (family, pastor,
+  supported missionary) is FYI, never LOW_PRIORITY — a named instance of P1, because models
+  still read "newsletter" as a LOW_PRIORITY trigger. Brian wants this paired with a **list of
+  recognised newsletter senders** so the model can tell a known relationship's newsletter
+  from a stranger's — the same "preference as data" mechanism as S2 below.
+- **P9 (2026-09-09).** **Survey and feedback requests** are NEEDS_RESPONSE when they come
+  from DiscipleMakers or Oakwood; from just about anyone else they are LOW_PRIORITY.
+  Relationship-based — a candidate for the same known-senders list.
 
-- **P6.** Group mail that asks **every** recipient to act (RSVP, vote, complete an
-  evaluation, register) is NEEDS_RESPONSE — the "each of you" half of P3 made explicit.
-  ⚠️ The golden set currently disagrees with itself here: "[DM Staff] Summer Staff
-  Conference 2026 Eval" is needs_response, "[DM Staff] Fall Conference Registration: A Few
-  Clarifications" ("please register yourself ASAP") is fyi. One of them changes, or P6 is
-  narrowed to say which.
-- **P7.** A request addressed to someone else with Brian copied is FYI.
-- **P8.** A known-person **newsletter or prayer letter** (family, pastor, supported
-  missionary) is FYI, never LOW_PRIORITY — a named instance of P1, because models still
-  read "newsletter" as a LOW_PRIORITY trigger.
+**Proposed, not yet ruled:** none open on the person side as of 2026-09-09.
 
 ## 6. Stage 2 — label rules for SERVICE senders
 
@@ -105,23 +109,34 @@ persons, P1 made LOW_PRIORITY crisp; for services, "worth reading for awareness"
 how much Brian wants to see a given email's content, which is a preference, not a rule a
 model can infer from the thread.
 
-**Proposed, not yet ruled:**
+**Decided 2026-09-09 (voice, walked through as decision questions so the work is ready when
+the cloud-tier run can happen):**
 
-- **S1 — "about me" versus "about them", a structural test.** If the email *reports
-  something that happened to Brian* — a charge, an order, a delivery, a statement, a
-  security or account change, a deadline on something he holds — it is FYI. If it exists
-  to *draw his attention to the sender's own content* — newsletter, digest, product update,
-  promotion, re-engagement — it is LOW_PRIORITY. Decidable from the thread alone.
-- **S2 — taste as data, not prose.** The editorial newsletters Brian does want are a
-  preference; preferences belong in a **keep-list of service senders/streams** (config,
-  like `VIP_SENDERS`), which overrides S1 for those senders. Anything "about them" and not
-  on the list defaults to LOW_PRIORITY. Service senders are stable, so this is a decision
-  made once per sender, not once per email; the golden set then tests whether the model
-  recognises the stream, not whether it shares Brian's taste. Could be a lookup before
-  the model is called at all.
-- Evidence to gather before ruling: the service/fyi versus service/low_priority
-  disagreements between models and labels (82 fyi / 191 low_priority reviewed as of
-  2026-09-08). That slice needs the cloud tier, so it is a docker-3 run.
+- **S1 — "about me" versus "about them".** If the email *reports something that happened
+  to Brian* — a charge, an order, a delivery, a statement, a security or account change, a
+  deadline on something he holds — it is FYI. If it exists to *draw his attention to the
+  sender's own content* — newsletter, digest, product update, promotion, re-engagement — it
+  is LOW_PRIORITY. Brian accepts the consequence that security/account-change alerts about
+  him, LOW_PRIORITY in today's prompt, become FYI.
+- **S1a — three-way split.** "About me" *and requiring action* (renewal, signature, verify,
+  failed payment) is NEEDS_RESPONSE (the service analogue of P4); "about me" record-only is
+  FYI; "about them" is LOW_PRIORITY unless the sender is on the keep-list (S2).
+- **S1b — tiebreaker against sales dressed as alerts** (accepted to try; judge by the
+  service-slice run). "About me" must name a **specific completed event or a specific
+  consequence to something Brian holds** — an amount, an order number, a date, a device,
+  an expiry. Generic "review your account / manage your licenses / unlock…" names nothing
+  and is "about them". (Sales reps at vendor addresses — Adobe was the example — are
+  PERSON at stage 1 and fall to P1 cold outreach already.)
+- **S2 — the keep-list is a deterministic code LOOKUP, not prompt text.** Sender on the
+  list → FYI, no model call. Brian chose determinism over the model's ability to generalise
+  to a new address; making the list cheap to update is the follow-on once it exists.
+- **Golden set, service side:** do **not** relabel the 273 reviewed service threads
+  wholesale. Run the models (cloud tier — a docker-3 job), then adjudicate only the
+  model-versus-label disagreements, exactly as on the person side. Brian: "the bulk of the
+  labels are going to be fine; isolate those at the boundaries."
+
+**Proposed:** none open on the service side as of 2026-09-09; S1b is provisional pending
+evidence.
 
 ## 7. Golden-set procedure
 
@@ -155,6 +170,8 @@ model can infer from the thread.
 
 ## 8. Change log
 
+- **2026-09-09 (later)** — P6–P8 ruled Decided, P9 added, S1/S1a/S1b/S2 ruled Decided with
+  the service golden-set procedure, all by Brian by voice on 2026-09-09 morning.
 - **2026-09-09** — document created; §1–§7 consolidate PR #74, PR #75, the 2026-09-08
   review rulings and the 2026-09-09 eval discussion. Eval evidence for the current state:
   the assistant's `docs/labeler-eval-report-2026-09-09.md` (workspace repo).
