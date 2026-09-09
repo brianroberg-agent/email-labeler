@@ -311,6 +311,29 @@ class TestAssistantKey:
             assert thread.excluded is False
 
 
+class TestAssistantUnknownValue:
+    """A hand-edited golden-set file can carry a value the maps do not know."""
+
+    def test_detail_lines_render_an_unknown_value_instead_of_crashing(self):
+        thread = _golden("t1", expected_label="needs_response")
+        thread.expected_assistant = "yes"       # hand-edited string, not a bool
+        lines = _build_detail_lines(thread, 0, 1)
+        assert any(line.startswith("Assistant:") and "???" in line for line in lines)
+
+    async def test_a_on_an_unknown_value_clears_it(self, tmp_path):
+        thread = _golden("t1", expected_label="needs_response")
+        thread.expected_assistant = "yes"
+        app = _edit_app([thread], tmp_path)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("enter")
+            assert "Assistant: ???" in _screen_text(app)
+            await pilot.press("a")
+            assert thread.expected_assistant is None
+            assert "Assistant: unset" in _screen_text(app)
+            await pilot.press("a")
+            assert thread.expected_assistant is True
+
+
 class TestRelabelClearsAssistantInEditTui:
     async def test_relabel_away_from_needs_response_clears_it(self, tmp_path):
         thread = _golden("t1", expected_label="needs_response", expected_assistant=True)

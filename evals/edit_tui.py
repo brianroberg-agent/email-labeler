@@ -25,9 +25,14 @@ from tui_common import truncate as _truncate
 # Abbreviation maps for compact list display
 _SENDER_ABBREV = {"person": "PER", "service": "SVC"}
 _LABEL_ABBREV = {"needs_response": "NR", "fyi": "FYI", "low_priority": "LP"}
-# Tri-state assistant annotation (issue #78), for display.
+# Tri-state assistant annotation (issue #78), for display. Looked up with
+# `.get` like _SENDER_ABBREV: a hand-edited golden-set file can hold a value
+# outside the three, and a detail view that raises is worse than one that
+# shows the value is not understood.
 _ASSISTANT_DISPLAY = {None: "unset", True: "yes", False: "no"}
-# The `a` cycle: unset -> yes -> no -> unset.
+_ASSISTANT_UNKNOWN = "???"
+# The `a` cycle: unset -> yes -> no -> unset. An unrecognised value cycles to
+# unset, which clears it rather than reading an annotation into it.
 _ASSISTANT_CYCLE = {None: True, True: False, False: None}
 
 # Column widths for list view
@@ -83,7 +88,9 @@ def _build_detail_lines(thread: GoldenThread, index: int, total: int) -> list[st
     lines.append("")
     lines.append(f"Sender type: {thread.expected_sender_type}")
     lines.append(f"Label:       {thread.expected_label}")
-    lines.append(f"Assistant:   {_ASSISTANT_DISPLAY[thread.expected_assistant]}")
+    lines.append(
+        f"Assistant:   {_ASSISTANT_DISPLAY.get(thread.expected_assistant, _ASSISTANT_UNKNOWN)}"
+    )
     lines.append("")
     lines.append("--- Body ---")
 
@@ -163,7 +170,8 @@ class DetailScreen(Screen):
         self.query_one("#detail-help", Static).update(help_text)
         status = (
             f"Sender: {self.thread.expected_sender_type}  Label: {self.thread.expected_label}"
-            f"  Assistant: {_ASSISTANT_DISPLAY[self.thread.expected_assistant]}"
+            f"  Assistant: "
+            f"{_ASSISTANT_DISPLAY.get(self.thread.expected_assistant, _ASSISTANT_UNKNOWN)}"
         )
         self.query_one("#detail-status", Static).update(status)
 
@@ -209,7 +217,7 @@ class DetailScreen(Screen):
         # Tri-state cycle unset -> yes -> no -> unset, mirroring the `e` toggle:
         # same auto-save, `reviewed` and `excluded` left untouched. Reversible
         # by pressing `a` until the value comes round again.
-        self.thread.expected_assistant = _ASSISTANT_CYCLE[self.thread.expected_assistant]
+        self.thread.expected_assistant = _ASSISTANT_CYCLE.get(self.thread.expected_assistant)
         self._auto_save()
         self._refresh()
 
