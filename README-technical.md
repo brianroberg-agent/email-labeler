@@ -440,7 +440,10 @@ each call of a newsletter grading) resets it. The halt is
 per-function (decisions D5, D19): a newsletter-tier balance fault halts
 newsletter grading while email triage keeps classifying, and vice versa; when
 the two share one client (`[newsletter.llm]` absent) a shared-provider fault
-halts both within a cycle or two. HTTP 429 never halts, even with quota
+halts both, but not at the same moment: each function's slot needs its own
+`balance_halt_strikes` consecutive faults, and a function accrues at most one
+fault per thread per cycle — with a single pending newsletter thread the
+newsletter slot trips on the third cycle. HTTP 429 never halts, even with quota
 phrasing — a per-minute rate limit is worded identically to hard quota
 exhaustion, and a wrong halt (an hour's outage and a push, since D22) is worse
 than treating a rare 429-signaled out-of-funds as provider unavailability:

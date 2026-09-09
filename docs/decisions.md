@@ -145,6 +145,10 @@ did:
   direction accepts the fetch-and-skip churn: the query cannot express "not
   to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
   within a cycle or two, which is correct: the fault disables both functions.
+  (Wording of the record; the pace is per-slot — each needs its own
+  `balance_halt_strikes` consecutive faults and accrues at most one per thread
+  per cycle, so a single pending newsletter thread trips the second slot on the
+  third cycle.)
   **Reset superseded by D22 (2026-09-09):** "until restart" / "restart-only
   reset" was this corollary's wording as implemented in Wave 2 and is kept
   here as the record; the halt now trips on the `balance_halt_strikes`-th

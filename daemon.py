@@ -539,8 +539,12 @@ class FunctionHalts:
     halted when deciding whether anything is left to do.
 
     When the two functions share one LLM client ([newsletter.llm] absent), a
-    shared-provider fault trips both slots within a cycle or two as each
-    function hits its own request — correct, since the fault does disable both.
+    shared-provider fault eventually trips both slots as each function hits its
+    own request — correct, since the fault does disable both. Not at the same
+    moment, though: each slot needs its own ``strikes_to_trip`` consecutive
+    faults, and a function accrues at most one fault per thread per cycle, so
+    with a single pending newsletter thread the newsletter slot trips on the
+    third cycle (shipped count: config.toml [daemon] balance_halt_strikes).
     """
 
     def __init__(
