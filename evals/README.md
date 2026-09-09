@@ -58,6 +58,8 @@ Interactive CLI for reviewing and correcting labels in the golden set. Saves ato
 
 Hotkeys: sender type `p`/`s` (person/service); label `r`/`f`/`l` (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit.
 
+**The assistant question.** A thread you label `needs_response` gets a third prompt — `Assistant obligation? [y] yes [n] no` — recording whether the obligation is one the assistant can discharge rather than you (issue #78). Any other label skips the prompt and leaves the field unset. At that prompt `n` answers "no", so notes is not offered there; take notes at the sender or label step instead. In `--edit`, `a` cycles the same field unset -> yes -> no -> unset. Relabeling a thread away from `needs_response`, in either tool, clears the annotation.
+
 ```bash
 # Review all threads (blind mode by default)
 uv run python -m evals.review
@@ -81,8 +83,9 @@ uv run python -m evals.review --unreviewed-only
 uv run python -m evals.review --unreviewed-only --sender-type person
 
 # Where does the set stand? Composition dashboard (read-only, no TUI):
-# total / excluded / pending counts plus a sender × label crosstab of the
-# reviewed & unexcluded threads — the set run_eval actually scores.
+# total / excluded / pending counts, assistant-annotation progress, plus a
+# sender × label crosstab of the reviewed & unexcluded threads — the set
+# run_eval actually scores.
 uv run python -m evals.review --stats
 ```
 

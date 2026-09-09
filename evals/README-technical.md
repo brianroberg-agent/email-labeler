@@ -29,9 +29,11 @@ Harvest always appends to `--output`, deduplicating by thread ID. There is no ov
 | `--filter-label` | Show only threads with this label |
 | `--sender-type` | Show only threads with this expected sender type (`person` or `service`). In `--edit` mode, like `--filter-label`, an explicit filter replaces the reviewed-only default |
 | `--start-at` | Start at thread index (0-based) |
-| `--stats` | Print a composition summary and exit (read-only, no TUI): total / excluded / unreviewed-pending / reviewed-&-unexcluded counts, plus a sender × label crosstab of the reviewed-&-unexcluded set (what `run_eval` scores) |
+| `--stats` | Print a composition summary and exit (read-only, no TUI): total / excluded / unreviewed-pending / reviewed-&-unexcluded counts, an assistant-annotation line (annotated vs unannotated `needs_response` threads in that set), plus a sender × label crosstab of the reviewed-&-unexcluded set (what `run_eval` scores) |
 
 Review hotkeys: `p`/`s` sender (person/service); `r`/`f`/`l` label (needs_response/fyi/low_priority); `n` notes; `z` undo; `k` skip; `e` exclude; `q` quit. **Skip** (`k`) leaves the thread unreviewed so it reappears later. **Exclude** (`e`) sets `excluded=True` (also marks reviewed): excluded threads are dropped from the review queue here and from `run_eval` entirely. In the `--edit` TUI detail view, `e` is a symmetric **toggle** (exclude an included thread / un-exclude an excluded one; `reviewed` is left untouched). The `excluded` field is persisted in the golden set JSONL; legacy records using the old `skipped` key are still read as excluded.
+
+**Assistant annotation** (`expected_assistant`, issue #78). A tri-state field on `GoldenThread`: `True`/`False` = the obligation is/is not one the assistant can discharge; `None` = not annotated, which is how records written before the field load. In blind review it is asked as a third step, `[y]`/`[n]`, and only when the chosen label is `needs_response`; the queue keys (`z`/`k`/`e`/`q`) still work there, but `n` answers the question, so notes is reachable only at the sender and label steps. In the `--edit` TUI detail view, `a` cycles the field unset -> yes -> no -> unset with the same auto-save as `e`. Setting a label anywhere in either tool goes through `evals.review.apply_label`, which clears the annotation when the label moves off `needs_response` — the field has no meaning on an FYI or low-priority thread, and a stale value would inflate the annotated count. Loading never mutates it.
 
 ### run_eval
 
@@ -114,6 +116,8 @@ the dialect it accepts via `--extra-body`/`--local-extra-body`.
 | `--results-dir` | Directory of results for trend view |
 | `--verbose` | Show per-thread disagreements |
 | `--format` | `table` (default) or `json` |
+
+**Assistant-field metrics** (issue #78). Reported separately from the three-way label accuracy, as binary precision/recall/F1 over the threads whose expected label is `needs_response` AND which carry a non-null `expected_assistant`; that n is printed alongside every figure. Within that set a thread counts as a positive prediction only when `predicted_assistant` is `True`, so an absent prediction counts as a negative — which is what the absence of the marker label means in practice. A positive prediction on a thread outside the set (wrong label, or not yet annotated) is reported on its own line as `out_of_scope_positives` instead of entering precision. While a run contains no `predicted_assistant` values at all, the block prints annotation progress — `assistant: no predictions in this run (N of M needs_response threads annotated)` — rather than a 0% that would read as a measured failure. `print_trend` carries an `Assistant` column (the F1, `N/A` with no predictions); `--compare` prints a precision/recall/F1 block when both runs have predictions; `--format json` carries the whole `assistant` section.
 
 ## Newsletter Evaluation CLI Reference
 
