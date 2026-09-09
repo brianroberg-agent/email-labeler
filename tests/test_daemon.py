@@ -1926,6 +1926,42 @@ class TestReprobeHalts:
         email_client.probe.assert_awaited_once()
         nl_client.probe.assert_awaited_once()
 
+    async def test_due_probes_run_concurrently_with_the_short_timeout(self):
+        """Review of #81 (Fable 6 / Opus F6): probes ran one after another with
+        the 60 s default timeout, at the loop head ahead of the heartbeat write —
+        two hung slots stalled the loop up to 120 s against the healthcheck's
+        180 s threshold. Due slots are now probed together (asyncio.gather) with
+        the short HALT_REPROBE_TIMEOUT, so the worst stall is one timeout."""
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        started: list[str] = []
+        gate = asyncio.Event()
+
+        def gated_client(name):
+            async def probe(timeout=None):
+                started.append(name)
+                await gate.wait()
+                return _OK
+            client = MagicMock()
+            client.probe = AsyncMock(side_effect=probe)
+            return client
+
+        email_client = gated_client("email")
+        nl_client = gated_client("newsletter")
+        halts.email.trip("email out of funds", probe_client=email_client, now=0.0)
+        halts.newsletter.trip("nl out of funds", probe_client=nl_client, now=0.0)
+
+        task = asyncio.create_task(daemon.reprobe_halts(halts, now=3600.0, interval=3600))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Both probes are in flight before either has answered.
+        assert sorted(started) == ["email", "newsletter"]
+        gate.set()
+        resumed = await task
+
+        assert [name for name, _d in resumed] == ["email triage", "newsletter grading"]
+        email_client.probe.assert_awaited_once_with(timeout=daemon.HALT_REPROBE_TIMEOUT)
+        nl_client.probe.assert_awaited_once_with(timeout=daemon.HALT_REPROBE_TIMEOUT)
+
     async def test_disabled_function_is_not_probed(self):
         halts = daemon.FunctionHalts(email_enabled=False, newsletter_enabled=True)
         client = _probe_client(_OK)

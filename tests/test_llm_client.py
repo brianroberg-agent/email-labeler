@@ -7,6 +7,7 @@ import pytest
 
 from llm_client import (
     DEFAULT_AVAILABILITY_TIMEOUT,
+    HALT_REPROBE_TIMEOUT,
     AvailabilityResult,
     LLMBalanceError,
     LLMClient,
@@ -879,6 +880,49 @@ class TestProbe:
             await local_client.probe()
 
             assert mock_client_cls.call_args.kwargs["timeout"] == DEFAULT_AVAILABILITY_TIMEOUT
+
+    async def test_probe_sends_the_clients_real_request_shape(self):
+        """Review of #81 (Fable 5 / Opus unverified 1): a probe with max_tokens=1
+        exercised a different request than real work sends, so a provider whose
+        balance rejection depends on the requested budget (or on the GLM
+        `thinking` field) could pass the probe and fail every real request,
+        cycling halt/resume hourly. The probe now carries the client's own
+        max_tokens, temperature, extra_body and — for GLM — the same thinking
+        field complete() adds; only the messages differ (a fixed "ping")."""
+        client = LLMClient(
+            base_url="https://api.cloud.example.com/v1/chat/completions",
+            api_key="sk-test-key",
+            model="zai-org/glm-5",
+            max_tokens=1024,
+            temperature=0.3,
+            timeout=60,
+            extra_body={"top_p": 0.9},
+        )
+        mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})
+        with patch("llm_client.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await client.probe()
+
+            body = mock_client.post.call_args.kwargs["json"]
+        assert body["max_tokens"] == 1024
+        assert body["temperature"] == 0.3
+        assert body["top_p"] == 0.9
+        assert body["thinking"] == {"type": "enabled"}
+        assert body["messages"] == [{"role": "user", "content": "ping"}]
+        assert "ping" not in str(body["model"])
+
+    def test_halt_reprobe_timeout_is_short(self):
+        """Review of #81 (Fable 6 / Opus F6): the halted-function re-probe runs
+        at the poll-loop head ahead of the heartbeat write, so its timeout must
+        stay well inside the container healthcheck's 180 s staleness threshold
+        even with every halted slot hung — unlike the startup preflight, which
+        is generous to cover a cold model load."""
+        assert HALT_REPROBE_TIMEOUT < DEFAULT_AVAILABILITY_TIMEOUT
+        assert HALT_REPROBE_TIMEOUT <= 30
 
     async def test_probe_explicit_timeout_is_honored(self, local_client):
         mock_response = _mock_response(json_data={"choices": [{"message": {"content": "ok"}}]})

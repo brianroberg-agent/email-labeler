@@ -24,7 +24,7 @@ from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
-from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
+from llm_client import HALT_REPROBE_TIMEOUT, LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import (
     AssessmentSinkError,
     NewsletterClassifier,
@@ -581,31 +581,36 @@ async def reprobe_halts(
     """Re-probe each halted enabled function whose probe is due; clear the ones
     whose provider answers (decision D22, issue #73).
 
-    One cheap request (``LLMClient.probe``: max_tokens=1, a fixed innocuous
-    prompt, no email content) per ``interval`` seconds per halted function,
-    through THAT function's own client — email and newsletter may sit on
-    different providers. A probe that answers 200 clears the slot and the
-    function resumes on the next cycle; a probe that does not leaves the slot
-    tripped and logs below ERROR (the per-cycle halt line is already the
-    loudness — an hourly ERROR would only repeat it). Nothing raised by a probe
-    escapes: this runs outside the poll loop's try/except.
+    One request (``LLMClient.probe``: the client's own request shape and a
+    fixed innocuous prompt, no email content) per ``interval`` seconds per
+    halted function, through THAT function's own client — email and newsletter
+    may sit on different providers. Every due slot is probed at once
+    (``asyncio.gather``) with ``HALT_REPROBE_TIMEOUT``, so the loop head stalls
+    for at most one short timeout however many slots hang, keeping the
+    heartbeat well inside the healthcheck threshold. A probe that answers 200
+    clears the slot and the function resumes on the next cycle; a probe that
+    does not leaves the slot tripped and logs below ERROR (the per-cycle halt
+    line is already the loudness — an hourly ERROR would only repeat it).
+    Nothing raised by a probe escapes: this runs outside the poll loop's
+    try/except.
 
     Returns ``(function name, seconds halted)`` for each function that resumed,
-    so the caller can notify and undo any halt-time state of its own.
+    in enabled-slot order, so the caller can notify and undo any halt-time
+    state of its own.
     """
-    resumed: list[tuple[str, float]] = []
-    for name, slot in halts.enabled_slots():
-        if not slot.probe_due(now, interval):
-            continue
+    due = [(name, slot) for name, slot in halts.enabled_slots() if slot.probe_due(now, interval)]
+    for _name, slot in due:
         slot.last_probe_at = now
+
+    async def probe_one(name: str, slot: DaemonHalt) -> tuple[str, float] | None:
         if slot.probe_client is None:
             log.info("%s still halted — no provider client recorded to re-probe", name)
-            continue
+            return None
         try:
-            result = await slot.probe_client.probe()
+            result = await slot.probe_client.probe(timeout=HALT_REPROBE_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — a probe fault must never kill the loop
             log.warning("%s still halted — re-probe raised %s: %s", name, type(exc).__name__, exc)
-            continue
+            return None
         if result.ok:
             downtime = now - (slot.tripped_at if slot.tripped_at is not None else now)
             log.info(
@@ -614,13 +619,15 @@ async def reprobe_halts(
                 name, format_downtime(downtime),
             )
             slot.clear()
-            resumed.append((name, downtime))
-        else:
-            log.info(
-                "%s still halted — re-probe failed (%s); next probe in %ds",
-                name, result.detail() or "no response detail", interval,
-            )
-    return resumed
+            return (name, downtime)
+        log.info(
+            "%s still halted — re-probe failed (%s); next probe in %ds",
+            name, result.detail() or "no response detail", interval,
+        )
+        return None
+
+    outcomes = await asyncio.gather(*(probe_one(name, slot) for name, slot in due))
+    return [outcome for outcome in outcomes if outcome is not None]
 
 
 async def notify_new_halts(

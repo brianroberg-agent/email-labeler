@@ -17,6 +17,19 @@ from retry import retry_with_backoff
 # routinely exceeds 10s, and timing out would wrongly report it unreachable.
 DEFAULT_AVAILABILITY_TIMEOUT = 60
 
+# Seconds to wait on a HALTED function's re-probe (daemon.reprobe_halts, decision
+# D22). Deliberately shorter than DEFAULT_AVAILABILITY_TIMEOUT: the re-probe runs
+# at the poll-loop head, ahead of the heartbeat write, and the container
+# healthcheck declares the daemon unhealthy once that heartbeat is 180 s stale —
+# so even every halted slot hanging for the full timeout (they are probed
+# concurrently, so the stall is one timeout, not a sum) must leave the 60 s poll
+# cycle well inside that threshold. The client being re-probed is normally a
+# warm cloud provider, not a cold on-demand model load; and the probe carries the
+# client's real max_tokens (see probe()), so a reasoning model answering "ping"
+# may think for a while — 30 s covers that with room to spare. A slow probe is a
+# failed probe: the halt simply holds for another interval (review of PR #81).
+HALT_REPROBE_TIMEOUT = 30
+
 
 @dataclass(frozen=True)
 class AvailabilityResult:
@@ -216,6 +229,36 @@ class LLMClient:
             return True
         return self.extra_body.get("enable_thinking") is False
 
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _request_body(self, messages: list[dict], *, include_thinking: bool) -> dict:
+        """The chat-completion body this client sends: model, max_tokens,
+        temperature, ``extra_body`` and (for GLM) the thinking field, around the
+        given messages. Shared by ``complete`` and ``probe`` so a probe exercises
+        the same request shape as real work — a provider whose rejection depends
+        on the requested budget or on a body field must reject both alike
+        (review of PR #81, decision D22).
+        """
+        body = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": messages,
+            **self.extra_body,
+        }
+        # GLM models require an explicit thinking field. Honor a disable request
+        # from extra_body (e.g. --no-think, which GLM otherwise ignores) instead of
+        # contradicting it with enabled, and never override a `thinking` field the
+        # caller set explicitly in extra_body.
+        if include_thinking and self._is_glm_model() and "thinking" not in body:
+            disabled = self._extra_body_disables_thinking()
+            body["thinking"] = {"type": "disabled" if disabled else "enabled"}
+        return body
+
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
@@ -250,28 +293,14 @@ class LLMClient:
                 (400/401/403/404/422… without a balance signature) —
                 request-specific, a strike candidate.
         """
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        body = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "messages": [
+        headers = self._headers()
+        body = self._request_body(
+            [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            **self.extra_body,
-        }
-
-        # GLM models require an explicit thinking field. Honor a disable request
-        # from extra_body (e.g. --no-think, which GLM otherwise ignores) instead of
-        # contradicting it with enabled, and never override a `thinking` field the
-        # caller set explicitly in extra_body.
-        if include_thinking and self._is_glm_model() and "thinking" not in body:
-            disabled = self._extra_body_disables_thinking()
-            body["thinking"] = {"type": "disabled" if disabled else "enabled"}
+            include_thinking=include_thinking,
+        )
 
         async def _do_request() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -428,7 +457,10 @@ class LLMClient:
     async def probe(self, timeout: float | None = None) -> "AvailabilityResult":
         """Probe the endpoint, returning status detail (issue #41 item 7).
 
-        Sends a minimal completion request. ``ok`` is True only on HTTP 200.
+        Sends one completion request with this client's real request shape
+        (max_tokens, temperature, extra_body, GLM thinking field — see
+        ``_request_body``) and a fixed one-word user message carrying no email
+        content. ``ok`` is True only on HTTP 200.
         ``status_code`` carries the HTTP status when a response arrived — so a
         404 (which usually means the requested model name doesn't match the
         served one) is distinguishable from an endpoint that is simply down.
@@ -443,17 +475,10 @@ class LLMClient:
         if timeout is None:
             timeout = DEFAULT_AVAILABILITY_TIMEOUT
         try:
-            headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-
-            body = {
-                "model": self.model,
-                "max_tokens": 1,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": "ping"}],
-                **self.extra_body,
-            }
+            headers = self._headers()
+            body = self._request_body(
+                [{"role": "user", "content": "ping"}], include_thinking=True
+            )
 
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(self.base_url, headers=headers, json=body)
