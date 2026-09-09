@@ -453,6 +453,12 @@ class DaemonHalt:
     ) -> None:
         if self.reason is None:
             self.reason = reason
+            if fault is not None:
+                # Kept for the notification's four scalar fields, not for its
+                # frames: a live traceback would pin the thread JSON, transcript,
+                # request body and response below the raise for the whole halt
+                # (hours to days). Same object, so `halt.fault is exc` still holds.
+                fault.__traceback__ = None
             self.fault = fault
             self.probe_client = probe_client
             self.tripped_at = time.monotonic() if now is None else now

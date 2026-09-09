@@ -1855,6 +1855,28 @@ class TestDaemonHalt:
             halt.record_balance_error(LLMBalanceError("x", tier="local"), probe_client=local)
         assert halt.probe_client is local
 
+    def test_trip_drops_the_faults_traceback(self):
+        """Review of #81 (Fable 8): the tripping exception is kept for the halt
+        push (four scalar fields), but its traceback pinned every frame below
+        the raise — the Gmail thread JSON, the transcript, the request body and
+        the 403 response — in memory for the whole halt, hours to days. The
+        exception object stays (tests and the notification read `fault`); its
+        traceback goes."""
+
+        def raise_with_a_big_local():
+            payload = "x" * 10_000  # noqa: F841 — stands in for the thread transcript
+            raise LLMBalanceError("out of funds", tier="cloud", status_code=403)
+
+        halt = DaemonHalt()
+        for _ in range(3):
+            try:
+                raise_with_a_big_local()
+            except LLMBalanceError as exc:
+                halt.record_balance_error(exc)
+        assert halt.tripped is True
+        assert isinstance(halt.fault, LLMBalanceError)
+        assert halt.fault.__traceback__ is None
+
     def test_probe_is_due_once_per_interval(self):
         """The re-probe is paced from the trip, then from the last probe: one
         cheap request per interval, not one per poll cycle."""
