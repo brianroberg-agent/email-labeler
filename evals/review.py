@@ -46,7 +46,8 @@ def apply_label(thread: GoldenThread, label: str) -> None:
     The assistant annotation (issue #78) only has meaning while the thread is
     needs_response, so moving the label off it clears the field rather than
     leaving a stale yes/no behind. Moving the label TO needs_response leaves any
-    existing annotation alone. Only edit paths call this; loading never mutates.
+    existing annotation alone. The invariant is applied here, at edit time;
+    loading a golden set leaves the field as stored.
     """
     thread.expected_label = label
     if label != "needs_response":
