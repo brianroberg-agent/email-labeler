@@ -29,6 +29,7 @@ recipient) is configuration, not something to abstract away.
 - `evals/README.md` — Human-oriented eval suite guide: pipeline stages, common workflows, key commands
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
 - `docs/decisions.md` — Decisions registry: adjudicated tradeoffs reviews must not re-litigate (see Review Charter)
+- `docs/newsletter-rubric.md` — Newsletter grading rubric: purpose (coaching first, shortlisting a slice), what each dimension/theme grade means, golden-set labeling and exclusion procedure, decided vs proposed rules; the `[newsletter.prompts.*]` implement it (D23)
 - `docs/plans/` — Frozen history: every file carries a status header; superseded plans are records, not instructions
 - `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest while the daemon is stopped, before fresh give-ups mix into the label), and not to be executed by an agent with Gmail write access
 - `scripts/migrate_assessments.py` — Convert pre-#53 records in an assessments JSONL (list themes → graded dicts, 1-5 scores → Poor/OK/Good) so the review TUI can open a file with old history; tiers are preserved verbatim. Dry-run by default, `--in-place` applies (keeps `.bak`)
