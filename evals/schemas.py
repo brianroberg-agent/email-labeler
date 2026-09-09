@@ -22,6 +22,11 @@ class GoldenThread:
     reviewed: bool = False
     notes: str = ""
     excluded: bool = False  # permanently set aside: never reviewed-queued or evaluated
+    # Tri-state annotation (issue #78): True/False = an obligation the assistant
+    # can/cannot discharge; None = not annotated. Meaningful only while
+    # expected_label is "needs_response" — the review tools clear it when the
+    # label moves away.
+    expected_assistant: bool | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -37,6 +42,7 @@ class GoldenThread:
             "reviewed": self.reviewed,
             "notes": self.notes,
             "excluded": self.excluded,
+            "expected_assistant": self.expected_assistant,
         }
 
     @classmethod
@@ -55,6 +61,8 @@ class GoldenThread:
             notes=d.get("notes", ""),
             # Backward compat: pre-existing golden sets persisted this as "skipped".
             excluded=d.get("excluded", d.get("skipped", False)),
+            # Absent on every record written before #78.
+            expected_assistant=d.get("expected_assistant"),
         )
 
 
@@ -71,6 +79,12 @@ class PredictionResult:
     predicted_label_raw: str | None = None
     sender_type_correct: bool | None = None
     label_correct: bool | None = None
+    # Assistant field (issue #78). expected_ mirrors the golden annotation;
+    # predicted_ is None until something predicts it; assistant_correct is the
+    # per-thread comparison, None whenever either side is missing.
+    expected_assistant: bool | None = None
+    predicted_assistant: bool | None = None
+    assistant_correct: bool | None = None
     privacy_violation: bool = False  # True if expected=person, predicted=service
     duration_seconds: float = 0.0
     error: str | None = None
@@ -87,6 +101,9 @@ class PredictionResult:
             "predicted_label_raw": self.predicted_label_raw,
             "sender_type_correct": self.sender_type_correct,
             "label_correct": self.label_correct,
+            "expected_assistant": self.expected_assistant,
+            "predicted_assistant": self.predicted_assistant,
+            "assistant_correct": self.assistant_correct,
             "privacy_violation": self.privacy_violation,
             "duration_seconds": self.duration_seconds,
             "error": self.error,
@@ -104,6 +121,9 @@ class PredictionResult:
             predicted_label_raw=d.get("predicted_label_raw"),
             sender_type_correct=d.get("sender_type_correct"),
             label_correct=d.get("label_correct"),
+            expected_assistant=d.get("expected_assistant"),
+            predicted_assistant=d.get("predicted_assistant"),
+            assistant_correct=d.get("assistant_correct"),
             privacy_violation=d.get("privacy_violation", False),
             duration_seconds=d.get("duration_seconds", 0.0),
             error=d.get("error"),

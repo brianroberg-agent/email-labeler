@@ -86,6 +86,39 @@ class TestGoldenThread:
         restored = GoldenThread.from_dict(d)
         assert restored.excluded is True
 
+    def test_expected_assistant_defaults_to_none_and_round_trips(self):
+        # Issue #78 groundwork: the annotation is tri-state. None = "not
+        # annotated", which is what every pre-#78 record is.
+        gt = GoldenThread(
+            thread_id="t_asst",
+            messages=[],
+            senders=[],
+            subject="",
+            snippet="",
+            expected_sender_type="person",
+            expected_label="needs_response",
+        )
+        assert gt.expected_assistant is None
+        gt.expected_assistant = True
+        d = gt.to_dict()
+        assert d["expected_assistant"] is True
+        assert GoldenThread.from_dict(d).expected_assistant is True
+        gt.expected_assistant = False
+        assert GoldenThread.from_dict(gt.to_dict()).expected_assistant is False
+
+    def test_records_without_expected_assistant_load_as_none(self):
+        # Every record written before #78 lacks the key entirely.
+        d = {
+            "thread_id": "t_old",
+            "messages": [],
+            "senders": [],
+            "subject": "",
+            "snippet": "",
+            "expected_sender_type": "person",
+            "expected_label": "needs_response",
+        }
+        assert GoldenThread.from_dict(d).expected_assistant is None
+
     def test_legacy_skipped_key_maps_to_excluded(self):
         # Pre-existing golden sets persisted the marker as "skipped".
         d = {
@@ -129,6 +162,43 @@ class TestPredictionResult:
         assert restored.privacy_violation is False
         assert restored.duration_seconds == 1.234
         assert restored.error is None
+
+    def test_assistant_fields_round_trip(self):
+        # Issue #78 groundwork: the three assistant fields are carried through
+        # the result record even though nothing predicts the field yet.
+        pr = PredictionResult(
+            thread_id="t_asst",
+            expected_sender_type="person",
+            expected_label="needs_response",
+            expected_assistant=True,
+            predicted_assistant=False,
+            assistant_correct=False,
+        )
+        d = pr.to_dict()
+        assert d["expected_assistant"] is True
+        assert d["predicted_assistant"] is False
+        assert d["assistant_correct"] is False
+        restored = PredictionResult.from_dict(d)
+        assert restored.expected_assistant is True
+        assert restored.predicted_assistant is False
+        assert restored.assistant_correct is False
+
+    def test_assistant_fields_default_to_none(self):
+        pr = PredictionResult(
+            thread_id="t_plain",
+            expected_sender_type="person",
+            expected_label="fyi",
+        )
+        assert pr.expected_assistant is None
+        assert pr.predicted_assistant is None
+        assert pr.assistant_correct is None
+        # A pre-#78 result record has none of the three keys.
+        restored = PredictionResult.from_dict(
+            {"thread_id": "t_old", "expected_sender_type": "person", "expected_label": "fyi"}
+        )
+        assert restored.expected_assistant is None
+        assert restored.predicted_assistant is None
+        assert restored.assistant_correct is None
 
     def test_round_trip_with_error(self):
         pr = PredictionResult(
