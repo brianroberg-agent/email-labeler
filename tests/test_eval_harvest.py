@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 
 import pytest
 
@@ -242,6 +243,22 @@ class TestGmailLabelArg:
         # The name is embedded in a quoted Gmail term and Gmail has no escape.
         with pytest.raises(argparse.ArgumentTypeError):
             gmail_label_arg('eval/"hot" leads')
+
+
+class TestCliGmailLabelWiring:
+    """The argparse boundary must actually use gmail_label_arg (not just define it)."""
+
+    @pytest.mark.parametrize("value", ["", "   ", 'eval/"hot" leads'])
+    def test_cli_rejects_bad_gmail_label_before_running(self, value, monkeypatch):
+        ran = []
+        # If argparse let the value through, cli() would reach asyncio.run(main(..));
+        # stub it so a wrongly-accepted value is recorded rather than hitting the network.
+        monkeypatch.setattr(harvest_mod.asyncio, "run", lambda coro: (ran.append(coro), coro.close()))
+        monkeypatch.setattr(sys, "argv", ["harvest", "--gmail-label", value, "--proxy-url", "http://x"])
+        with pytest.raises(SystemExit) as excinfo:
+            harvest_mod.cli()
+        assert excinfo.value.code == 2  # argparse usage error
+        assert ran == []
 
 
 class TestHarvestQuery:
