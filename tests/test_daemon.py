@@ -2429,6 +2429,101 @@ class TestHaltReprobeWiring:
         assert load_config()["daemon"]["halt_probe_interval_seconds"] == 3600
 
 
+def _fake_notifier(monkeypatch, send=None):
+    """Replace HaltNotifier.from_env with a stub whose send() is an AsyncMock."""
+    fake = MagicMock()
+    fake.enabled = True
+    fake.send = send if send is not None else AsyncMock(return_value=True)
+    monkeypatch.setattr(daemon.HaltNotifier, "from_env", classmethod(lambda cls: fake))
+    return fake
+
+
+class TestHaltNotificationWiring:
+    """Push on halt (once per halt, not hourly) and on resume (D22, issue #73);
+    a notifier fault never reaches the poll loop."""
+
+    async def test_halt_push_is_sent_once_per_halt(self, monkeypatch, tmp_path):
+        fake = _fake_notifier(monkeypatch)
+        client = _probe_client(_STILL_403, _STILL_403, _STILL_403)
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+            process_mock=_halt_email_with(client),
+            cycles=4,
+            daemon_overrides={"halt_probe_interval_seconds": 0},
+        )
+        # Four cycles, three of them halted with a failed probe each: ONE push.
+        fake.send.assert_awaited_once()
+        title = fake.send.call_args.args[0]
+        assert title == "email-labeler halted: email triage"
+
+    async def test_resume_push_names_the_function(self, monkeypatch, tmp_path):
+        fake = _fake_notifier(monkeypatch)
+        client = _probe_client(_OK)
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": []},
+                {"messages": []},
+            ],
+            process_mock=_halt_email_with(client),
+            cycles=3,
+            daemon_overrides={"halt_probe_interval_seconds": 0},
+        )
+        titles = [c.args[0] for c in fake.send.await_args_list]
+        assert titles == [
+            "email-labeler halted: email triage",
+            "email-labeler resumed: email triage",
+        ]
+
+    async def test_a_second_halt_after_resume_pushes_again(self, monkeypatch, tmp_path):
+        """"Once per halt" — a fresh halt after a resume is a new event."""
+        fake = _fake_notifier(monkeypatch)
+        client = _probe_client(_OK, _STILL_403)
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": [{"id": "m2", "threadId": "t2"}]},
+            ],
+            process_mock=_halt_email_with(client),
+            cycles=4,
+            daemon_overrides={"halt_probe_interval_seconds": 0},
+        )
+        titles = [c.args[0] for c in fake.send.await_args_list]
+        assert titles == [
+            "email-labeler halted: email triage",
+            "email-labeler resumed: email triage",
+            "email-labeler halted: email triage",
+        ]
+
+    async def test_notifier_fault_does_not_stop_the_loop(self, monkeypatch, tmp_path):
+        _fake_notifier(monkeypatch, send=AsyncMock(side_effect=RuntimeError("ntfy down")))
+        client = _probe_client(_STILL_403, _STILL_403)
+        proxy = await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+            process_mock=_halt_email_with(client),
+            cycles=3,
+            daemon_overrides={"halt_probe_interval_seconds": 0},
+        )
+        # The loop lived through the raising notifier: cycle 1 polled, cycles
+        # 2–3 stood down (the probe kept failing) — no exception escaped.
+        assert proxy.list_messages.call_count == 1
+
+    async def test_startup_builds_the_notifier_from_env(self, monkeypatch, tmp_path, caplog):
+        """Unset vars → the one-time WARNING at startup, and otherwise the daemon
+        behaves exactly as before (the cycle runs; nothing is sent)."""
+        monkeypatch.delenv("NTFY_URL", raising=False)
+        monkeypatch.delenv("NTFY_TOKEN", raising=False)
+        with caplog.at_level(logging.WARNING, logger="email-labeler"):
+            proxy = await run_poll_cycles(monkeypatch, tmp_path, [{"messages": []}])
+        assert proxy.list_messages.call_count == 1
+        warnings = [r for r in caplog.records if "halt notifications disabled" in r.getMessage()]
+        assert len(warnings) == 1
+
+
 class TestPerFunctionHalt:
     """Functions fail independently (decision D5's scope rule; resolves D19's
     "today daemon-wide" note): a provider-balance fault halts the function whose

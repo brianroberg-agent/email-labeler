@@ -79,6 +79,9 @@ email-labeler/
 | `WRITE_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent label-application writes (`modify_message`), overriding `write_parallel` in `config.toml`. Bounds the proxy-write burst when `max_emails_per_cycle` is large. Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s). |
 | `GIT_SHA` | No | `unknown` | Git commit SHA of the running build, logged once at daemon startup (decision D11). Stamped by the image build (Dockerfile `ARG`/`ENV`); not an operator knob. |
 | `MAX_FAILURES` | No | `5` (from `config.toml`) | Strikes a thread takes before it is set aside under `agent/attempted`, overriding `max_failures` in `config.toml`. Only failures the cycle-level attribution blames on the thread count (decision D5 Rule 2). Also sets the masquerade escalation threshold. |
+| `HALT_PROBE_INTERVAL_SECONDS` | No | `3600` (from `config.toml`) | How often a halted function re-probes its LLM provider and resumes if it answers, overriding `halt_probe_interval_seconds` in `config.toml` (decision D22). |
+| `NTFY_URL` | No | — | Full ntfy topic URL for halt/resume push notifications (decision D22). Unset (or `NTFY_TOKEN` unset): notifications are disabled, one WARNING at startup, otherwise no change in behaviour. |
+| `NTFY_TOKEN` | No | — | Bearer token for `NTFY_URL`. Mint one for the labeler alone — do not reuse another service's. Secret: never logged. |
 
 Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
 

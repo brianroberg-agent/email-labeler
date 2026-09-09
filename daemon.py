@@ -40,6 +40,7 @@ from newsletter import (
     sink_writability_warning,
     write_assessment,
 )
+from notify import HaltNotifier, format_downtime, halt_message, resume_message
 from proxy_client import (
     TRANSIENT_TRANSPORT_ERRORS,
     GmailProxyClient,
@@ -548,13 +549,6 @@ class FunctionHalts:
         )
 
 
-def format_downtime(seconds: float) -> str:
-    """`Xh Ym` / `Ym` for a halt's duration — the resume line and push."""
-    minutes = int(seconds // 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
-
-
 async def reprobe_halts(
     halts: FunctionHalts, now: float, interval: float
 ) -> list[tuple[str, float]]:
@@ -601,6 +595,41 @@ async def reprobe_halts(
                 name, result.detail() or "no response detail", interval,
             )
     return resumed
+
+
+async def notify_new_halts(
+    halts: FunctionHalts, notifier: HaltNotifier, probe_interval: int
+) -> None:
+    """Push once per halt (D22): each tripped slot not yet ``notified``.
+
+    Called at the top of each poll cycle, BEFORE the re-probe, so a halt that
+    trips and resumes between two cycles still reports both events in order.
+    The halt push therefore lags the trip by at most one poll interval. One
+    attempt per halt whatever its outcome — the flag is set before sending.
+    Wrapped so that even a notifier bug cannot reach the loop
+    (``HaltNotifier.send`` already never raises).
+    """
+    try:
+        for name, slot in halts.enabled_slots():
+            if slot.tripped and not slot.notified:
+                slot.notified = True
+                await notifier.send(
+                    *halt_message(
+                        name, slot.fault, tripped_wall=slot.tripped_wall,
+                        probe_interval=probe_interval,
+                    )
+                )
+    except Exception as exc:  # noqa: BLE001 — a notification must never fail the daemon
+        log.warning("Halt notification failed (%s: %s)", type(exc).__name__, exc)
+
+
+async def notify_resumes(notifier: HaltNotifier, resumed: list[tuple[str, float]]) -> None:
+    """Push once per resume (D22), in the cycle the probe answered."""
+    try:
+        for name, downtime in resumed:
+            await notifier.send(*resume_message(name, downtime))
+    except Exception as exc:  # noqa: BLE001 — a notification must never fail the daemon
+        log.warning("Resume notification failed (%s: %s)", type(exc).__name__, exc)
 
 
 def attribute_cycle_failures(
@@ -1637,6 +1666,9 @@ async def run_daemon() -> None:
     halt_probe_interval = resolve_int_env(
         "HALT_PROBE_INTERVAL_SECONDS", daemon_config.get("halt_probe_interval_seconds", 3600)
     )
+    # Push on halt and on resume (D22). Disabled — one WARNING here, then
+    # no-ops — unless NTFY_URL and NTFY_TOKEN are both set.
+    notifier = HaltNotifier.from_env()
 
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
     missing = await verify_labels_with_retry(label_manager)
@@ -1667,8 +1699,9 @@ async def run_daemon() -> None:
         # Halted functions re-probe their provider on the slow schedule and
         # clear themselves when it answers (D22). Runs before the stand-down
         # check so a resumed function polls in this very cycle.
-        for _name, _downtime in await reprobe_halts(halts, time.monotonic(), halt_probe_interval):
-            pass
+        await notify_new_halts(halts, notifier, halt_probe_interval)
+        resumed = await reprobe_halts(halts, time.monotonic(), halt_probe_interval)
+        await notify_resumes(notifier, resumed)
         if narrowed_by_halt and not halts.email.tripped:
             # Email triage resumed: its backlog must be fetched again.
             gmail_query = base_query
