@@ -3164,11 +3164,15 @@ class TestPerFunctionHalt:
         mock_label_manager.mark_processed.assert_not_called()
         mock_label_manager.apply_classification.assert_not_called()
 
-    async def test_query_is_narrowed_exactly_once(self, monkeypatch, tmp_path):
-        """The email-only-halt narrowing appends `to:recipient` ONCE. The
-        partial-halt branch runs every cycle for as long as the halt lasts:
-        re-appending would grow the query without bound (and re-log the
-        narrowing line) for as long as the halt does."""
+    async def test_narrowed_query_carries_the_filter_in_every_halted_cycle(
+        self, monkeypatch, tmp_path
+    ):
+        """Once email triage halts, every subsequent poll asks Gmail only for
+        the newsletter function's threads — and the cycle before the halt asks
+        for everything. (Renamed in the review of #81: the narrowing became an
+        assignment rather than an append, so the counts below no longer
+        distinguish the two forms; the gate that made them differ is pinned by
+        `test_the_narrowing_runs_once_per_halt_not_once_per_cycle`.)"""
         recipient = load_config()["newsletter"]["recipient"]
 
         async def halt_email(*args, **kwargs):
@@ -3190,6 +3194,40 @@ class TestPerFunctionHalt:
 
         queries = [c.kwargs["q"] for c in proxy.list_messages.call_args_list]
         assert [q.count(f"to:{recipient}") for q in queries] == [0, 1, 1, 1]
+
+    async def test_the_narrowing_runs_once_per_halt_not_once_per_cycle(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """The `narrowed_by_halt` gate. The partial-halt branch runs every cycle
+        for as long as the halt lasts; the narrowing inside it must fire once.
+        Without the gate the operator gets the narrowing line again every cycle
+        of a halt that can last hours — and under the pre-review *append* form
+        the query would also grow a fresh `to:recipient` clause each cycle,
+        without bound. Both are pinned: one narrowing line across five halted
+        cycles, and never two copies of the clause in one query."""
+        recipient = load_config()["newsletter"]["recipient"]
+
+        async def halt_email(*args, **kwargs):
+            kwargs["halts"].email.trip("cloud provider out of funds")
+            return False
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            proxy = await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [{"messages": [{"id": "m1", "threadId": "t1"}]}] + [{"messages": []}] * 5,
+                process_mock=halt_email,
+                keep_newsletter=True,
+                newsletter_output_file=tmp_path / "assessments.jsonl",
+            )
+
+        narrowings = [
+            r for r in caplog.records
+            if "Gmail query narrowed to the newsletter function" in r.getMessage()
+        ]
+        assert len(narrowings) == 1
+        queries = [c.kwargs["q"] for c in proxy.list_messages.call_args_list]
+        assert len(queries) == 6  # the halt narrows the query, it does not stop polling
+        assert max(q.count(f"to:{recipient}") for q in queries) == 1
 
     async def test_partial_halt_keeps_polling_and_names_the_halted_function(
         self, monkeypatch, tmp_path, caplog
