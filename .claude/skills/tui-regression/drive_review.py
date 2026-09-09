@@ -106,17 +106,37 @@ async def s_undo(chk):
 
 
 async def s_blind_full_flow(chk):
+    # needs_response opens a third step (issue #78): sender -> label -> assistant.
     ths = _threads()[:2]
     app = ReviewApp(ths, blind=True)
     async with app.run_test(size=SIZE) as pilot:
         await pilot.press("p")              # sender step -> person
         await pilot.pause()
         chk.eq(ths[0].expected_sender_type, "person", "blind sender set")
-        await pilot.press("r")              # label step -> needs_response, advance
+        await pilot.press("r")              # label step -> needs_response, assistant step opens
         await pilot.pause()
         chk.eq(ths[0].expected_label, "needs_response", "blind label set")
         chk.that(ths[0].reviewed, "blind flow marks reviewed")
-        chk.eq(app.session.index, 1, "advanced after label")
+        chk.eq(app.session.index, 0, "needs_response holds at the assistant step")
+        await pilot.press("y")              # assistant step -> yes, advance
+        await pilot.pause()
+        chk.eq(ths[0].expected_assistant, True, "assistant step recorded yes")
+        chk.eq(app.session.index, 1, "advanced after the assistant step")
+
+
+async def s_blind_fyi_skips_assistant(chk):
+    # The assistant question is asked on needs_response and nowhere else, so a
+    # thread labelled fyi advances straight away with the field left unset.
+    ths = _threads()[:2]
+    app = ReviewApp(ths, blind=True)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("p")              # sender step -> person
+        await pilot.pause()
+        await pilot.press("f")              # label step -> fyi
+        await pilot.pause()
+        chk.eq(ths[0].expected_label, "fyi", "blind label set to fyi")
+        chk.eq(ths[0].expected_assistant, None, "fyi leaves the assistant field unset")
+        chk.eq(app.session.index, 1, "fyi advances without an assistant step")
 
 
 async def s_blind_undo_mid_flow(chk):
@@ -265,6 +285,7 @@ def scenarios():
         ("normal_skip_and_exclude", s_normal_skip_and_exclude),
         ("undo", s_undo),
         ("blind_full_flow", s_blind_full_flow),
+        ("blind_fyi_skips_assistant", s_blind_fyi_skips_assistant),
         ("blind_undo_mid_flow", s_blind_undo_mid_flow),
         ("stage1_sender_only", s_stage1_sender_only),
         ("stage2_label_only", s_stage2_label_only),

@@ -115,14 +115,17 @@ so a schema break shows up here too.
 
 ## Coverage today
 
-68 scenarios across the four drivers (newsletter_label 15, review 18, edit_tui
-13, newsletter_review 22) exercise every binding/action in each module — browse
+70 scenarios across the four drivers (newsletter_label 15, review 19, edit_tui
+14, newsletter_review 22) exercise every binding/action in each module — browse
 + span sub-mode (with **exact committed-slice** assertions), blind + stage
 variants, the full filter matrix (incl. the newsletter_review **date filter** —
 past-N-days window, since-prompt boundary, CANCEL-vs-clear, and the
 `--since`/`init_since` pre-filter), every modal, Esc/cancel/decline/guard
 branches, undo (incl. empty-stack and undo-after-skip/exclude), scroll (asserting
-the offset, not just liveness), quit paths, and the auto-repeat/last-item guards
+the offset, not just liveness), quit paths, the auto-repeat/last-item guards, and
+the review tool's third step for `needs_response` threads plus the editor's `a`
+cycle (issue #78 — asked on `needs_response`, skipped elsewhere, tri-state cycle
+auto-saved)
 — and each diverse data state is actually **opened and its rendered content
 asserted** (emoji/CJK, CRLF, no-stories, multi-message, notes, reviewed, multi-
 story), including the send-date column's **LOCAL-timezone rendering** (an

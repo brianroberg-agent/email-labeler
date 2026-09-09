@@ -119,6 +119,28 @@ async def s_exclude_toggle_on_included(chk):
         chk.that(not ths[0].excluded, "second e un-excludes")
 
 
+async def s_cycle_assistant(chk):
+    # Issue #78: `a` cycles the tri-state annotation unset -> yes -> no -> unset,
+    # auto-saving each step like the `e` toggle.
+    ths = [t for t in _threads() if t.thread_id == "th-service-nr"]
+    app, path = _app(ths)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("enter")
+        chk.eq(ths[0].expected_assistant, None, "starts unset")
+        await pilot.press("a")
+        await pilot.pause()
+        chk.eq(ths[0].expected_assistant, True, "a: unset -> yes")
+        chk.that(path.exists(), "assistant cycle auto-saved")
+        await pilot.press("a")
+        await pilot.pause()
+        chk.eq(ths[0].expected_assistant, False, "a: yes -> no")
+        await pilot.press("a")
+        await pilot.pause()
+        chk.eq(ths[0].expected_assistant, None, "a: no -> unset")
+        saved = load_golden_set(path)
+        chk.eq(saved[0].expected_assistant, None, "final unset persisted to disk")
+
+
 async def s_scroll_detail(chk):
     from textual.containers import VerticalScroll
     ths = [t for t in _threads() if t.thread_id == "th-longbody"]
@@ -226,6 +248,7 @@ def scenarios():
         ("sender_cancel_no_save", s_sender_cancel_no_save),
         ("unexclude", s_unexclude),
         ("exclude_toggle_on_included", s_exclude_toggle_on_included),
+        ("cycle_assistant", s_cycle_assistant),
         ("scroll_detail", s_scroll_detail),
         ("detail_renders_multimsg_and_notes", s_detail_renders_multimsg_and_notes),
         ("edit_to_person_and_fyi", s_edit_to_person_and_fyi),
