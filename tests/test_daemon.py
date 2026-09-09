@@ -1824,6 +1824,37 @@ class TestDaemonHalt:
             halt.record_balance_error(exc, probe_client=client)
         assert halt.probe_client is client
 
+    def test_probe_client_prefers_the_cloud_tier_seen_in_the_streak(self):
+        """Review of #81 (Fable 7): the slot kept the client of whichever fault
+        happened to be third. Under D4's eval-only paid local stand-in a mixed
+        streak could then re-probe the local provider, clear on its 200, and
+        re-trip a cycle later with a spurious resume/halt push pair. If any
+        counted fault in the streak came from the cloud tier, that is the
+        provider to re-probe."""
+        halt = DaemonHalt()
+        cloud, local = MagicMock(name="cloud"), MagicMock(name="local")
+        halt.record_balance_error(LLMBalanceError("x", tier="cloud"), probe_client=cloud)
+        halt.record_balance_error(LLMBalanceError("x", tier="local"), probe_client=local)
+        halt.record_balance_error(LLMBalanceError("x", tier="local"), probe_client=local)
+        assert halt.tripped is True
+        assert halt.probe_client is cloud
+
+    def test_probe_client_is_the_local_client_for_an_all_local_streak(self):
+        halt = DaemonHalt()
+        local = MagicMock(name="local")
+        for _ in range(3):
+            halt.record_balance_error(LLMBalanceError("x", tier="local"), probe_client=local)
+        assert halt.probe_client is local
+
+    def test_a_success_forgets_the_streaks_cloud_client(self):
+        halt = DaemonHalt()
+        cloud, local = MagicMock(name="cloud"), MagicMock(name="local")
+        halt.record_balance_error(LLMBalanceError("x", tier="cloud"), probe_client=cloud)
+        halt.record_success()
+        for _ in range(3):
+            halt.record_balance_error(LLMBalanceError("x", tier="local"), probe_client=local)
+        assert halt.probe_client is local
+
     def test_probe_is_due_once_per_interval(self):
         """The re-probe is paced from the trip, then from the last probe: one
         cheap request per interval, not one per poll cycle."""

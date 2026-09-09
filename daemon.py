@@ -429,6 +429,10 @@ class DaemonHalt:
         self.fault: LLMBalanceError | None = None
         # The LLMClient whose provider reported the fault; re-probed while tripped.
         self.probe_client: LLMClient | None = None
+        # The cloud-tier client seen in the CURRENT streak, if any: preferred over
+        # the third fault's client at trip, since the local tier is a paid
+        # provider only under D4's eval-only stand-in (review of PR #81).
+        self._streak_cloud_client: LLMClient | None = None
         # time.monotonic() at trip and at the last probe (scheduling), and
         # time.time() at trip (the notification's wall-clock "since").
         self.tripped_at: float | None = None
@@ -465,14 +469,20 @@ class DaemonHalt:
         """Count one balance fault; trip at ``strikes_to_trip`` consecutive.
 
         Returns True only on the call that trips the slot. A fault on an
-        already-tripped slot changes nothing (first tripper wins).
+        already-tripped slot changes nothing (first tripper wins). The client
+        recorded for the re-probe is a cloud-tier one if any fault in the
+        streak came from the cloud tier, otherwise the tripping fault's.
         """
         if self.tripped:
             return False
         self.consecutive_faults += 1
+        if probe_client is not None and exc.tier != "local" and self._streak_cloud_client is None:
+            self._streak_cloud_client = probe_client
         if self.consecutive_faults < self.strikes_to_trip:
             return False
-        self.trip(str(exc), fault=exc, probe_client=probe_client, now=now)
+        self.trip(
+            str(exc), fault=exc, probe_client=self._streak_cloud_client or probe_client, now=now
+        )
         return True
 
     def record_success(self) -> None:
@@ -480,6 +490,7 @@ class DaemonHalt:
         consecutive after all. Does not clear a tripped slot (D22: only the
         probe resumes a halted function)."""
         self.consecutive_faults = 0
+        self._streak_cloud_client = None
 
     def clear(self) -> None:
         """Resume: the probe got an answer. Back to the untripped initial state."""
@@ -487,6 +498,7 @@ class DaemonHalt:
         self.consecutive_faults = 0
         self.fault = None
         self.probe_client = None
+        self._streak_cloud_client = None
         self.tripped_at = None
         self.tripped_wall = None
         self.last_probe_at = None
