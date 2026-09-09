@@ -298,12 +298,13 @@ class TestHarvestQuery:
         assert proxy.last_query is None
         assert "eval/harvst" in capsys.readouterr().err
 
-    async def test_gmail_label_check_is_case_insensitive(self):
-        # Gmail's label: search is case-insensitive, so the check must not
-        # reject a name Gmail would accept.
+    async def test_gmail_label_matched_case_insensitively_and_queried_canonically(self):
+        # A differently-cased spelling is accepted, but the query carries the
+        # spelling list_labels reported — the one known to exist — so how Gmail
+        # treats case in label: search never has to matter.
         proxy = FakeProxy()
         await harvest_threads(proxy, self.CONFIG, max_threads=10, gmail_label="Eval/Harvest")
-        assert proxy.last_query == 'label:agent/processed label:"Eval/Harvest"'
+        assert proxy.last_query == 'label:agent/processed label:"eval/harvest"'
 
 
 class TestWriteGoldenSet:

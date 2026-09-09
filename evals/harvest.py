@@ -219,14 +219,17 @@ async def harvest_threads(
             sys.exit(1)
 
     # A hand-picked label must exist in Gmail, or "no messages found" would
-    # be indistinguishable from "nothing labeled yet". Gmail's label: search
-    # is case-insensitive, so compare the same way.
+    # be indistinguishable from "nothing labeled yet". Match case-insensitively
+    # but query with the spelling list_labels reported — the one known to
+    # exist — so how Gmail treats case in label: search does not matter here.
     if gmail_label:
-        known_names = {name.lower() for name in label_id_to_name.values()}
-        if gmail_label.lower() not in known_names:
+        canonical_names = {name.lower(): name for name in label_id_to_name.values()}
+        canonical = canonical_names.get(gmail_label.lower())
+        if canonical is None:
             print(f"Error: --gmail-label '{gmail_label}' is not a label in this Gmail account",
                   file=sys.stderr)
             sys.exit(1)
+        gmail_label = canonical
 
     # Fetch message stubs with agent/processed label. Filters are ANDed into
     # the Gmail query so the fetch returns a dense pool of matching threads
