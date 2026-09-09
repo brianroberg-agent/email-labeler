@@ -761,3 +761,69 @@ class TestPrintAssistantSection:
         print_report(_make_meta(), compute_metrics(results))
         section = capsys.readouterr().out.split("--- Assistant Field ---")[1]
         assert "outside the scored set: 1" in section
+
+
+def _write_run(path, results, **meta_kw):
+    """Write a results JSONL (run_meta line + prediction lines) at *path*."""
+    import json
+
+    meta = _make_meta(**meta_kw)
+    with open(path, "w") as f:
+        f.write(json.dumps(meta.to_dict()) + "\n")
+        for r in results:
+            f.write(json.dumps(r.to_dict()) + "\n")
+
+
+class TestTrendAssistantColumn:
+    def test_trend_has_an_assistant_column(self, tmp_path, capsys):
+        from evals.report import print_trend
+
+        _write_run(tmp_path / "a.jsonl", [
+            _asst_result("needs_response", True, True, "tp"),
+            _asst_result("needs_response", False, True, "fp"),
+        ], run_id="run-a", tag="with-preds")
+        print_trend(tmp_path)
+        out = capsys.readouterr().out
+        assert "Assistant" in out
+        assert "66.7%" in out  # F1 for 1 tp / 1 fp / 0 fn: P=50%, R=100%
+
+    def test_trend_shows_na_when_a_run_has_no_assistant_predictions(self, tmp_path, capsys):
+        from evals.report import print_trend
+
+        _write_run(tmp_path / "a.jsonl", [
+            _asst_result("needs_response", True, None, "unpredicted"),
+        ], run_id="run-a", tag="no-preds")
+        print_trend(tmp_path)
+        out = capsys.readouterr().out
+        assert "Assistant" in out
+        assert "N/A" in out
+
+
+class TestCompareAssistant:
+    def _metrics(self, *results):
+        return compute_metrics(list(results))
+
+    def test_comparison_shows_assistant_precision_recall_f1_with_delta(self, capsys):
+        a = self._metrics(
+            _asst_result("needs_response", True, True, "tp"),
+            _asst_result("needs_response", False, True, "fp"),
+        )
+        b = self._metrics(
+            _asst_result("needs_response", True, True, "tp"),
+            _asst_result("needs_response", False, False, "tn"),
+        )
+        print_comparison(_make_meta(), a, _make_meta(), b)
+        out = capsys.readouterr().out
+        assert "--- Assistant Field ---" in out
+        section = out.split("--- Assistant Field ---")[1]
+        assert "Precision" in section
+        assert "Recall" in section
+        assert "F1" in section
+        assert "+50.0%" in section  # precision 50% -> 100%
+
+    def test_comparison_omits_the_block_when_a_run_has_no_predictions(self, capsys):
+        a = self._metrics(_asst_result("needs_response", True, True, "tp"))
+        b = self._metrics(_asst_result("needs_response", True, None, "none"))
+        print_comparison(_make_meta(), a, _make_meta(), b)
+        out = capsys.readouterr().out
+        assert "--- Assistant Field ---" not in out

@@ -436,6 +436,17 @@ def print_comparison(
                     delta(s2a["per_class"][cls]["f1"], s2b["per_class"][cls]["f1"]),
                 ], widths))
 
+    aa, ab = metrics1.get("assistant"), metrics2.get("assistant")
+    if aa and ab and aa["predictions"] and ab["predictions"]:
+        print("\n--- Assistant Field ---")
+        print("  " + format_table_row(["Metric", "Run A", "Run B", "Delta"], widths))
+        print("  " + "-" * sum(w + 2 for w in widths))
+        for name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1", "f1")]:
+            print("  " + format_table_row([
+                f"{name} (n={aa['count']}/{ab['count']})",
+                format_pct(aa[key]), format_pct(ab[key]), delta(aa[key], ab[key]),
+            ], widths))
+
     if "combined" in metrics1 and "combined" in metrics2:
         ca, cb = metrics1["combined"], metrics2["combined"]
         print("\n--- Combined ---")
@@ -522,9 +533,10 @@ def print_trend(results_dir: Path) -> None:
     print(f"Trend Report ({len(files)} runs)")
     print(f"{'=' * 60}")
 
-    widths = [12, 10, 20, 12, 12, 12, 8]
+    widths = [12, 10, 20, 12, 12, 12, 12, 8]
     print("  " + format_table_row(
-        ["Run ID", "Stages", "Tag/Config", "Stage 1", "Stage 2", "Combined", "Errors"],
+        ["Run ID", "Stages", "Tag/Config", "Stage 1", "Stage 2", "Combined", "Assistant",
+         "Errors"],
         widths,
     ))
     print("  " + "-" * sum(w + 2 for w in widths))
@@ -537,6 +549,9 @@ def print_trend(results_dir: Path) -> None:
             s1_acc = format_pct(metrics.get("stage1", {}).get("accuracy"))
             s2_acc = format_pct(metrics.get("stage2", {}).get("accuracy"))
             comb = format_pct(metrics.get("combined", {}).get("accuracy"))
+            # Assistant F1 is None until a run actually predicts the field, so
+            # an unscored run reads N/A rather than 0.0%.
+            asst = format_pct(metrics.get("assistant", {}).get("f1"))
 
             print("  " + format_table_row([
                 meta.run_id[:8],
@@ -545,6 +560,7 @@ def print_trend(results_dir: Path) -> None:
                 s1_acc,
                 s2_acc,
                 comb,
+                asst,
                 str(metrics["errors"]),
             ], widths))
         except Exception as exc:
