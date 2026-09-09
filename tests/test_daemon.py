@@ -32,7 +32,7 @@ from daemon import (
     summarize_cycle,
 )
 from labeler import LabelManager, _get_priority
-from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
+from llm_client import AvailabilityResult, LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import NewsletterTier, StoryResult
 from proxy_client import (
     ProxyAuthError,
@@ -1763,6 +1763,136 @@ class TestDaemonHalt:
             halt.record_balance_error(exc, probe_client=client)
         assert halt.probe_client is client
 
+    def test_probe_is_due_once_per_interval(self):
+        """The re-probe is paced from the trip, then from the last probe: one
+        cheap request per interval, not one per poll cycle."""
+        halt = DaemonHalt()
+        halt.trip("out of funds", now=100.0)
+        assert halt.probe_due(100.0 + 3599, 3600) is False
+        assert halt.probe_due(100.0 + 3600, 3600) is True
+        halt.last_probe_at = 3700.0
+        assert halt.probe_due(3700.0 + 3599, 3600) is False
+        assert halt.probe_due(3700.0 + 3600, 3600) is True
+
+    def test_untripped_slot_is_never_due(self):
+        assert DaemonHalt().probe_due(1e9, 0) is False
+
+    def test_clear_returns_to_the_initial_state(self):
+        halt = DaemonHalt()
+        exc = LLMBalanceError("out of funds")
+        for _ in range(3):
+            halt.record_balance_error(exc, probe_client=MagicMock(), now=5.0)
+        halt.notified = True
+        halt.clear()
+        fresh = DaemonHalt()
+        assert vars(halt) == vars(fresh)
+
+
+def _probe_client(*results):
+    """An LLMClient stand-in whose probe() yields the given AvailabilityResults in turn."""
+    client = MagicMock()
+    client.probe = AsyncMock(side_effect=list(results))
+    return client
+
+
+_OK = AvailabilityResult(ok=True, status_code=200)
+_STILL_403 = AvailabilityResult(ok=False, status_code=403)
+
+
+class TestReprobeHalts:
+    """A halted function re-probes its own provider on a slow schedule and
+    resumes by itself when the probe answers (decision D22, issue #73)."""
+
+    async def test_due_probe_that_answers_clears_the_slot(self, caplog):
+        halts = daemon.FunctionHalts()
+        client = _probe_client(_OK)
+        halts.email.trip("out of funds", probe_client=client, now=0.0)
+
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            resumed = await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
+
+        assert [name for name, _downtime in resumed] == ["email triage"]
+        assert resumed[0][1] == pytest.approx(3600.0)
+        assert halts.email.tripped is False
+        client.probe.assert_awaited_once()
+        lines = [r for r in caplog.records if "resumed" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "email triage" in lines[0].getMessage()
+
+    async def test_due_probe_that_fails_keeps_the_halt_quietly(self, caplog):
+        """A failed hourly probe is expected while the account is genuinely
+        empty: it logs below ERROR (the per-cycle halt line is already the
+        loudness) and reschedules from now."""
+        halts = daemon.FunctionHalts()
+        client = _probe_client(_STILL_403)
+        halts.email.trip("out of funds", probe_client=client, now=0.0)
+
+        with caplog.at_level(logging.DEBUG, logger="email-labeler"):
+            resumed = await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
+
+        assert resumed == []
+        assert halts.email.tripped is True
+        assert halts.email.last_probe_at == 3600.0
+        probe_lines = [r for r in caplog.records if "re-probe" in r.getMessage()]
+        assert len(probe_lines) == 1
+        assert probe_lines[0].levelno < logging.ERROR
+        assert "403" in probe_lines[0].getMessage()
+
+    async def test_probe_not_yet_due_is_not_sent(self):
+        halts = daemon.FunctionHalts()
+        client = _probe_client(_OK)
+        halts.email.trip("out of funds", probe_client=client, now=0.0)
+        resumed = await daemon.reprobe_halts(halts, now=1800.0, interval=3600)
+        assert resumed == []
+        client.probe.assert_not_awaited()
+        assert halts.email.tripped is True
+
+    async def test_each_halted_function_probes_its_own_client(self):
+        """Email and newsletter may sit on different providers: each slot probes
+        the client that raised for it, and only the one that answers resumes."""
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        email_client = _probe_client(_STILL_403)
+        nl_client = _probe_client(_OK)
+        halts.email.trip("email out of funds", probe_client=email_client, now=0.0)
+        halts.newsletter.trip("nl out of funds", probe_client=nl_client, now=0.0)
+
+        resumed = await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
+
+        assert [name for name, _d in resumed] == ["newsletter grading"]
+        assert halts.email.tripped is True
+        assert halts.newsletter.tripped is False
+        email_client.probe.assert_awaited_once()
+        nl_client.probe.assert_awaited_once()
+
+    async def test_disabled_function_is_not_probed(self):
+        halts = daemon.FunctionHalts(email_enabled=False, newsletter_enabled=True)
+        client = _probe_client(_OK)
+        halts.email.trip("out of funds", probe_client=client, now=0.0)
+        await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
+        client.probe.assert_not_awaited()
+
+    async def test_probe_exception_counts_as_a_failed_probe(self, caplog):
+        """probe() already swallows httpx errors; anything else must still not
+        escape into the poll loop, which sits outside the cycle's try/except."""
+        halts = daemon.FunctionHalts()
+        client = MagicMock()
+        client.probe = AsyncMock(side_effect=ValueError("boom"))
+        halts.email.trip("out of funds", probe_client=client, now=0.0)
+        with caplog.at_level(logging.WARNING, logger="email-labeler"):
+            resumed = await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
+        assert resumed == []
+        assert halts.email.tripped is True
+        assert any("boom" in r.getMessage() for r in caplog.records)
+
+    async def test_slot_without_a_client_stays_halted_without_crashing(self, caplog):
+        halts = daemon.FunctionHalts()
+        halts.email.trip("out of funds", now=0.0)
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            resumed = await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
+        assert resumed == []
+        assert halts.email.tripped is True
+
 
 class TestSummarizeCycle:
     def test_counts_handled_threads_and_drains_give_ups(self):
@@ -2157,7 +2287,7 @@ class TestOutOfFundsHalt:
                 process_mock=_out_of_funds_process,
                 cycles=3,
             )
-        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        halted = [r for r in caplog.records if "resumes on its own" in r.getMessage()]
         # One line per halted cycle (2 of the 3) — outage-severity, must not
         # scroll out of a long-running container's logs.
         assert len(halted) == 2
@@ -2208,8 +2338,95 @@ class TestOutOfFundsHalt:
                 cycles=3,
             )
         # Both halted cycles survived the failed write and still logged the line.
-        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        halted = [r for r in caplog.records if "resumes on its own" in r.getMessage()]
         assert len(halted) == 2
+
+
+def _halt_email_with(client):
+    """process_single_thread stand-in that trips the email slot with a probe client."""
+
+    async def process(*args, **kwargs):
+        kwargs["halts"].email.trip("out of funds", probe_client=client)
+        return False
+
+    return process
+
+
+class TestHaltReprobeWiring:
+    """run_daemon re-probes halted functions each cycle the interval allows
+    (D22): a stood-down daemon polls again once the provider answers, an
+    email-only halt's query narrowing is undone on resume, and the interval
+    comes from config.toml with an env override (the MAX_FAILURES pattern)."""
+
+    async def test_stood_down_daemon_resumes_polling_when_the_probe_answers(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        client = _probe_client(_STILL_403, _OK)
+        with caplog.at_level(logging.INFO, logger="email-labeler"):
+            proxy = await run_poll_cycles(
+                monkeypatch, tmp_path,
+                [
+                    {"messages": [{"id": "m1", "threadId": "t1"}]},
+                    {"messages": []},
+                ],
+                process_mock=_halt_email_with(client),
+                cycles=3,
+                daemon_overrides={"halt_probe_interval_seconds": 0},
+            )
+        # Cycle 1 polls and trips; cycle 2's probe fails (no poll); cycle 3's
+        # probe answers, so cycle 3 polls again.
+        assert proxy.list_messages.call_count == 2
+        assert client.probe.await_count == 2
+        assert any("resumed" in r.getMessage() for r in caplog.records)
+
+    async def test_email_resume_restores_the_poll_query(self, monkeypatch, tmp_path):
+        recipient = load_config()["newsletter"]["recipient"]
+        client = _probe_client(_STILL_403, _OK, _STILL_403)
+        proxy = await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [{"id": "m1", "threadId": "t1"}]},
+                {"messages": []},
+                {"messages": []},
+            ],
+            process_mock=_halt_email_with(client),
+            keep_newsletter=True,
+            newsletter_output_file=tmp_path / "assessments.jsonl",
+            daemon_overrides={"halt_probe_interval_seconds": 0},
+        )
+        queries = [c.kwargs["q"] for c in proxy.list_messages.call_args_list]
+        # base → narrowed (probe failed, still halted) → base again (probe answered).
+        assert [q.count(f"to:{recipient}") for q in queries] == [0, 1, 0]
+
+    async def test_probe_interval_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HALT_PROBE_INTERVAL_SECONDS", "120")
+        seen = []
+
+        async def record(halts, now, interval):
+            seen.append(interval)
+            return []
+
+        monkeypatch.setattr(daemon, "reprobe_halts", record)
+        await run_poll_cycles(monkeypatch, tmp_path, [{"messages": []}])
+        assert seen == [120]
+
+    async def test_probe_interval_defaults_to_config_value(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("HALT_PROBE_INTERVAL_SECONDS", raising=False)
+        seen = []
+
+        async def record(halts, now, interval):
+            seen.append(interval)
+            return []
+
+        monkeypatch.setattr(daemon, "reprobe_halts", record)
+        await run_poll_cycles(
+            monkeypatch, tmp_path, [{"messages": []}],
+            daemon_overrides={"halt_probe_interval_seconds": 777},
+        )
+        assert seen == [777]
+
+    def test_shipped_config_probes_hourly(self):
+        assert load_config()["daemon"]["halt_probe_interval_seconds"] == 3600
 
 
 class TestPerFunctionHalt:
@@ -2549,7 +2766,7 @@ class TestPerFunctionHalt:
             )
 
         assert proxy.list_messages.call_count == 3
-        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        halted = [r for r in caplog.records if "resumes on its own" in r.getMessage()]
         # Cycles 2 and 3 (the halt trips during cycle 1's processing).
         assert len(halted) == 2
         assert all(r.levelno == logging.ERROR for r in halted)
@@ -2583,7 +2800,7 @@ class TestPerFunctionHalt:
                 newsletter_output_file=tmp_path / "assessments.jsonl",
             )
 
-        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        halted = [r for r in caplog.records if "resumes on its own" in r.getMessage()]
         assert len(halted) == 2  # cycles 2 and 3
         assert all(
             "newsletter grading: provider account balance exhausted" in r.getMessage()
@@ -2613,7 +2830,7 @@ class TestPerFunctionHalt:
 
         # Cycle 1 polls and trips both halts; cycles 2–3 must not poll again.
         assert proxy.list_messages.call_count == 1
-        halted = [r for r in caplog.records if "restart the daemon" in r.getMessage()]
+        halted = [r for r in caplog.records if "resumes on its own" in r.getMessage()]
         assert len(halted) == 2
         assert all("email" in r.getMessage() for r in halted)
         assert all("newsletter" in r.getMessage() for r in halted)

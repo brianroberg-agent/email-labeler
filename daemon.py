@@ -475,6 +475,13 @@ class DaemonHalt:
     def tripped(self) -> bool:
         return self.reason is not None
 
+    def probe_due(self, now: float, interval: float) -> bool:
+        """True when this tripped slot's next re-probe is due: ``interval``
+        seconds since the trip, then since the last probe (D22)."""
+        if not self.tripped or self.last_probe_at is None:
+            return False
+        return now - self.last_probe_at >= interval
+
 
 class FunctionHalts:
     """Per-function halt state (decision D5's scope rule; D19).
@@ -482,9 +489,9 @@ class FunctionHalts:
     The two functions fail independently, so an out-of-funds provider stops only
     the function whose requests it was serving: a newsletter-tier balance fault
     halts newsletter grading while email triage keeps classifying, and vice
-    versa. Each function owns a DaemonHalt slot (first-tripper-wins,
-    restart-only reset); the poll loop stands down entirely only when EVERY
-    enabled function is halted.
+    versa. Each function owns a DaemonHalt slot (first-tripper-wins, cleared by
+    a successful re-probe of its own provider — D22); the poll loop stands down
+    entirely only when EVERY enabled function is halted.
 
     "Enabled" is a deployment fact, not a runtime one: newsletter grading iff
     [newsletter] is configured, email triage iff NEWSLETTER_ONLY is unset. A
@@ -502,7 +509,8 @@ class FunctionHalts:
         self.email_enabled = email_enabled
         self.newsletter_enabled = newsletter_enabled
 
-    def _enabled_slots(self) -> list[tuple[str, DaemonHalt]]:
+    def enabled_slots(self) -> list[tuple[str, DaemonHalt]]:
+        """(function name, slot) for each ENABLED function, in a fixed order."""
         slots = []
         if self.email_enabled:
             slots.append(("email triage", self.email))
@@ -513,12 +521,12 @@ class FunctionHalts:
     @property
     def all_halted(self) -> bool:
         """True when every enabled function is halted — nothing is left to poll for."""
-        slots = self._enabled_slots()
+        slots = self.enabled_slots()
         return bool(slots) and all(h.tripped for _name, h in slots)
 
     @property
     def any_halted(self) -> bool:
-        return any(h.tripped for _name, h in self._enabled_slots())
+        return any(h.tripped for _name, h in self.enabled_slots())
 
     @property
     def email_only_halted(self) -> bool:
@@ -536,8 +544,63 @@ class FunctionHalts:
     def halted_summary(self) -> str:
         """`function: reason` for each halted enabled function — the operator line."""
         return "; ".join(
-            f"{name}: {h.reason}" for name, h in self._enabled_slots() if h.tripped
+            f"{name}: {h.reason}" for name, h in self.enabled_slots() if h.tripped
         )
+
+
+def format_downtime(seconds: float) -> str:
+    """`Xh Ym` / `Ym` for a halt's duration — the resume line and push."""
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+async def reprobe_halts(
+    halts: FunctionHalts, now: float, interval: float
+) -> list[tuple[str, float]]:
+    """Re-probe each halted enabled function whose probe is due; clear the ones
+    whose provider answers (decision D22, issue #73).
+
+    One cheap request (``LLMClient.probe``: max_tokens=1, a fixed innocuous
+    prompt, no email content) per ``interval`` seconds per halted function,
+    through THAT function's own client — email and newsletter may sit on
+    different providers. A probe that answers 200 clears the slot and the
+    function resumes on the next cycle; a probe that does not leaves the slot
+    tripped and logs below ERROR (the per-cycle halt line is already the
+    loudness — an hourly ERROR would only repeat it). Nothing raised by a probe
+    escapes: this runs outside the poll loop's try/except.
+
+    Returns ``(function name, seconds halted)`` for each function that resumed,
+    so the caller can notify and undo any halt-time state of its own.
+    """
+    resumed: list[tuple[str, float]] = []
+    for name, slot in halts.enabled_slots():
+        if not slot.probe_due(now, interval):
+            continue
+        slot.last_probe_at = now
+        if slot.probe_client is None:
+            log.info("%s still halted — no provider client recorded to re-probe", name)
+            continue
+        try:
+            result = await slot.probe_client.probe()
+        except Exception as exc:  # noqa: BLE001 — a probe fault must never kill the loop
+            log.warning("%s still halted — re-probe raised %s: %s", name, type(exc).__name__, exc)
+            continue
+        if result.ok:
+            downtime = now - (slot.tripped_at if slot.tripped_at is not None else now)
+            log.info(
+                "%s resumed — provider answered the re-probe after %s halted; "
+                "normal processing resumes next cycle",
+                name, format_downtime(downtime),
+            )
+            slot.clear()
+            resumed.append((name, downtime))
+        else:
+            log.info(
+                "%s still halted — re-probe failed (%s); next probe in %ds",
+                name, result.detail() or "no response detail", interval,
+            )
+    return resumed
 
 
 def attribute_cycle_failures(
@@ -1563,11 +1626,16 @@ async def run_daemon() -> None:
 
     # Account-level fault switches (provider out of funds), one per function
     # (decision D5's scope rule, D19): a tripped slot stops that function until
-    # the admin adds funds and restarts; the poll loop stands down only once
-    # every enabled function is halted. Session-scoped.
+    # its hourly re-probe gets an answer (D22); the poll loop stands down only
+    # once every enabled function is halted. Session-scoped. Probe cadence:
+    # config.toml [daemon] halt_probe_interval_seconds (authoritative);
+    # override per run with HALT_PROBE_INTERVAL_SECONDS.
     halts = FunctionHalts(
         email_enabled=not newsletter_only,
         newsletter_enabled=bool(newsletter_classifier and newsletter_recipient),
+    )
+    halt_probe_interval = resolve_int_env(
+        "HALT_PROBE_INTERVAL_SECONDS", daemon_config.get("halt_probe_interval_seconds", 3600)
     )
 
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
@@ -1582,11 +1650,13 @@ async def run_daemon() -> None:
     poll_interval = daemon_config["poll_interval_seconds"]
     max_emails = resolve_int_env("MAX_EMAILS_PER_CYCLE", daemon_config["max_emails_per_cycle"])
     gmail_query = daemon_config["gmail_query"]
-    query_narrowed = False  # set once an email-only halt narrows the query below
     if newsletter_only and newsletter_recipient:
         gmail_query += f" to:{newsletter_recipient}"
-        query_narrowed = True
         log.info("Gmail query narrowed to: %s", gmail_query)
+    # The query as configured (plus any NEWSLETTER_ONLY clause), restored when
+    # an email-only halt that narrowed it resumes (D22).
+    base_query = gmail_query
+    narrowed_by_halt = False
     healthcheck_file = Path(daemon_config["healthcheck_file"])
     backoff = poll_interval
     status_interval = daemon_config.get("status_interval_seconds", 900)
@@ -1594,17 +1664,29 @@ async def run_daemon() -> None:
     proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
+        # Halted functions re-probe their provider on the slow schedule and
+        # clear themselves when it answers (D22). Runs before the stand-down
+        # check so a resumed function polls in this very cycle.
+        for _name, _downtime in await reprobe_halts(halts, time.monotonic(), halt_probe_interval):
+            pass
+        if narrowed_by_halt and not halts.email.tripped:
+            # Email triage resumed: its backlog must be fetched again.
+            gmail_query = base_query
+            narrowed_by_halt = False
+            log.info("Email triage resumed — Gmail query restored: %s", gmail_query)
         if halts.all_halted:
             # Every enabled function's provider is out of funds, and such a fault
             # fails EVERY request — polling on would only burn the backlog into
             # agent/attempted. Stand down but stay alive: the heartbeat stays
             # fresh (deliberately halted, not hung), and the instruction repeats
-            # at ERROR every cycle so it can't scroll out of the logs.
-            # Restarting the daemon is the only reset.
+            # at ERROR every cycle so it can't scroll out of the logs. The
+            # re-probe above is the reset (a restart also clears the in-memory
+            # state, but is no longer required — D22).
             log.error(
-                "Daemon halted — every enabled function stopped (%s). Add funds to "
-                "the provider account, then restart the daemon to resume processing.",
-                halts.halted_summary(),
+                "Daemon halted — every enabled function stopped (%s). Add funds if "
+                "the provider account is out of them; the daemon re-probes the "
+                "provider every %ds and resumes on its own once it answers.",
+                halts.halted_summary(), halt_probe_interval,
             )
             try:
                 healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
@@ -1621,19 +1703,20 @@ async def run_daemon() -> None:
             # quiet about it — same repeated-ERROR discipline as the full
             # stand-down, naming which function needs the funds.
             log.error(
-                "Function halted — %s. Add funds to the provider account, then "
-                "restart the daemon to resume it; the other function keeps running.",
-                halts.halted_summary(),
+                "Function halted — %s. Add funds if the provider account is out of "
+                "them; the daemon re-probes the provider every %ds and resumes on its "
+                "own once it answers; the other function keeps running.",
+                halts.halted_summary(), halt_probe_interval,
             )
-            if halts.email_only_halted and not query_narrowed:
+            if halts.email_only_halted and not narrowed_by_halt:
                 # Email triage is stopped but newsletter grading is not: narrow
                 # the query the way NEWSLETTER_ONLY does, so the halted
                 # function's backlog stops costing a get_thread per thread per
                 # cycle and can't crowd newsletter threads out of the
-                # max_results page. Halts are restart-reset, so this holds for
-                # the rest of the session.
-                gmail_query += f" to:{newsletter_recipient}"
-                query_narrowed = True
+                # max_results page. Holds until the email function resumes,
+                # when the block at the top of the loop restores base_query.
+                gmail_query = f"{base_query} to:{newsletter_recipient}"
+                narrowed_by_halt = True
                 log.info(
                     "Email triage halted — Gmail query narrowed to the newsletter "
                     "function: %s",
