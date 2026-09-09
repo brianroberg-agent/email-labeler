@@ -10,6 +10,7 @@ To start fresh, delete the file manually.
 Usage:
     python -m evals.harvest --output evals/golden_set.jsonl --max-threads 200
     python -m evals.harvest --output evals/golden_set.jsonl --sender-type person
+    python -m evals.harvest --gmail-label eval/harvest   # hand-picked threads
 """
 
 import argparse
@@ -125,12 +126,40 @@ def deduplicate(new_threads: list[GoldenThread], existing_path: Path) -> list[Go
     return [t for t in new_threads if t.thread_id not in existing_ids]
 
 
+def build_query(
+    labels_config: dict,
+    label_filter: str | None,
+    gmail_label: str | None = None,
+) -> str:
+    """Build the Gmail search query for the harvest fetch.
+
+    Always matches the processed label. When ``label_filter`` maps to a Gmail
+    label via ``labels_config``, that label is ANDed in; an unmapped key is
+    ignored here (the caller warns). When ``gmail_label`` is given, it is
+    ANDed in as well, after the classification label.
+
+    Both appended labels are quoted: classification labels contain hyphens
+    (agent/needs-response, agent/low-priority) and user labels may contain
+    '/', '-' or spaces, and an unquoted '-' can be read by Gmail as the NOT
+    operator, silently matching nothing.
+    """
+    query = f"label:{labels_config['processed']}"
+    if label_filter:
+        filter_label_name = labels_config.get(label_filter, "")
+        if filter_label_name:
+            query += f' label:"{filter_label_name}"'
+    if gmail_label:
+        query += f' label:"{gmail_label}"'
+    return query
+
+
 async def harvest_threads(
     proxy: GmailProxyClient,
     config: dict,
     max_threads: int = 200,
     sender_type_filter: str | None = None,
     label_filter: str | None = None,
+    gmail_label: str | None = None,
 ) -> list[GoldenThread]:
     """Fetch processed threads and build golden set entries.
 
@@ -140,6 +169,8 @@ async def harvest_threads(
         max_threads: Maximum threads to fetch.
         sender_type_filter: Optional filter for "person" or "service".
         label_filter: Optional filter for classification label.
+        gmail_label: Optional Gmail label name ANDed into the query, for
+            hand-picked threads (e.g. eval/harvest).
 
     Returns:
         List of GoldenThread objects.
@@ -160,18 +191,11 @@ async def harvest_threads(
     # pool of matching threads instead of relying on the recent processed
     # window happening to contain them (label_filter is also re-checked per
     # thread below, since a thread's messages can carry multiple labels).
-    processed_label = labels_config["processed"]
-    query = f"label:{processed_label}"
-    if label_filter:
-        filter_label_name = labels_config.get(label_filter, "")
-        if filter_label_name:
-            # Quote the label name: classification labels contain hyphens
-            # (agent/needs-response, agent/low-priority) and an unquoted '-'
-            # can be read by Gmail as the NOT operator, silently matching nothing.
-            query += f' label:"{filter_label_name}"'
-        else:
-            print(f"Warning: --label '{label_filter}' has no mapping in [labels]; "
-                  "querying processed-only.", file=sys.stderr)
+    # --gmail-label is ANDed in the same way for hand-picked threads.
+    if label_filter and not labels_config.get(label_filter):
+        print(f"Warning: --label '{label_filter}' has no mapping in [labels]; "
+              "querying processed-only.", file=sys.stderr)
+    query = build_query(labels_config, label_filter, gmail_label)
     try:
         response = await proxy.list_messages(
             q=query,
@@ -280,6 +304,7 @@ async def main(args: argparse.Namespace) -> None:
         max_threads=args.max_threads,
         sender_type_filter=args.sender_type,
         label_filter=args.label,
+        gmail_label=args.gmail_label,
     )
 
     if not threads:
@@ -304,6 +329,12 @@ def cli():
     parser.add_argument("--sender-type", choices=["person", "service"], help="Filter by sender type")
     parser.add_argument("--label", choices=list(_CLASSIFICATION_LABELS),
                         help="Filter by classification label")
+    parser.add_argument(
+        "--gmail-label", metavar="LABEL",
+        help="Only harvest threads that ALSO carry this Gmail label (e.g. eval/harvest). "
+             "Lets you hand-pick test cases in Gmail; ANDed with agent/processed and --label. "
+             "Ground truth is still inferred from the daemon's labels — correct it in evals.review.",
+    )
     parser.add_argument("--config", help="Path to config.toml (default: ./config.toml)")
     parser.add_argument("--proxy-url", help="API proxy URL (overrides PROXY_URL env var)")
     # Deprecated no-op: harvest always appends now. Kept so existing automation

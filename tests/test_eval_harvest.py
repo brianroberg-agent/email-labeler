@@ -4,7 +4,13 @@ import argparse
 import json
 
 import evals.harvest as harvest_mod
-from evals.harvest import deduplicate, harvest_threads, infer_ground_truth, write_golden_set
+from evals.harvest import (
+    build_query,
+    deduplicate,
+    harvest_threads,
+    infer_ground_truth,
+    write_golden_set,
+)
 from evals.schemas import GoldenThread
 
 # Label config matching the real config.toml structure
@@ -191,6 +197,41 @@ class FakeProxy:
         return {"messages": []}
 
 
+class TestBuildQuery:
+    """build_query is the pure query builder behind harvest_threads."""
+
+    def test_base_query_is_processed_only(self):
+        assert build_query(LABELS_CONFIG, None) == "label:agent/processed"
+
+    def test_label_filter_appends_quoted_classification_label(self):
+        assert build_query(LABELS_CONFIG, "needs_response") == (
+            'label:agent/processed label:"agent/needs-response"'
+        )
+
+    def test_gmail_label_appends_quoted_user_label(self):
+        assert build_query(LABELS_CONFIG, None, gmail_label="eval/harvest") == (
+            'label:agent/processed label:"eval/harvest"'
+        )
+
+    def test_both_filters_ordered_processed_classification_gmail(self):
+        assert build_query(LABELS_CONFIG, "low_priority", gmail_label="eval/harvest") == (
+            'label:agent/processed label:"agent/low-priority" label:"eval/harvest"'
+        )
+
+    def test_gmail_label_with_slash_and_hyphen_is_quoted(self):
+        # An unquoted '-' can be read by Gmail as the NOT operator, so the
+        # user-supplied label must be quoted verbatim.
+        assert build_query(LABELS_CONFIG, None, gmail_label="eval/cold-pitch") == (
+            'label:agent/processed label:"eval/cold-pitch"'
+        )
+
+    def test_unmapped_label_filter_yields_processed_only(self):
+        assert build_query(LABELS_CONFIG, "bogus") == "label:agent/processed"
+
+    def test_empty_gmail_label_is_ignored(self):
+        assert build_query(LABELS_CONFIG, None, gmail_label="") == "label:agent/processed"
+
+
 class TestHarvestQuery:
     """The Gmail query should AND in the classification label when filtering."""
 
@@ -212,6 +253,20 @@ class TestHarvestQuery:
         proxy = FakeProxy()
         await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
         assert proxy.last_query == "label:agent/processed"
+
+    async def test_gmail_label_anded_into_query(self):
+        proxy = FakeProxy()
+        await harvest_threads(
+            proxy, self.CONFIG, max_threads=10, label_filter="low_priority", gmail_label="eval/harvest",
+        )
+        assert proxy.last_query == (
+            'label:agent/processed label:"agent/low-priority" label:"eval/harvest"'
+        )
+
+    async def test_unknown_label_filter_still_warns(self, capsys):
+        proxy = FakeProxy()
+        await harvest_threads(proxy, self.CONFIG, max_threads=10, label_filter="bogus")
+        assert "has no mapping in [labels]" in capsys.readouterr().err
 
 
 class TestWriteGoldenSet:
@@ -297,6 +352,7 @@ class TestMainDeduplicates:
             max_threads=10,
             sender_type=None,
             label=None,
+            gmail_label=None,
             config=None,
             proxy_url="http://x",
         )
