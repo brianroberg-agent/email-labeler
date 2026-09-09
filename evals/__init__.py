@@ -24,9 +24,11 @@ def atomic_write_jsonl(records, path) -> None:
         with os.fdopen(fd, "w") as f:
             for record in records:
                 f.write(json.dumps(record.to_dict()) + "\n")
-        # mkstemp creates the temp file 0600. Carry the real file's permissions
+        # mkstemp creates the temp file 0600. Carry the real file's mode bits
         # across the rename (or, for a new file, what a plain open() would
-        # produce) so a save never narrows who can read the file.
+        # produce) so a save does not narrow them. Only the mode bits are
+        # carried over from the previous file: the temp file is a new inode,
+        # so its ownership is not inherited from the old one.
         os.chmod(tmp_path, _target_mode(path))
         os.rename(tmp_path, path)
     except BaseException:
