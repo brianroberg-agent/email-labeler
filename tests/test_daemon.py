@@ -2036,12 +2036,25 @@ class TestReprobeHalts:
         assert any("boom" in r.getMessage() for r in caplog.records)
 
     async def test_slot_without_a_client_stays_halted_without_crashing(self, caplog):
+        """The `probe_client is None` guard, which a slot tripped without a
+        client relies on (the D4 eval stand-in path, and any future trip site
+        that omits one). Surviving is not enough to pin it: without the guard
+        `None.probe` raises AttributeError into the same catch-all that absorbs
+        a real probe fault, so the slot still stays halted and the loop still
+        lives — but the operator is told the re-probe *raised an internal
+        error* instead of that no client was ever recorded. Assert the
+        explanation and the absence of that swallowed error (review of #81)."""
         halts = daemon.FunctionHalts()
         halts.email.trip("out of funds", now=0.0)
         with caplog.at_level(logging.INFO, logger="email-labeler"):
             resumed = await daemon.reprobe_halts(halts, now=3600.0, interval=3600)
         assert resumed == []
         assert halts.email.tripped is True
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("no provider client recorded to re-probe" in m for m in messages)
+        # No probe was attempted, so nothing was raised and swallowed.
+        assert not any("re-probe raised" in m for m in messages)
+        assert [r.levelname for r in caplog.records] == ["INFO"]
 
 
 class TestSummarizeCycle:
