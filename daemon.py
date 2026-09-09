@@ -606,7 +606,8 @@ async def reprobe_halts(
     (``asyncio.gather``) with ``HALT_REPROBE_TIMEOUT``, so the loop head stalls
     for at most one short timeout however many slots hang, keeping the
     heartbeat well inside the healthcheck threshold. A probe that answers 200
-    clears the slot and the function resumes on the next cycle; a probe that
+    clears the slot and the function resumes in this very cycle (the loop
+    re-probes at its head, before the poll); a probe that
     does not leaves the slot tripped and logs below ERROR (the per-cycle halt
     line is already the loudness — an hourly ERROR would only repeat it).
     Nothing raised by a probe escapes: this runs outside the poll loop's
@@ -633,7 +634,7 @@ async def reprobe_halts(
             downtime = now - (slot.tripped_at if slot.tripped_at is not None else now)
             log.info(
                 "%s resumed — provider answered the re-probe after %s halted; "
-                "normal processing resumes next cycle",
+                "normal processing resumes in this cycle",
                 name, format_downtime(downtime),
             )
             slot.clear()
@@ -1410,9 +1411,11 @@ async def process_single_thread(
         # arm means the fault came from the EMAIL pipeline's tiers (the
         # newsletter branch traps its own balance faults at the call site), so
         # it halts email triage only — newsletter grading keeps running
-        # (decision D5's scope rule, D19). The third consecutive fault trips
-        # the slot (D22); the client to re-probe is the tier that raised —
-        # normally cloud; local only with a public stand-in on that slot (D4).
+        # (decision D5's scope rule, D19). The balance_halt_strikes-th
+        # consecutive fault trips the slot (D22); the client to re-probe is the
+        # tier that raised — normally cloud; local only with a public stand-in
+        # on that slot (D4), and even then a cloud client seen earlier in the
+        # streak is preferred (DaemonHalt.record_balance_error).
         log.error("Thread %s deferred — %s", thread_id, exc)
         if halts is not None:
             probe_client = (

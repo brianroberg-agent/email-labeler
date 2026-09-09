@@ -66,7 +66,8 @@ Forecloses: presenting a public stand-in as a routine production configuration.
 
 ## D5 — Failure model: two rules and a scope (2026-07-30)
 
-**Status:** implemented (model Wave 0; corollaries Wave 2).
+**Status:** implemented (model Wave 0; corollaries Wave 2); restart-only-reset
+corollary reversed by D22 (2026-09-09).
 
 **Rule 1 — Outcomes only come from successes.** A committed outcome (label,
 archive, grade record, `agent/processed`) is only ever produced by a
@@ -146,8 +147,9 @@ did:
   within a cycle or two, which is correct: the fault disables both functions.
   **Reset superseded by D22 (2026-09-09):** "until restart" / "restart-only
   reset" was this corollary's wording as implemented in Wave 2 and is kept
-  here as the record; the halt now trips on the third consecutive balance
-  fault, re-probes its provider hourly, clears itself when the provider
+  here as the record; the halt now trips on the `balance_halt_strikes`-th
+  consecutive balance fault (config.toml `[daemon]`), re-probes its provider
+  hourly, clears itself when the provider
   answers (undoing the query narrowing with it), and pushes a notification at
   halt and at resume. A restart still clears the in-memory state but is no
   longer the only way out.
@@ -377,28 +379,54 @@ reporting the halt, stayed halted for fourteen days. Four decisions, taken
 together:
 
 1. **Re-probe while halted.** A halted function sends one chat completion with
-   `max_tokens=1` and a fixed innocuous prompt (no email content) through
-   *its own* `LLMClient` — the client that raised, so email and newsletter
-   probe their own providers — once per `halt_probe_interval_seconds`
-   (config.toml `[daemon]`, authoritative; env override
-   `HALT_PROBE_INTERVAL_SECONDS`). A 200 clears the halt, undoes any
-   halt-time state (the email-only query narrowing) and resumes normal
-   processing next cycle, at INFO; anything else stays halted and logs below
-   ERROR.
-2. **Three consecutive balance faults trip the halt, not one.** Any successful
-   classification for that function resets the count. Per function.
+   its own request shape (the client's real `max_tokens`, `temperature`,
+   `extra_body` and, for GLM, the thinking field — so a rejection that depends
+   on the request fails the probe too) and a fixed innocuous prompt (no email
+   content) through *its own* `LLMClient` — the client that raised, so email
+   and newsletter probe their own providers — once per
+   `halt_probe_interval_seconds` (config.toml `[daemon]`, authoritative; env
+   override `HALT_PROBE_INTERVAL_SECONDS`; validated at startup). Due probes
+   run concurrently with a short timeout (`HALT_REPROBE_TIMEOUT`), so the loop
+   head stalls for at most one probe and the heartbeat stays fresh. A 200
+   clears the halt, undoes any halt-time state (the email-only query
+   narrowing) and resumes normal processing in the same cycle (the re-probe
+   runs at the loop head, ahead of the poll), at INFO; anything else stays
+   halted and logs below ERROR. The email function re-probes a cloud-tier
+   client if any fault in the streak came from the cloud tier; the local tier
+   is a paid provider only under D4's eval-only stand-in, and there the count
+   is per function rather than per client — a cloud answer at Stage 1 resets
+   a streak of local-tier faults. Accepted as a D4-only limitation.
+2. **Consecutive balance faults trip the halt, not one.** The count is
+   `balance_halt_strikes` in config.toml `[daemon]` (authoritative, with its
+   rationale — D7's one-home rule; env override `BALANCE_HALT_STRIKES`;
+   validated at startup). Any request one of the function's LLM clients
+   answers resets the count — Stage 1 of the email pipeline included, and
+   each LLM call of a newsletter grading. Per function. Two consequences,
+   accepted: the count is per observed outcome, not per time, so faults
+   arriving back-to-back within a single poll cycle (a few-second provider
+   blip under `cloud_parallel` concurrency) can reach it and trip — the cost
+   is bounded to one probe interval, after which the re-probe resumes the
+   function; and a balance-shaped 400/403 specific to one thread is counted
+   like any other, so while sibling threads answer it defers each cycle at
+   one ERROR line without halting or striking, and alone in its cycles it
+   reaches the count as a real outage would.
 3. **Notification is opt-in by two env vars**, `NTFY_URL` (full topic URL)
    and `NTFY_TOKEN` (a bearer token minted for the labeler, not shared with
    another service). Either unset: one WARNING at startup, then the daemon
    behaves as before. A notification failure is logged and swallowed
    (test-guarded), so the poll loop continues.
-4. **Push on halt and on resume.** Once per halt (not repeated hourly), with
-   provider tier, model, HTTP status, the provider's reason text and the time;
-   once per resume, with the downtime. No email content, no credentials.
+4. **Push on halt and on resume.** Once per halt — not repeated hourly once it
+   has landed; a push that fails to send is re-attempted on the probe cadence
+   until one does — with provider tier, model, HTTP status, the matched
+   balance signature (the short recognised phrase, e.g. `NOT_ENOUGH_BALANCE`)
+   and the time; once per resume, with the downtime. The daemon adds no email
+   content and no credentials; the provider's response body is not forwarded
+   (a 400 can echo the rejected request) — the HTTP status and the matched
+   phrase are.
 
 Forecloses: reinstating restart-only halts; halting on a single balance
 response; retrying the halted function's backlog on the poll cadence; an hourly ERROR or an
-hourly push for an unchanged halt; a balance-*endpoint* check replacing the
-completion probe (a separate issue records it as a possible complement — the
+hourly push for an unchanged halt; forwarding the provider's response body in
+a push; a balance-*endpoint* check replacing the completion probe (a separate issue records it as a possible complement — the
 2026-08-25 fault was a completion 403 with funds present, which a balance
 check would have called fine).
