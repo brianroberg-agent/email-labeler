@@ -765,6 +765,25 @@ class TestAssistantMetrics:
         assert a["recall"] == 0.0
         assert a["f1"] is None
 
+    def test_missing_in_scope_prediction_counts_as_a_false_negative(self):
+        # No marker label on a thread the owner annotated "yes" is a miss, not
+        # an abstention: the mail lands in his own pile.
+        results = [_asst_result("needs_response", True, None, "no_prediction")]
+        a = compute_metrics(results)["assistant"]
+        assert a["false_negatives"] == 1
+
+    def test_a_missing_prediction_drags_recall_down(self):
+        results = [
+            _asst_result("needs_response", True, True, "hit"),
+            _asst_result("needs_response", True, None, "miss"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 1
+        assert a["true_positives"] == 1
+        assert a["false_negatives"] == 1
+        assert a["precision"] == 1.0
+        assert a["recall"] == 0.5
+
     def test_empty_results_have_no_assistant_section(self):
         assert "assistant" not in compute_metrics([])
 
