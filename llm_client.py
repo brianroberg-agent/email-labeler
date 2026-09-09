@@ -110,7 +110,8 @@ _BALANCE_SIGNATURE = re.compile(
 # 400/403 when the body matches). 429 is excluded even though some providers
 # phrase hard quota exhaustion identically to a per-minute rate limit
 # ("exceeded your current quota"): wrongly converting a transient rate limit
-# into a restart-only function halt is worse than letting a rare 429-signaled
+# into a function halt (self-healing since D22, but still an hour's outage and
+# a push) is worse than letting a rare 429-signaled
 # out-of-funds be retried as provider unavailability (decision D19) — it
 # defers threads each cycle and never strikes (D5). Its visibility is the
 # per-thread WARNING and the cycle summary, not an ERROR: an account-wide 429

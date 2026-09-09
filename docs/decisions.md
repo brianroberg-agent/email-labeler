@@ -144,6 +144,13 @@ did:
   direction accepts the fetch-and-skip churn: the query cannot express "not
   to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
   within a cycle or two, which is correct: the fault disables both functions.
+  **Reset superseded by D22 (2026-09-09):** "until restart" / "restart-only
+  reset" was this corollary's wording as implemented in Wave 2 and is kept
+  here as the record; the halt now trips on the third consecutive balance
+  fault, re-probes its provider hourly, clears itself when the provider
+  answers (undoing the query narrowing with it), and pushes a notification at
+  halt and at resume. A restart still clears the in-memory state but is no
+  longer the only way out.
 - A keyword-free label reply raises instead of silently defaulting to
   LOW_PRIORITY→archive — implemented (Wave 2 T10, `ee3958d`).
   `parse_email_label` raises
@@ -339,7 +346,10 @@ the thread unprocessed rather than labeled-but-lost. Dedup on read: newest
 Rate-limit phrasing is indistinguishable from quota exhaustion; a wrong
 restart-only halt is worse than retry. Balance-signature 402/400/403 halts the
 function whose provider reported it — per-function under D5, implemented in
-Wave 2 T9 (was daemon-wide).
+Wave 2 T9 (was daemon-wide). The halt was restart-only when this was decided;
+since D22 it self-heals, which bounds the cost of a wrong halt to about an
+hour plus a push — still worse than retrying a rate limit, so the 429
+exclusion stands.
 
 ## D20 — Content-less grading is a failure, not an outcome (issue #30, 2026-07-08)
 
@@ -354,3 +364,41 @@ blames the newsletter, so one that keeps failing while its siblings grade ends
 findably under `agent/attempted`, while several failing the same way are held
 as shared cause. A successful zero-story extraction remains a valid
 `no-stories` outcome — the only one.
+
+## D22 — Halts self-heal by re-probe; notification on halt and resume (issue #73, 2026-09-09)
+
+**Status:** implemented (PR for issue #73).
+
+Supersedes the "restart is the only reset" corollary of D5 (its text is kept
+there as the record). Background: on 2026-08-25 the cloud provider answered a
+single 403 with a balance signature while the account had funds; the daemon
+halted on that one response and, with a restart as the only reset and nothing
+reporting the halt, stayed halted for fourteen days. Four decisions, taken
+together:
+
+1. **Re-probe while halted.** A halted function sends one chat completion with
+   `max_tokens=1` and a fixed innocuous prompt (no email content) through
+   *its own* `LLMClient` — the client that raised, so email and newsletter
+   probe their own providers — once per `halt_probe_interval_seconds`
+   (config.toml `[daemon]`, authoritative; env override
+   `HALT_PROBE_INTERVAL_SECONDS`). A 200 clears the halt, undoes any
+   halt-time state (the email-only query narrowing) and resumes normal
+   processing next cycle, at INFO; anything else stays halted and logs below
+   ERROR.
+2. **Three consecutive balance faults trip the halt, not one.** Any successful
+   classification for that function resets the count. Per function.
+3. **Notification is opt-in by two env vars**, `NTFY_URL` (full topic URL)
+   and `NTFY_TOKEN` (a bearer token minted for the labeler, not shared with
+   another service). Either unset: one WARNING at startup, then the daemon
+   behaves as before. A notification failure is logged and swallowed
+   (test-guarded), so the poll loop continues.
+4. **Push on halt and on resume.** Once per halt (not repeated hourly), with
+   provider tier, model, HTTP status, the provider's reason text and the time;
+   once per resume, with the downtime. No email content, no credentials.
+
+Forecloses: reinstating restart-only halts; halting on a single balance
+response; retrying the halted function's backlog on the poll cadence; an hourly ERROR or an
+hourly push for an unchanged halt; a balance-*endpoint* check replacing the
+completion probe (a separate issue records it as a possible complement — the
+2026-08-25 fault was a completion 403 with funds present, which a balance
+check would have called fine).

@@ -442,7 +442,7 @@ class TestProcessSingleThread:
     ):
         """An out-of-funds provider is account-wide, not a poison thread: the thread
         must be left fully unprocessed (no agent/attempted, no agent/processed) so
-        it is retried after the admin adds funds and restarts."""
+        it is retried once the function resumes (D22)."""
         mock_proxy.get_thread.return_value = mock_thread_response
         mock_classifier.classify_sender.side_effect = LLMBalanceError("out of funds")
         tracker = FailureTracker(max_failures=2)
@@ -1118,7 +1118,7 @@ class TestFailureAttribution:
         thread never struck and never converged to a findable agent/attempted —
         silently voiding D5 Rule 1's "set aside findably" guarantee. The
         newsletter-halted direction makes the shielding permanent: the deferring
-        thread is re-fetched and re-deferred every cycle until restart."""
+        thread is re-fetched and re-deferred every cycle until it resumes."""
         def route(tid):
             if tid == "t_poison":
                 raise ValueError("poison thread")
@@ -1695,7 +1695,8 @@ class TestResultCache:
 
 class TestDaemonHalt:
     """In-memory halt state for ONE function (out-of-funds); FunctionHalts pairs
-    two of these (D5 scope, D19). Restart is the only reset."""
+    two of these (D5 scope, D19). Trips on the third consecutive balance
+    fault and clears on a successful re-probe (D22)."""
 
     def test_starts_untripped(self):
         halt = DaemonHalt()
@@ -2264,9 +2265,10 @@ async def _out_of_funds_process(*args, **kwargs):
 class TestOutOfFundsHalt:
     """Once a balance error halts every enabled function, the poll loop must stand
     down: no more polling or processing, a recurring admin instruction at ERROR,
-    and a fresh heartbeat (the daemon is alive by design, not hung). Restart-only
-    reset. Reworked for per-function halts (D5 scope, D19; Wave 2 T9) — here only
-    email triage is enabled, so the daemon-wide behavior these pin is the
+    and a fresh heartbeat (the daemon is alive by design, not hung). Cleared by
+    a successful re-probe (D22; TestHaltReprobeWiring). Reworked for
+    per-function halts (D5 scope, D19; Wave 2 T9) — here only email triage is
+    enabled, so the daemon-wide behavior these pin is the
     all-enabled-functions-halted case. TestPerFunctionHalt covers partial halts."""
 
     async def test_halt_stops_polling(self, monkeypatch, tmp_path):
@@ -2715,8 +2717,8 @@ class TestPerFunctionHalt:
         """While only email triage is halted, the poll query is narrowed to the
         newsletter recipient (the NEWSLETTER_ONLY precedent) so the halted
         function's backlog stops costing a get_thread per thread per cycle and
-        can't crowd newsletter threads out of the max_results page. Halts are
-        restart-reset, so the narrowing holds."""
+        can't crowd newsletter threads out of the max_results page. The
+        narrowing holds while the halt does (undone on resume — D22)."""
         recipient = load_config()["newsletter"]["recipient"]
 
         async def halt_email(*args, **kwargs):
@@ -2810,10 +2812,10 @@ class TestPerFunctionHalt:
         mock_label_manager.apply_classification.assert_not_called()
 
     async def test_query_is_narrowed_exactly_once(self, monkeypatch, tmp_path):
-        """The email-only-halt narrowing appends `to:recipient` ONCE. Halts are
-        restart-reset, so the partial-halt branch runs every cycle for the rest of
-        the session: re-appending would grow the query without bound (and re-log
-        the narrowing line) for as long as the daemon lives."""
+        """The email-only-halt narrowing appends `to:recipient` ONCE. The
+        partial-halt branch runs every cycle for as long as the halt lasts:
+        re-appending would grow the query without bound (and re-log the
+        narrowing line) for as long as the halt does."""
         recipient = load_config()["newsletter"]["recipient"]
 
         async def halt_email(*args, **kwargs):
@@ -2841,7 +2843,7 @@ class TestPerFunctionHalt:
     ):
         """A halted newsletter function must not stop the poll loop, and must not
         go quiet either: one ERROR per cycle names it and repeats the
-        add-funds-and-restart instruction."""
+        add-funds / re-probes-on-its-own instruction."""
 
         async def halt_newsletter(*args, **kwargs):
             kwargs["halts"].newsletter.trip("newsletter provider out of funds")

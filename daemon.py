@@ -679,7 +679,7 @@ def attribute_cycle_failures(
     # zero-success forever, so the poisoned thread never struck and never
     # converged to a findable agent/attempted — silently voiding D5 Rule 1's
     # set-aside guarantee (a halted function re-fetches and re-defers its
-    # threads every cycle, so the shielding persists until restart).
+    # threads every cycle, so the shielding persists until it resumes).
     failed_threads = {f.thread_id for f in failures}
     attempted = {
         tid

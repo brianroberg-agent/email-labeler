@@ -397,7 +397,7 @@ class TestBalanceError:
 
     Detection must be conservative enough that an ordinary 403 (bad key, forbidden
     route) stays a bare RuntimeError — only a payment-required status or a body
-    carrying a known balance/quota signature may trip a restart-only halt.
+    carrying a known balance/quota signature may count toward a function halt.
     """
 
     async def test_403_with_balance_body_raises_balance_error(self, cloud_client):
@@ -436,7 +436,7 @@ class TestBalanceError:
         """A 429 must NEVER halt, even with quota phrasing (decision D19):
         Gemini-style per-minute rate limits use the same wording as hard quota
         exhaustion, and wrongly converting a transient rate limit into a
-        restart-only halt is worse than retrying it as unavailability. Reworked
+        function halt is worse than retrying it as unavailability. Reworked
         for D5 (Wave 2 T8): an exhausted 429 is provider-shaped now, so it
         raises LLMUnavailableError instead of the old RuntimeError strike path.
 
@@ -466,7 +466,7 @@ class TestBalanceError:
         the signature), so a 429 body with no signature — the test above —
         cannot tell whether 429 is in that set. These bodies satisfy the
         signature half, leaving the status exclusion as the only thing between a
-        429 and a restart-only function halt.
+        429 and a function halt.
 
         The live case: OpenAI returns 429 with `insufficient_quota` for an
         exhausted account, wording a per-minute throttle shares."""

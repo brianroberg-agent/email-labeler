@@ -16,7 +16,7 @@ asymmetry is an accident of history, not a decision (registry D1).
 Neither function depends on the other, and design values are scoped
 per-function. The failure model (D5) scopes faults per-function as well: a
 provider-balance halt stops the affected function and leaves the other running
-(registry D5/D19).
+(registry D5/D19), and heals itself by re-probing the provider (registry D22).
 
 Non-goals: this is a single-owner deployment, not a generic multi-user
 product; org-specific content (the Ends Statement themes, the newsletter
@@ -75,7 +75,9 @@ or our own config/code): no strikes for anyone, get loud, keep the backlog.
 
 **Scope — functions fail independently.** A fault that disables one function
 (e.g. its LLM provider's balance) stops that function loudly; the other
-function continues.
+function continues. A halt is not permanent: the halted function re-probes
+its provider on a slow schedule and resumes when it answers, and the operator
+is notified at halt and at resume (registry D22).
 
 The registry entry D5 lists the corollaries — all implemented (Wave 2), each
 naming its commit. The code obeys this model; a deviation from it is a bug,

@@ -594,8 +594,9 @@ class NewsletterClassifier:
         tier/themes) and marking it processed. Mirrors the email pipeline's
         transient-outage guarantee. An out-of-funds provider (LLMBalanceError)
         propagates likewise: the thread stays unprocessed and the NEWSLETTER
-        function halts until the admin adds funds and restarts — email triage
-        keeps running on its own tiers (decision D5's scope rule, D19).
+        function halts (on the third consecutive fault) until its re-probe
+        finds the provider answering again (D22) — email triage keeps running
+        on its own tiers (decision D5's scope rule, D19).
         """
         stories = await self.extract_stories(body)
         if not stories:
