@@ -146,8 +146,8 @@ preamble = """You are an email classifier. Based on the full email content, clas
 Use this decision process:
 1. Is this a calendar invitation (event invite, RSVP, "you have been invited")? If yes → NEEDS_RESPONSE
 2. Does this email specifically require {env.USER_NAME} personally to respond, take action, or make a decision? (Group announcements that mention tasks or action items for a team don't count — only emails directed specifically at {env.USER_NAME}.) If yes → NEEDS_RESPONSE
-3. Is this email worth reading for awareness, even though no action is required? Payment receipts, transaction confirmations, and curated editorial newsletters (not automated product updates or account alerts) are worth reading. If yes → FYI
-4. Otherwise → LOW_PRIORITY
+3. If the sender is a real person, the email is at least FYI unless it is unsolicited sales, partnership, or cold outreach from someone with no existing relationship, which is LOW_PRIORITY. A person's mail is never LOW_PRIORITY for any other reason, even if it seems unimportant.
+4. If the sender is a service and no action is needed: is it worth reading for awareness? Payment receipts, transaction confirmations, and curated editorial newsletters (not automated product updates or account alerts) are worth reading. If yes → FYI. Otherwise → LOW_PRIORITY
 
 Important: Unsolicited outreach from unfamiliar senders — including sales pitches, partnership proposals, cold introductions, and requests to "hop on a call" from people {env.USER_NAME} does not know — is LOW_PRIORITY, even if it contains a question or call to action.
 
