@@ -738,3 +738,38 @@ class TestRelabelClearsAssistant:
             await pilot.press("l", "l")  # label submenu -> low_priority
         assert threads[0].expected_label == "low_priority"
         assert threads[0].expected_assistant is None
+
+
+class TestStatsAssistantLine:
+    """Issue #78: --stats reports annotation progress on the needs_response set."""
+
+    def test_counts_annotated_and_unannotated_needs_response_threads(self):
+        import re
+
+        threads = [
+            _golden("a", reviewed=True, expected_label="needs_response",
+                    expected_assistant=True),
+            _golden("b", reviewed=True, expected_label="needs_response",
+                    expected_assistant=False),
+            _golden("c", reviewed=True, expected_label="needs_response"),  # unannotated
+            _golden("d", reviewed=True, expected_label="fyi"),             # not counted
+        ]
+        summary = review.format_stats_summary(threads)
+        assert re.search(
+            r"Assistant annotated:\s+2 of 3 needs_response threads \(1 unannotated\)", summary
+        )
+
+    def test_excluded_and_unreviewed_threads_are_not_counted(self):
+        import re
+
+        threads = [
+            _golden("scored", reviewed=True, expected_label="needs_response",
+                    expected_assistant=True),
+            _golden("excl", reviewed=True, excluded=True, expected_label="needs_response",
+                    expected_assistant=True),
+            _golden("pending", reviewed=False, expected_label="needs_response"),
+        ]
+        summary = review.format_stats_summary(threads)
+        assert re.search(
+            r"Assistant annotated:\s+1 of 1 needs_response threads \(0 unannotated\)", summary
+        )

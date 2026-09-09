@@ -465,11 +465,20 @@ def format_stats_summary(threads: list[GoldenThread]) -> str:
         max(len(h), *(len(str(row[i])) for _, row in rows)) for i, h in enumerate(headers)
     ]
 
+    # Assistant-annotation progress (issue #78) over the scored set: the
+    # question is only asked of needs_response threads, so that is the
+    # denominator, and it is the number that says how much of the annotation
+    # pass is left.
+    needs_response = [t for t in scored if t.expected_label == "needs_response"]
+    annotated = sum(1 for t in needs_response if t.expected_assistant is not None)
+
     lines = [
         f"Total records:           {total}",
         f"  Excluded:              {excluded}",
         f"  Unreviewed (pending):  {pending}",
         f"  Reviewed & unexcluded: {len(scored)}  (the set run_eval scores)",
+        f"  Assistant annotated:   {annotated} of {len(needs_response)} needs_response "
+        f"threads ({len(needs_response) - annotated} unannotated)",
         "",
         "Reviewed & unexcluded, sender type × label:",
         "",
