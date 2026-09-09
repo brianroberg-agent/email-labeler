@@ -400,7 +400,7 @@ together:
    `balance_halt_strikes` in config.toml `[daemon]` (authoritative, with its
    rationale — D7's one-home rule; env override `BALANCE_HALT_STRIKES`;
    validated at startup). Any request one of the function's LLM clients
-   answers resets the count — Stage 1 of the email pipeline included, and
+   answers *and the pipeline parses* resets the count — Stage 1 of the email pipeline included, and
    each LLM call of a newsletter grading. Per function. Two consequences,
    accepted: the count is per observed outcome, not per time, so faults
    arriving back-to-back within a single poll cycle (a few-second provider

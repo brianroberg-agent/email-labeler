@@ -460,7 +460,7 @@ thinking field) and a fixed one-word prompt carrying no email content —
 through that function's own LLM client, once per
 `halt_probe_interval_seconds` (config.toml `[daemon]`; override
 `HALT_PROBE_INTERVAL_SECONDS`). Probes for several halted functions run
-concurrently with a short timeout (`HALT_REPROBE_TIMEOUT`, 30 s), so the loop
+concurrently with a short timeout (`HALT_REPROBE_TIMEOUT` in `llm_client.py`), so the loop
 head stalls for at most one probe. A 200 clears the halt: the function
 resumes in the same cycle (the re-probe runs at the loop head, before the
 poll), an INFO line reports how long it was down, and any halt-time query
