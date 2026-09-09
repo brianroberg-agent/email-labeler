@@ -32,7 +32,25 @@ _SENDER_KEY_MAP = {"p": "person", "s": "service"}
 _LABEL_KEY_MAP = {"r": "needs_response", "f": "fyi", "l": "low_priority"}
 
 # Mutable fields that get snapshotted for undo
-_SNAPSHOT_FIELDS = ("expected_sender_type", "expected_label", "reviewed", "notes", "excluded")
+_SNAPSHOT_FIELDS = (
+    "expected_sender_type", "expected_label", "reviewed", "notes", "excluded",
+    "expected_assistant",
+)
+
+_ASSISTANT_KEY_MAP = {"y": True, "n": False}
+
+
+def apply_label(thread: GoldenThread, label: str) -> None:
+    """Set *thread*'s label, dropping a now-meaningless assistant annotation.
+
+    The assistant annotation (issue #78) only has meaning while the thread is
+    needs_response, so moving the label off it clears the field rather than
+    leaving a stale yes/no behind. Moving the label TO needs_response leaves any
+    existing annotation alone. Only edit paths call this; loading never mutates.
+    """
+    thread.expected_label = label
+    if label != "needs_response":
+        thread.expected_assistant = None
 
 
 def _capture_snapshot(thread: GoldenThread, index: int) -> dict:
@@ -153,6 +171,9 @@ def build_menu(header: str, options: list[tuple[str, str]]) -> str:
 
 
 _QUEUE_OPTIONS = [("n", "notes"), ("z", "undo"), ("k", "skip"), ("e", "exclude"), ("q", "quit")]
+# At the assistant step `n` answers "no", so notes is not offered there; it is
+# still reachable at the sender and label steps of the same thread.
+_ASSISTANT_QUEUE_OPTIONS = [o for o in _QUEUE_OPTIONS if o[0] != "n"]
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +202,8 @@ class ReviewApp(App):
         self.session = ReviewSession(threads, start_at=start_at)
         self.blind = blind
         self.stage = stage
-        self._step = "actions"  # "actions" (normal) | "sender" | "label" (blind)
+        # "actions" (normal) | "sender" | "label" | "assistant" (blind)
+        self._step = "actions"
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(Static(id="thread-content", markup=False), id="review-scroll")
@@ -220,6 +242,11 @@ class ReviewApp(App):
             menu = build_menu("Actions:", actions)
         elif self._step == "sender":
             menu = build_menu("Sender type:", [("p", "person"), ("s", "service")] + _QUEUE_OPTIONS)
+        elif self._step == "assistant":
+            menu = build_menu(
+                "Assistant obligation?",
+                [("y", "yes"), ("n", "no")] + _ASSISTANT_QUEUE_OPTIONS,
+            )
         else:
             menu = build_menu(
                 "Label:",
@@ -276,6 +303,8 @@ class ReviewApp(App):
             self._handle_actions(hot)
         elif self._step == "sender":
             self._handle_sender(hot)
+        elif self._step == "assistant":
+            self._handle_assistant(hot)
         else:
             self._handle_label(hot)
 
@@ -322,7 +351,7 @@ class ReviewApp(App):
         elif hot == "l" and self.stage != 1:
             def apply(result) -> None:
                 if result != CANCEL:
-                    thread.expected_label = result
+                    apply_label(thread, result)
                     thread.reviewed = True
                     self._status(f"  -> Label set to: {result}")
                     self._advance()
@@ -355,11 +384,26 @@ class ReviewApp(App):
     def _handle_label(self, hot: str) -> None:
         thread = self.session.thread
         if hot in _LABEL_KEY_MAP:
-            thread.expected_label = _LABEL_KEY_MAP[hot]
+            apply_label(thread, _LABEL_KEY_MAP[hot])
             thread.reviewed = True
             self._status(
                 f"  -> Classified as {thread.expected_sender_type} / {thread.expected_label}"
             )
+            # Only a needs_response thread carries an obligation to place, so
+            # the third question is asked there and nowhere else.
+            if thread.expected_label == "needs_response":
+                self._step = "assistant"
+                self._refresh_menu()
+            else:
+                self._advance()
+        else:
+            self._handle_queue_keys(hot, "Invalid key")
+
+    def _handle_assistant(self, hot: str) -> None:
+        thread = self.session.thread
+        if hot in _ASSISTANT_KEY_MAP:
+            thread.expected_assistant = _ASSISTANT_KEY_MAP[hot]
+            self._status(f"  -> Assistant obligation: {'yes' if hot == 'y' else 'no'}")
             self._advance()
         else:
             self._handle_queue_keys(hot, "Invalid key")

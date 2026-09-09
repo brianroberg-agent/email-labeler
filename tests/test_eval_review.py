@@ -178,12 +178,15 @@ class TestExclude:
 
 class TestClassifyAndNotes:
     async def test_blind_p_then_r_classifies(self, tmp_path):
+        # needs_response opens the assistant step (issue #78), so the queue
+        # finishes on the third keystroke rather than the second.
         threads = [_golden("t1", expected_sender_type="service", expected_label="fyi")]
         app = ReviewApp(threads, blind=True)
         async with app.run_test(size=SIZE) as pilot:
-            await pilot.press("p", "r")
+            await pilot.press("p", "r", "y")
         assert threads[0].expected_sender_type == "person"
         assert threads[0].expected_label == "needs_response"
+        assert threads[0].expected_assistant is True
         assert threads[0].reviewed is True
         assert app.return_value == "done"  # queue finished
 
@@ -625,3 +628,113 @@ class TestScrollAndStages:
             await pilot.press("l")
             assert "Unknown action" in _status(app)
             assert threads[0].expected_label == "fyi"
+
+
+# ---------------------------------------------------------------------------
+# Assistant annotation step (issue #78)
+# ---------------------------------------------------------------------------
+
+class TestAssistantStep:
+    async def test_needs_response_opens_the_assistant_step(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r")
+            text = _screen_text(app)
+            assert "Assistant" in text
+            assert "[y] yes" in text
+            assert "[n] no" in text
+            assert "[k] skip" in text
+            assert "[n] notes" not in text  # n answers the question at this step
+            assert threads[0].expected_assistant is None  # not answered yet
+
+    async def test_y_records_yes_and_advances(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r", "y")
+            assert threads[0].expected_assistant is True
+            assert threads[0].reviewed is True
+            assert "Thread 2/2" in _screen_text(app)
+
+    async def test_n_records_no_and_advances(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r", "n")
+            assert threads[0].expected_assistant is False
+            assert "Thread 2/2" in _screen_text(app)
+
+    async def test_other_labels_skip_the_step_and_leave_the_field_unset(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "f")
+            assert threads[0].expected_label == "fyi"
+            assert threads[0].expected_assistant is None
+            assert "Thread 2/2" in _screen_text(app)
+
+    async def test_stage_2_still_asks_the_question(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=True, stage=2)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("r")
+            assert "[y] yes" in _screen_text(app)
+            await pilot.press("y")
+        assert threads[0].expected_assistant is True
+
+    async def test_stage_1_never_reaches_the_question(self, tmp_path):
+        threads = [_golden("t1")]
+        app = ReviewApp(threads, blind=True, stage=1)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p")
+        assert threads[0].expected_assistant is None
+        assert app.return_value == "done"
+
+    async def test_skip_at_the_assistant_step_leaves_the_field_unset(self, tmp_path):
+        threads = [_golden("t1"), _golden("t2")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r", "k")
+            assert threads[0].expected_assistant is None
+            assert threads[0].expected_label == "needs_response"
+            assert "Thread 2/2" in _screen_text(app)
+
+    async def test_undo_reverts_the_annotation_with_the_rest_of_the_thread(self, tmp_path):
+        threads = [_golden("t0"), _golden("t1")]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r", "y")
+            assert threads[0].expected_assistant is True
+            await pilot.press("z")  # undo from t1
+            assert threads[0].expected_assistant is None
+            assert threads[0].expected_label == "fyi"
+
+
+class TestRelabelClearsAssistant:
+    """Ruling 3: moving a label off needs_response drops a stale annotation."""
+
+    async def test_blind_relabel_away_clears_it(self, tmp_path):
+        threads = [_golden("t1", expected_label="needs_response", expected_assistant=True)]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "f")
+        assert threads[0].expected_assistant is None
+
+    async def test_blind_relabel_to_needs_response_keeps_it(self, tmp_path):
+        threads = [_golden("t1", expected_label="fyi", expected_assistant=True)]
+        app = ReviewApp(threads, blind=True)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("p", "r")
+            assert threads[0].expected_assistant is True  # the step can still change it
+
+    async def test_normal_mode_label_submenu_clears_it(self, tmp_path):
+        threads = [
+            _golden("t1", expected_label="needs_response", expected_assistant=True),
+            _golden("t2"),
+        ]
+        app = ReviewApp(threads, blind=False)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("l", "l")  # label submenu -> low_priority
+        assert threads[0].expected_label == "low_priority"
+        assert threads[0].expected_assistant is None
