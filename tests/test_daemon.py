@@ -492,8 +492,14 @@ class TestProcessSingleThread:
     ):
         """A balance fault carrying tier="local" (a public stand-in on the local
         slot, D4 — eval-only, but the daemon must still probe the right thing)
-        records the LOCAL client for the re-probe, not the cloud one."""
+        records the LOCAL client for the re-probe, not the cloud one.
+
+        Routed through the VIP short-circuit: since the review of #81 a cloud
+        answer at Stage 1 resets the (per-function) count, so a streak of
+        local-tier faults survives only where Stage 1 makes no cloud call — the
+        D4-only limitation D22 records."""
         mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.return_value = (SenderType.PERSON, "VIP", "")
         mock_classifier.classify.side_effect = LLMBalanceError("out of funds", tier="local")
         halts = daemon.FunctionHalts()
         for _ in range(3):
@@ -527,6 +533,59 @@ class TestProcessSingleThread:
             ))
         assert results == [False, False, True, False, False]
         assert halts.email.tripped is False
+
+    async def test_stage_one_answer_resets_the_count_even_when_stage_two_defers(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Review of #81 (Fable 2 / Opus F1): the reset used to fire only after BOTH
+        stages, so with the local tier offline every PERSON thread's Stage-1 cloud
+        answer was followed by a deferral and recorded nothing — isolated false
+        403s hours apart then accumulated to a halt. The cloud provider answering
+        Stage 1 IS the evidence D22 item 2 wants: 403, 403, cloud-200-then-local-
+        offline, 403 must not trip."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        good = mock_classifier.classify_sender.return_value
+        mock_classifier.classify_sender.side_effect = [
+            LLMBalanceError("out of funds", tier="cloud"),
+            LLMBalanceError("out of funds", tier="cloud"),
+            good,
+            LLMBalanceError("out of funds", tier="cloud"),
+        ]
+        mock_classifier.classify.side_effect = LLMUnavailableError("MLX endpoint down")
+        halts = daemon.FunctionHalts()
+        results = []
+        for _ in range(4):
+            results.append(await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
+            ))
+        assert results == [False, False, False, False]
+        assert halts.email.tripped is False
+        assert halts.email.consecutive_faults == 1
+
+    async def test_vip_short_circuit_is_not_a_stage_one_answer(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """The VIP short-circuit skips the LLM entirely (classify_sender returns
+        "VIP" without a call), so it says nothing about the provider: with Stage 2
+        deferring too, the streak stands and the third real fault trips."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify_sender.side_effect = [
+            LLMBalanceError("out of funds", tier="cloud"),
+            LLMBalanceError("out of funds", tier="cloud"),
+            (SenderType.PERSON, "VIP", ""),
+            LLMBalanceError("out of funds", tier="cloud"),
+        ]
+        mock_classifier.classify.side_effect = LLMUnavailableError("MLX endpoint down")
+        halts = daemon.FunctionHalts()
+        for _ in range(4):
+            await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
+            )
+        assert halts.email.tripped is True
 
     async def test_tripped_halt_short_circuits_before_any_work(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
@@ -2663,6 +2722,51 @@ class TestPerFunctionHalt:
             ))
         assert results == [False, False, True, False, False]
         assert halts.newsletter.tripped is False
+
+    async def test_newsletter_provider_answer_mid_pipeline_resets_the_count(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        newsletter_thread_response, tmp_path,
+    ):
+        """Review of #81 (Fable 2 / Opus F1, newsletter analogue): grading is
+        several LLM calls; a provider that answers extraction and then drops the
+        connection has still answered. The daemon hands classify_newsletter an
+        ``on_answer`` hook bound to the slot's record_success, so the count resets
+        at the first answered call, not only when the whole grading lands."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+
+        async def answers_then_drops(_transcript, on_answer=None):
+            on_answer()
+            raise LLMUnavailableError("connection dropped")
+
+        mock_newsletter_classifier.classify_newsletter.side_effect = [
+            LLMBalanceError("nl out of funds"), LLMBalanceError("nl out of funds"),
+            answers_then_drops,
+            LLMBalanceError("nl out of funds"),
+        ]
+        # AsyncMock cannot call a coroutine function from side_effect, so drive it
+        # by hand: one wrapper that dispatches to the scripted outcome.
+        outcomes = list(mock_newsletter_classifier.classify_newsletter.side_effect)
+
+        async def dispatch(transcript, **kwargs):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return await outcome(transcript, **kwargs)
+
+        mock_newsletter_classifier.classify_newsletter = AsyncMock(side_effect=dispatch)
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        for _ in range(4):
+            await process_single_thread(
+                "thread_nl", ["thread_nl"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=50000,
+                newsletter_classifier=mock_newsletter_classifier,
+                newsletter_recipient="newsletters@dm.org",
+                newsletter_output_file=str(tmp_path / "assessments.jsonl"),
+                halts=halts,
+            )
+        assert halts.newsletter.tripped is False
+        assert halts.newsletter.consecutive_faults == 1
 
     async def test_email_balance_fault_leaves_newsletter_running(
         self, mock_proxy, mock_classifier, mock_label_manager,

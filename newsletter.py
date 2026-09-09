@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import getaddresses, parsedate_to_datetime
@@ -576,8 +577,16 @@ class NewsletterClassifier:
         )
         return parse_themes(raw), cot
 
-    async def classify_newsletter(self, body: str) -> list[StoryResult]:
+    async def classify_newsletter(
+        self, body: str, *, on_answer: Callable[[], None] | None = None
+    ) -> list[StoryResult]:
         """Run the full newsletter classification pipeline over story texts.
+
+        ``on_answer``, when given, is called after every LLM call the provider
+        answers (extraction, each quality assessment, each theme classification)
+        — the daemon binds it to the newsletter halt slot's ``record_success`` so
+        a provider that answers and then fails a later call has still been seen
+        answering (decision D22 item 2; review of PR #81).
 
         Individual *per-story* failures are isolated — a quality failure doesn't
         prevent theme classification, and vice versa — but only while some story
@@ -599,6 +608,8 @@ class NewsletterClassifier:
         on its own tiers (decision D5's scope rule, D19).
         """
         stories = await self.extract_stories(body)
+        if on_answer is not None:
+            on_answer()
         if not stories:
             return []
 
@@ -608,6 +619,8 @@ class NewsletterClassifier:
 
             try:
                 scores, quality_cot = await self.assess_quality(text)
+                if on_answer is not None:
+                    on_answer()
                 result.quality_cot = quality_cot
                 if scores:
                     result.scores = scores
@@ -625,6 +638,8 @@ class NewsletterClassifier:
 
             try:
                 themes, theme_cot = await self.classify_themes(text)
+                if on_answer is not None:
+                    on_answer()
                 result.themes = themes
                 result.theme_cot = theme_cot
             except _PIPELINE_WIDE_ERRORS:

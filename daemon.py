@@ -983,8 +983,15 @@ async def process_single_thread(
 
                     try:
                         async with cloud_sem:
+                            # Grading is several LLM calls; each one the provider
+                            # answers resets the newsletter slot's consecutive-fault
+                            # count as it lands (D22 item 2), so an answer followed
+                            # by a dropped connection still counts as an answer.
                             story_results = await newsletter_classifier.classify_newsletter(
-                                transcript
+                                transcript,
+                                on_answer=(
+                                    halts.newsletter.record_success if halts is not None else None
+                                ),
                             )
                     except LLMBalanceError as exc:
                         # The NEWSLETTER function's provider is out of funds. Its
@@ -1004,6 +1011,9 @@ async def process_single_thread(
                             )
                         return False
                     if halts is not None:
+                        # The whole grading landed (every call answered — on_answer
+                        # above already recorded each; this keeps the reset explicit
+                        # at the call site).
                         halts.newsletter.record_success()
 
                     # Determine overall tier (best story's tier)
@@ -1174,6 +1184,13 @@ async def process_single_thread(
             # Stage 1: classify sender (always cloud LLM)
             async with cloud_sem:
                 sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
+            if halts is not None and sender_raw != "VIP":
+                # The cloud provider answered Stage 1: whatever Stage 2 does (the
+                # local tier may be offline), the email function's provider is not
+                # out of funds, so its consecutive-fault count restarts here (D22
+                # item 2). The VIP short-circuit makes no LLM call and so says
+                # nothing about the provider.
+                halts.email.record_success()
 
             # Stage 2: classify email (routed by sender type)
             if sender_type == SenderType.PERSON:
@@ -1184,8 +1201,8 @@ async def process_single_thread(
                     result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
 
             if halts is not None:
-                # Both stages answered: the email function's provider is not
-                # out of funds, so any consecutive-fault count restarts (D22).
+                # Stage 2 answered too. Stage 1 already recorded its answer above;
+                # this covers the VIP path, whose only LLM call is Stage 2 (D22).
                 halts.email.record_success()
 
             label = result.label
