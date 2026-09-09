@@ -709,6 +709,62 @@ class TestAssistantMetrics:
         assert a["annotated"] == 1
         assert a["needs_response_threads"] == 1
 
+    def test_predictions_are_counted_over_the_scored_set_only(self):
+        # A prediction that lands outside the scored population is reported on
+        # its own line and leaves the score undefined -- it is not a denominator.
+        results = [
+            _asst_result("needs_response", True, None, "scored_unpredicted"),
+            _asst_result("fyi", None, True, "out_of_scope"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 0
+        assert a["out_of_scope_positives"] == 1
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+
+    def test_unannotated_thread_with_a_prediction_scores_nothing(self):
+        # The golden set's state before any annotation pass: predictions exist,
+        # nothing is annotated, so there is no score -- not a score of zero.
+        results = [
+            _asst_result("needs_response", None, True, "unannotated_pos"),
+            _asst_result("needs_response", None, False, "unannotated_neg"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["annotated"] == 0
+        assert a["predictions"] == 0
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+
+    def test_all_negative_expectations_predicted_correctly_are_undefined(self):
+        # tp+fp and tp+fn are both zero: a perfect all-negative run. Precision
+        # and recall have no denominator, so they are None rather than 0.0.
+        results = [
+            _asst_result("needs_response", False, False, "tn1"),
+            _asst_result("needs_response", False, False, "tn2"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 2
+        assert a["true_positives"] == 0
+        assert a["false_positives"] == 0
+        assert a["false_negatives"] == 0
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+
+    def test_zero_precision_and_recall_leave_f1_undefined(self):
+        # Both figures are measured and both are 0.0; their sum is F1's
+        # denominator, so F1 itself is undefined.
+        results = [
+            _asst_result("needs_response", True, False, "fn"),
+            _asst_result("needs_response", False, True, "fp"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["precision"] == 0.0
+        assert a["recall"] == 0.0
+        assert a["f1"] is None
+
     def test_empty_results_have_no_assistant_section(self):
         assert "assistant" not in compute_metrics([])
 
@@ -752,6 +808,30 @@ class TestPrintAssistantSection:
         assert "Precision: 66.7% (n=4)" in section
         assert "Recall:    66.7% (n=4)" in section
         assert "F1:        66.7% (n=4)" in section
+
+    def test_undefined_figures_print_na_rather_than_zero(self, capsys):
+        results = [
+            _asst_result("needs_response", False, False, "tn1"),
+            _asst_result("needs_response", False, False, "tn2"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        # Just the assistant block, not the sections printed after it.
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1].split("\n\n")[0]
+        assert "Precision: N/A" in section
+        assert "Recall:    N/A" in section
+        assert "F1:        N/A" in section
+        assert "0.0%" not in section
+
+    def test_out_of_scope_positives_are_reported_with_no_in_scope_predictions(self, capsys):
+        results = [
+            _asst_result("needs_response", True, None, "scored_unpredicted"),
+            _asst_result("fyi", None, True, "out_of_scope"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1].split("\n\n")[0]
+        assert "no predictions in this run" in section
+        assert "outside the scored set: 1" in section
+        assert "0.0%" not in section
 
     def test_out_of_scope_positives_get_their_own_line(self, capsys):
         results = [

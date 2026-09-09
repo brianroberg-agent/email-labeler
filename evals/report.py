@@ -136,15 +136,21 @@ def compute_assistant_metrics(valid: list[PredictionResult]) -> dict:
     ``out_of_scope_positives`` rather than folded into precision, so an
     unfinished annotation pass cannot flatter or punish the score.
 
-    ``predictions`` counts every non-null ``predicted_assistant`` in the run.
-    While it is 0, precision/recall/f1 are None: there is nothing to score, and
-    a 0.0 would read as a measured failure.
+    ``predictions`` counts non-null ``predicted_assistant`` values WITHIN the
+    scored population, because those are the only ones the figures are computed
+    over. While it is 0, precision/recall/f1 are None: there is nothing to
+    score, and a 0.0 would read as a measured failure.
+
+    Each figure is also None when its own denominator is zero — precision when
+    ``tp + fp`` is 0 (nothing was predicted positive), recall when ``tp + fn``
+    is 0 (nothing was annotated positive), F1 when ``precision + recall`` is 0.
+    A run that correctly predicts an all-negative scored set therefore reads
+    N/A rather than 0.0%.
     """
     needs_response = [r for r in valid if r.expected_label == "needs_response"]
     scored = [r for r in needs_response if r.expected_assistant is not None]
-    predictions = [r for r in valid if r.predicted_assistant is not None]
-
     scored_ids = {id(r) for r in scored}
+    predictions = [r for r in scored if r.predicted_assistant is not None]
     out_of_scope_positives = sum(
         1 for r in valid if r.predicted_assistant is True and id(r) not in scored_ids
     )
@@ -167,9 +173,12 @@ def compute_assistant_metrics(valid: list[PredictionResult]) -> dict:
         "f1": None,
     }
     if predictions:
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall = tp / (tp + fn) if (tp + fn) > 0 else None
+        if precision is not None and recall is not None and (precision + recall) > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = None
         metrics.update({"precision": precision, "recall": recall, "f1": f1})
     return metrics
 
@@ -282,18 +291,30 @@ def format_per_class_table(prf: dict[str, dict[str, float]], classes: list[str])
     return "\n".join(lines)
 
 
+def _out_of_scope_line(a: dict) -> str:
+    return (
+        f"  Predicted assistant outside the scored set: {a['out_of_scope_positives']} "
+        f"(counted separately, not in the figures above)"
+    )
+
+
 def format_assistant_section(a: dict) -> list[str]:
     """Lines for the assistant-field block of a report.
 
-    With no predictions in the run the block states annotation progress
-    instead — how much of the needs_response population has been annotated —
-    because that is the only thing the run can actually say about the field.
+    With no predictions inside the scored set the block states annotation
+    progress instead — how much of the needs_response population has been
+    annotated — because that is the only thing the run can actually say about
+    the field; any positives predicted outside that set are still listed.
+    An undefined figure prints ``N/A`` (see ``compute_assistant_metrics``).
     """
     if not a["predictions"]:
-        return [
+        lines = [
             f"  assistant: no predictions in this run ({a['annotated']} of "
             f"{a['needs_response_threads']} needs_response threads annotated)"
         ]
+        if a["out_of_scope_positives"]:
+            lines.append(_out_of_scope_line(a))
+        return lines
     n = a["count"]
     lines = [
         f"  Scored: {n} needs_response threads carrying an expected_assistant annotation",
@@ -304,10 +325,7 @@ def format_assistant_section(a: dict) -> list[str]:
         f"fn={a['false_negatives']} (n={n})",
     ]
     if a["out_of_scope_positives"]:
-        lines.append(
-            f"  Predicted assistant outside the scored set: {a['out_of_scope_positives']} "
-            f"(counted separately, not in the figures above)"
-        )
+        lines.append(_out_of_scope_line(a))
     return lines
 
 
