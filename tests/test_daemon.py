@@ -2499,6 +2499,62 @@ def _fake_notifier(monkeypatch, send=None):
     return fake
 
 
+class TestNotifyNewHalts:
+    """The halt push is attempted until one lands (review of #81, Fable 1): a
+    halt that trips while ntfy is unreachable — a docker-3 reboot restarting
+    both containers — must still be announced, and a dead ntfy must cost one
+    POST per probe interval, not one per poll cycle."""
+
+    def _notifier(self, *outcomes):
+        notifier = MagicMock()
+        notifier.enabled = True
+        notifier.send = AsyncMock(side_effect=list(outcomes))
+        return notifier
+
+    async def test_failed_push_leaves_the_slot_unnotified(self):
+        halts = daemon.FunctionHalts()
+        halts.email.trip("out of funds", now=0.0)
+        notifier = self._notifier(False)
+        await daemon.notify_new_halts(halts, notifier, 3600, now=0.0)
+        notifier.send.assert_awaited_once()
+        assert halts.email.notified is False
+
+    async def test_failed_push_is_retried_on_the_probe_cadence_until_it_lands(self):
+        halts = daemon.FunctionHalts()
+        halts.email.trip("out of funds", now=0.0)
+        notifier = self._notifier(False, True)
+        # Cycle 1: the trip is new, the POST fails.
+        await daemon.notify_new_halts(halts, notifier, 3600, now=0.0)
+        assert notifier.send.await_count == 1
+        # Later poll cycles inside the interval: no re-attempt.
+        await daemon.notify_new_halts(halts, notifier, 3600, now=60.0)
+        await daemon.notify_new_halts(halts, notifier, 3600, now=1800.0)
+        assert notifier.send.await_count == 1
+        assert halts.email.notified is False
+        # The probe tick: one re-attempt, which lands.
+        await daemon.notify_new_halts(halts, notifier, 3600, now=3600.0)
+        assert notifier.send.await_count == 2
+        assert halts.email.notified is True
+        # Announced: nothing more, however long the halt runs.
+        await daemon.notify_new_halts(halts, notifier, 3600, now=7200.0)
+        assert notifier.send.await_count == 2
+
+    async def test_disabled_notifier_is_not_asked(self):
+        halts = daemon.FunctionHalts()
+        halts.email.trip("out of funds", now=0.0)
+        notifier = self._notifier(False)
+        notifier.enabled = False
+        await daemon.notify_new_halts(halts, notifier, 3600, now=0.0)
+        notifier.send.assert_not_awaited()
+
+    def test_clear_forgets_the_notify_schedule(self):
+        halt = DaemonHalt()
+        halt.trip("out of funds", now=0.0)
+        halt.last_notify_attempt_at = 0.0
+        halt.clear()
+        assert vars(halt) == vars(DaemonHalt())
+
+
 class TestHaltNotificationWiring:
     """Push on halt (once per halt, not hourly) and on resume (D22, issue #73);
     a notifier fault never reaches the poll loop."""

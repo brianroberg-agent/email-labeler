@@ -417,7 +417,10 @@ class DaemonHalt:
         self.tripped_at: float | None = None
         self.tripped_wall: float | None = None
         self.last_probe_at: float | None = None
+        # True once a halt push has LANDED (send returned True); a failed push is
+        # re-attempted on the probe cadence, paced by last_notify_attempt_at.
         self.notified = False
+        self.last_notify_attempt_at: float | None = None
 
     def trip(
         self,
@@ -471,6 +474,7 @@ class DaemonHalt:
         self.tripped_wall = None
         self.last_probe_at = None
         self.notified = False
+        self.last_notify_attempt_at = None
 
     @property
     def tripped(self) -> bool:
@@ -598,27 +602,41 @@ async def reprobe_halts(
 
 
 async def notify_new_halts(
-    halts: FunctionHalts, notifier: HaltNotifier, probe_interval: int
+    halts: FunctionHalts, notifier: HaltNotifier, probe_interval: int, now: float
 ) -> None:
-    """Push once per halt (D22): each tripped slot not yet ``notified``.
+    """Push once per halt (D22): each tripped slot whose push has not yet landed.
 
     Called at the top of each poll cycle, BEFORE the re-probe, so a halt that
     trips and resumes between two cycles still reports both events in order.
-    The halt push therefore lags the trip by at most one poll interval. One
-    attempt per halt whatever its outcome — the flag is set before sending.
-    Wrapped so that even a notifier bug cannot reach the loop
-    (``HaltNotifier.send`` already never raises).
+    The halt push therefore lags the trip by at most one poll interval. A push
+    that does not land (``send`` returns False — ntfy unreachable, say, when a
+    host reboot restarts both containers) is re-attempted on the probe cadence:
+    the first attempt is immediate, later ones ``probe_interval`` apart, until
+    one succeeds — so a dead ntfy costs one POST per probe interval, not one
+    per cycle, and a halt is still announced once ntfy is back. Wrapped so that
+    even a notifier bug cannot reach the loop (``HaltNotifier.send`` already
+    never raises).
     """
+    if not notifier.enabled:
+        return
     try:
         for name, slot in halts.enabled_slots():
-            if slot.tripped and not slot.notified:
-                slot.notified = True
-                await notifier.send(
-                    *halt_message(
-                        name, slot.fault, tripped_wall=slot.tripped_wall,
-                        probe_interval=probe_interval,
-                    )
+            if not slot.tripped or slot.notified:
+                continue
+            if (
+                slot.last_notify_attempt_at is not None
+                and now - slot.last_notify_attempt_at < probe_interval
+            ):
+                continue
+            slot.last_notify_attempt_at = now
+            landed = await notifier.send(
+                *halt_message(
+                    name, slot.fault, tripped_wall=slot.tripped_wall,
+                    probe_interval=probe_interval,
                 )
+            )
+            if landed:
+                slot.notified = True
     except Exception as exc:  # noqa: BLE001 — a notification must never fail the daemon
         log.warning("Halt notification failed (%s: %s)", type(exc).__name__, exc)
 
@@ -1716,8 +1734,9 @@ async def run_daemon() -> None:
         # Halted functions re-probe their provider on the slow schedule and
         # clear themselves when it answers (D22). Runs before the stand-down
         # check so a resumed function polls in this very cycle.
-        await notify_new_halts(halts, notifier, halt_probe_interval)
-        resumed = await reprobe_halts(halts, time.monotonic(), halt_probe_interval)
+        now = time.monotonic()
+        await notify_new_halts(halts, notifier, halt_probe_interval, now)
+        resumed = await reprobe_halts(halts, now, halt_probe_interval)
         await notify_resumes(notifier, resumed)
         if narrowed_by_halt and not halts.email.tripped:
             # Email triage resumed: its backlog must be fetched again.
