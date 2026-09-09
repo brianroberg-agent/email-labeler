@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from llm_client import LLMBalanceError
-from notify import HaltNotifier, halt_message, resume_message
+from notify import HaltNotifier, format_downtime, halt_message, resume_message
 
 URL = "https://ntfy.example.test/labeler-alerts"
 
@@ -214,3 +214,33 @@ class TestMessages:
         title, body = resume_message("email triage", 5400.0)
         assert title == "email-labeler resumed: email triage"
         assert "1h 30m" in body
+
+    def test_an_unknown_trip_time_renders_as_unknown(self):
+        """`tripped_wall=None` — a slot tripped without a wall clock (the eval
+        stand-in path, or any trip site that omits `now`). The push must still
+        say something legible about when, not blank or a raw None (review of
+        #81: the fallback was rendered by no assertion)."""
+        _title, body = halt_message(
+            "email triage", None, tripped_wall=None, probe_interval=3600
+        )
+        assert "Halted at: unknown." in body
+
+
+class TestDowntimeRendering:
+    """`format_downtime` feeds the resume line and the resume push. Its sub-hour
+    arm had no assertion on it (review of #81)."""
+
+    def test_a_sub_hour_halt_renders_minutes_only(self):
+        """No "0h " prefix on the common case — a probe interval's worth of
+        halt, or a halt cleared by the first probe after a short outage."""
+        assert format_downtime(90.0) == "1m"
+        assert format_downtime(1800.0) == "30m"
+        assert format_downtime(0.0) == "0m"
+
+    def test_an_hour_or_more_renders_hours_and_padded_minutes(self):
+        assert format_downtime(3600.0) == "1h 00m"
+        assert format_downtime(5400.0) == "1h 30m"
+
+    def test_a_resume_push_after_a_short_halt_reads_in_minutes(self):
+        _title, body = resume_message("email triage", 90.0)
+        assert "after 1m halted" in body
