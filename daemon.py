@@ -127,6 +127,26 @@ def resolve_int_env(env_var: str, default: int, minimum: int = 1) -> int:
     return value
 
 
+def positive_int_setting(daemon_config: dict, key: str, default: int) -> int:
+    """Return config.toml ``[daemon] key`` as an int >= 1, or *default* if absent.
+
+    Raises ValueError with an operator-readable message for anything else — a
+    quoted number, 0, a negative, a float, a bool. The halt machinery's
+    settings are validated here at startup rather than where they are first
+    used: ``halt_probe_interval_seconds`` feeds ``DaemonHalt.probe_due`` at the
+    loop head, outside the cycle's try/except, and only once a halt has
+    tripped — so a quoted value used to pass startup and kill the daemon at
+    the first poll after a halt, exactly when self-heal was meant to take over
+    (review of PR #81). Callers exit(1) on the error, like a missing label.
+    """
+    value = daemon_config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"config.toml [daemon] {key} must be an integer >= 1, got {value!r}"
+        )
+    return value
+
+
 def resolve_newsletter_llm_endpoint() -> tuple[str, str]:
     """Return (base_url, api_key) for the newsletter grading LLM.
 
@@ -375,14 +395,10 @@ class ResultCache:
         self._entries = {tid: e for tid, e in self._entries.items() if tid in active}
 
 
-# Consecutive balance faults (LLMBalanceError) a function absorbs before its
-# halt slot trips (decision D22, issue #73). One was too few: on 2026-08-25 the
-# provider answered a single false 403 while the account had funds, and the
-# resulting halt cost fourteen days. Three consecutive faults with no success
-# in between is the ruling — a provider that is genuinely out of funds fails
-# every request, so it reaches three within one poll cycle of a normal backlog,
-# while an isolated false 403 never does. Any success resets the count.
-BALANCE_HALT_STRIKES = 3
+# Fallback for config.toml [daemon] balance_halt_strikes when the key is absent.
+# The value and its rationale are homed there (decision D7's one-home rule; D22,
+# issue #73) — do not restate them here.
+DEFAULT_BALANCE_HALT_STRIKES = 3
 
 
 class DaemonHalt:
@@ -397,14 +413,15 @@ class DaemonHalt:
     clears it too, since the state is in-memory. First tripper wins: threads in
     one asyncio.gather cycle may race to trip, and the reason must stay stable.
 
-    Tripping takes BALANCE_HALT_STRIKES consecutive balance faults, counted by
-    ``record_balance_error``; ``record_success`` resets the count (D22) but
-    does not clear a tripped slot — only the probe does that.
+    Tripping takes ``strikes_to_trip`` consecutive balance faults (config.toml
+    ``[daemon] balance_halt_strikes``), counted by ``record_balance_error``;
+    ``record_success`` resets the count (D22) but does not clear a tripped
+    slot — only the probe does that.
 
     One slot per function, held together by FunctionHalts.
     """
 
-    def __init__(self, strikes_to_trip: int = BALANCE_HALT_STRIKES):
+    def __init__(self, strikes_to_trip: int = DEFAULT_BALANCE_HALT_STRIKES):
         self.reason: str | None = None
         self.strikes_to_trip = strikes_to_trip
         self.consecutive_faults = 0
@@ -508,9 +525,14 @@ class FunctionHalts:
     function hits its own request — correct, since the fault does disable both.
     """
 
-    def __init__(self, email_enabled: bool = True, newsletter_enabled: bool = False):
-        self.email = DaemonHalt()
-        self.newsletter = DaemonHalt()
+    def __init__(
+        self,
+        email_enabled: bool = True,
+        newsletter_enabled: bool = False,
+        strikes_to_trip: int = DEFAULT_BALANCE_HALT_STRIKES,
+    ):
+        self.email = DaemonHalt(strikes_to_trip)
+        self.newsletter = DaemonHalt(strikes_to_trip)
         self.email_enabled = email_enabled
         self.newsletter_enabled = newsletter_enabled
 
@@ -1690,16 +1712,29 @@ async def run_daemon() -> None:
 
     # Account-level fault switches (provider out of funds), one per function
     # (decision D5's scope rule, D19): a tripped slot stops that function until
-    # its hourly re-probe gets an answer (D22); the poll loop stands down only
-    # once every enabled function is halted. Session-scoped. Probe cadence:
-    # config.toml [daemon] halt_probe_interval_seconds (authoritative);
-    # override per run with HALT_PROBE_INTERVAL_SECONDS.
+    # its re-probe gets an answer (D22); the poll loop stands down only once
+    # every enabled function is halted. Session-scoped. Both knobs are homed in
+    # config.toml [daemon] (authoritative, with rationale): balance_halt_strikes
+    # (override BALANCE_HALT_STRIKES) and halt_probe_interval_seconds (override
+    # HALT_PROBE_INTERVAL_SECONDS). They are validated HERE, at startup: a bad
+    # value must not wait for the first halt to surface (review of PR #81).
+    try:
+        balance_halt_strikes = positive_int_setting(
+            daemon_config, "balance_halt_strikes", DEFAULT_BALANCE_HALT_STRIKES
+        )
+        halt_probe_interval_default = positive_int_setting(
+            daemon_config, "halt_probe_interval_seconds", 3600
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
     halts = FunctionHalts(
         email_enabled=not newsletter_only,
         newsletter_enabled=bool(newsletter_classifier and newsletter_recipient),
+        strikes_to_trip=resolve_int_env("BALANCE_HALT_STRIKES", balance_halt_strikes),
     )
     halt_probe_interval = resolve_int_env(
-        "HALT_PROBE_INTERVAL_SECONDS", daemon_config.get("halt_probe_interval_seconds", 3600)
+        "HALT_PROBE_INTERVAL_SECONDS", halt_probe_interval_default
     )
     # Push on halt and on resume (D22). Disabled — one WARNING here, then
     # no-ops — unless NTFY_URL and NTFY_TOKEN are both set.

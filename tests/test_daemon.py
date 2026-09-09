@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2103,10 +2104,27 @@ class _StopLoop(Exception):
     """Raised by the mocked inter-cycle sleep to break run_daemon's while True."""
 
 
+class _SteppingClock:
+    """Stand-in for the `time` module as daemon.py uses it: monotonic() advances
+    a fixed step per call; time() is the real wall clock."""
+
+    def __init__(self, step):
+        self._step = step
+        self._now = 1000.0
+
+    def monotonic(self):
+        self._now += self._step
+        return self._now
+
+    @staticmethod
+    def time():
+        return time.time()
+
+
 async def run_poll_cycles(
     monkeypatch, tmp_path, poll_outcomes, process_mock=None, cycles=None,
     keep_newsletter=False, newsletter_output_file=None, label_manager=None,
-    daemon_overrides=None,
+    daemon_overrides=None, clock_step=None,
 ):
     """Drive run_daemon through poll cycles, then stop; returns the proxy mock.
 
@@ -2127,6 +2145,10 @@ async def run_poll_cycles(
     (e.g. the post-gather agent/attempted marking).
     `daemon_overrides` patches [daemon] config keys (e.g. max_failures) so a
     test can exercise a value config.toml does not ship.
+    `clock_step` replaces daemon.time with a stub whose monotonic() advances by
+    that many seconds per call (time() stays real), so a halt-probe interval
+    of 1 s is "due" on the next cycle without sleeping — the daemon reads only
+    time.monotonic() and time.time() from the module.
     """
     config = copy.deepcopy(load_config())
     if not keep_newsletter:
@@ -2137,6 +2159,8 @@ async def run_poll_cycles(
     if daemon_overrides:
         config["daemon"].update(daemon_overrides)
     monkeypatch.setattr(daemon, "load_config", lambda: config)
+    if clock_step is not None:
+        monkeypatch.setattr(daemon, "time", _SteppingClock(clock_step))
 
     proxy = MagicMock()
     proxy.proxy_url = "http://proxy.test"
@@ -2432,7 +2456,7 @@ class TestHaltReprobeWiring:
                 ],
                 process_mock=_halt_email_with(client),
                 cycles=3,
-                daemon_overrides={"halt_probe_interval_seconds": 0},
+                daemon_overrides={"halt_probe_interval_seconds": 1}, clock_step=10.0,
             )
         # Cycle 1 polls and trips; cycle 2's probe fails (no poll); cycle 3's
         # probe answers, so cycle 3 polls again.
@@ -2453,7 +2477,7 @@ class TestHaltReprobeWiring:
             process_mock=_halt_email_with(client),
             keep_newsletter=True,
             newsletter_output_file=tmp_path / "assessments.jsonl",
-            daemon_overrides={"halt_probe_interval_seconds": 0},
+            daemon_overrides={"halt_probe_interval_seconds": 1}, clock_step=10.0,
         )
         queries = [c.kwargs["q"] for c in proxy.list_messages.call_args_list]
         # base → narrowed (probe failed, still halted) → base again (probe answered).
@@ -2488,6 +2512,86 @@ class TestHaltReprobeWiring:
 
     def test_shipped_config_probes_hourly(self):
         assert load_config()["daemon"]["halt_probe_interval_seconds"] == 3600
+
+
+class TestPositiveIntSetting:
+    """config.toml [daemon] integers that feed the halt machinery are checked at
+    startup (review of #81, Fable 3): a quoted value used to pass startup and
+    raise TypeError in probe_due at the first poll after a halt tripped — the
+    moment self-heal was meant to take over — and 0 probed every cycle."""
+
+    def test_returns_a_valid_value(self):
+        assert daemon.positive_int_setting({"k": 7}, "k", 3) == 7
+
+    def test_missing_key_returns_the_default(self):
+        assert daemon.positive_int_setting({}, "k", 3) == 3
+
+    @pytest.mark.parametrize("bad", ["3600", 0, -1, 2.5, True, None])
+    def test_rejects_non_positive_or_non_int(self, bad):
+        with pytest.raises(ValueError, match=r"\[daemon\] k must be an integer >= 1"):
+            daemon.positive_int_setting({"k": bad}, "k", 3)
+
+
+class TestHaltConfigValidation:
+    """A bad halt setting stops the daemon at startup with a clear message, the
+    way a missing label does — not at the first halt."""
+
+    @pytest.mark.parametrize("bad", ["3600", 0])
+    async def test_bad_probe_interval_exits_at_startup(self, monkeypatch, tmp_path, caplog, bad):
+        with caplog.at_level(logging.ERROR, logger="email-labeler"):
+            with pytest.raises(SystemExit):
+                await run_poll_cycles(
+                    monkeypatch, tmp_path, [{"messages": []}],
+                    daemon_overrides={"halt_probe_interval_seconds": bad},
+                )
+        assert any(
+            "halt_probe_interval_seconds" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("bad", ["3", 0])
+    async def test_bad_strike_count_exits_at_startup(self, monkeypatch, tmp_path, bad):
+        with pytest.raises(SystemExit):
+            await run_poll_cycles(
+                monkeypatch, tmp_path, [{"messages": []}],
+                daemon_overrides={"balance_halt_strikes": bad},
+            )
+
+
+class TestBalanceHaltStrikesConfig:
+    """The strike count is homed in config.toml [daemon] balance_halt_strikes
+    (D7 — one home for the literal; review of #81, Fable 10), read like
+    halt_probe_interval_seconds with the MAX_FAILURES-style env override."""
+
+    def test_shipped_config_trips_on_the_third_fault(self):
+        assert load_config()["daemon"]["balance_halt_strikes"] == 3
+
+    async def test_strike_count_comes_from_config(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BALANCE_HALT_STRIKES", raising=False)
+        seen = []
+
+        async def record(*args, **kwargs):
+            seen.append(kwargs["halts"].email.strikes_to_trip)
+            return True
+
+        await run_poll_cycles(
+            monkeypatch, tmp_path, [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+            process_mock=record, daemon_overrides={"balance_halt_strikes": 5},
+        )
+        assert seen == [5]
+
+    async def test_strike_count_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BALANCE_HALT_STRIKES", "4")
+        seen = []
+
+        async def record(*args, **kwargs):
+            seen.append(kwargs["halts"].newsletter.strikes_to_trip)
+            return True
+
+        await run_poll_cycles(
+            monkeypatch, tmp_path, [{"messages": [{"id": "m1", "threadId": "t1"}]}],
+            process_mock=record,
+        )
+        assert seen == [4]
 
 
 def _fake_notifier(monkeypatch, send=None):
@@ -2567,7 +2671,7 @@ class TestHaltNotificationWiring:
             [{"messages": [{"id": "m1", "threadId": "t1"}]}],
             process_mock=_halt_email_with(client),
             cycles=4,
-            daemon_overrides={"halt_probe_interval_seconds": 0},
+            daemon_overrides={"halt_probe_interval_seconds": 1}, clock_step=10.0,
         )
         # Four cycles, three of them halted with a failed probe each: ONE push.
         fake.send.assert_awaited_once()
@@ -2586,7 +2690,7 @@ class TestHaltNotificationWiring:
             ],
             process_mock=_halt_email_with(client),
             cycles=3,
-            daemon_overrides={"halt_probe_interval_seconds": 0},
+            daemon_overrides={"halt_probe_interval_seconds": 1}, clock_step=10.0,
         )
         titles = [c.args[0] for c in fake.send.await_args_list]
         assert titles == [
@@ -2606,7 +2710,7 @@ class TestHaltNotificationWiring:
             ],
             process_mock=_halt_email_with(client),
             cycles=4,
-            daemon_overrides={"halt_probe_interval_seconds": 0},
+            daemon_overrides={"halt_probe_interval_seconds": 1}, clock_step=10.0,
         )
         titles = [c.args[0] for c in fake.send.await_args_list]
         assert titles == [
@@ -2623,7 +2727,7 @@ class TestHaltNotificationWiring:
             [{"messages": [{"id": "m1", "threadId": "t1"}]}],
             process_mock=_halt_email_with(client),
             cycles=3,
-            daemon_overrides={"halt_probe_interval_seconds": 0},
+            daemon_overrides={"halt_probe_interval_seconds": 1}, clock_step=10.0,
         )
         # The loop lived through the raising notifier: cycle 1 polled, cycles
         # 2–3 stood down (the probe kept failing) — no exception escaped.

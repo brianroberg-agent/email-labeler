@@ -42,15 +42,27 @@ write_parallel = 4
 # daemon starts shouting about it (that thread is retried forever, never
 # abandoned). Override: MAX_FAILURES.
 max_failures = 5
+# How many CONSECUTIVE out-of-funds responses (LLMBalanceError: HTTP 402, or a
+# 400/403 with a balance signature) a function absorbs before its halt trips
+# (decision D22, issue #73). One was too few: on 2026-08-25 the provider answered
+# a single false 403 while the account had funds, and the resulting halt cost
+# fourteen days. Three consecutive faults with no success in between is the
+# ruling — a provider that is genuinely out of funds fails every request, so it
+# reaches three within one poll cycle of a normal backlog, while an isolated
+# false 403 never does. Any request the provider answers resets the count. Must
+# be an integer >= 1 (the daemon refuses to start otherwise). Override:
+# BALANCE_HALT_STRIKES.
+balance_halt_strikes = 3
 # How often a HALTED function re-probes its LLM provider (one chat completion
-# with max_tokens=1 and a fixed prompt, no email content) and resumes on its own
-# if the provider answers (decision D22, issue #73). A halt trips after three
-# consecutive out-of-funds responses; on 2026-08-25 a single provider-side false
-# 403 halted the daemon for fourteen days because a restart was the only reset.
-# Hourly is the balance: cheap enough to run indefinitely against an account that
-# really is empty (24 one-token requests a day), and it bounds a false halt to an
-# hour of downtime instead of "until someone notices". Override:
-# HALT_PROBE_INTERVAL_SECONDS.
+# with the client's own request shape and a fixed prompt, no email content) and
+# resumes on its own if the provider answers (decision D22, issue #73). A halt
+# trips after balance_halt_strikes consecutive out-of-funds responses (above);
+# on 2026-08-25 a single provider-side false 403 halted the daemon for fourteen
+# days because a restart was the only reset. Hourly is the balance: cheap enough
+# to run indefinitely against an account that really is empty (24 small requests
+# a day), and it bounds a false halt to an hour of downtime instead of "until
+# someone notices". Must be an integer >= 1 (the daemon refuses to start
+# otherwise). Override: HALT_PROBE_INTERVAL_SECONDS.
 halt_probe_interval_seconds = 3600
 healthcheck_file = "/tmp/healthcheck"
 

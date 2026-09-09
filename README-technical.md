@@ -81,6 +81,7 @@ email-labeler/
 | `WRITE_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent label-application writes (`modify_message`), overriding `write_parallel` in `config.toml`. Bounds the proxy-write burst when `max_emails_per_cycle` is large. Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s). |
 | `GIT_SHA` | No | `unknown` | Git commit SHA of the running build, logged once at daemon startup (decision D11). Stamped by the image build (Dockerfile `ARG`/`ENV`); not an operator knob. |
 | `MAX_FAILURES` | No | `5` (from `config.toml`) | Strikes a thread takes before it is set aside under `agent/attempted`, overriding `max_failures` in `config.toml`. Only failures the cycle-level attribution blames on the thread count (decision D5 Rule 2). Also sets the masquerade escalation threshold. |
+| `BALANCE_HALT_STRIKES` | No | `3` (from `config.toml`) | Consecutive out-of-funds responses a function absorbs before its halt trips, overriding `balance_halt_strikes` in `config.toml` (decision D22). |
 | `HALT_PROBE_INTERVAL_SECONDS` | No | `3600` (from `config.toml`) | How often a halted function re-probes its LLM provider and resumes if it answers, overriding `halt_probe_interval_seconds` in `config.toml` (decision D22). |
 | `NTFY_URL` | No | — | Full ntfy topic URL for halt/resume push notifications (decision D22). Unset (or `NTFY_TOKEN` unset): notifications are disabled, one WARNING at startup, otherwise no change in behaviour. |
 | `NTFY_TOKEN` | No | — | Bearer token for `NTFY_URL`. Mint one for the labeler alone — do not reuse another service's. Secret — kept out of log lines. |
@@ -103,9 +104,13 @@ search; excludes the `agent/processed` and `agent/attempted` markers) ·
 semaphores; env overrides `LOCAL_PARALLEL` / `WRITE_PARALLEL`) ·
 `max_failures` (strikes before `agent/attempted`, and the masquerade
 escalation threshold; env override `MAX_FAILURES`) ·
+`balance_halt_strikes` (consecutive out-of-funds responses before a
+function's halt trips, decision D22; env override `BALANCE_HALT_STRIKES`) ·
 `halt_probe_interval_seconds` (how often a halted function re-probes its
 provider and resumes if it answers, decision D22; env override
-`HALT_PROBE_INTERVAL_SECONDS`) · `healthcheck_file` (heartbeat path).
+`HALT_PROBE_INTERVAL_SECONDS`) · `healthcheck_file` (heartbeat path). The
+two halt settings must be integers >= 1; the daemon refuses to start
+otherwise.
 
 Threads found in a poll cycle are processed concurrently, bounded by the
 `cloud_parallel` and `local_parallel` semaphores. **`local_parallel` defaults to 1**:
