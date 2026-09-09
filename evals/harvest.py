@@ -22,10 +22,12 @@ from pathlib import Path
 
 import httpx
 
+from classifier import EmailLabel
 from config_utils import substitute_env_vars
 from evals import format_network_error
 from evals.schemas import GoldenThread
 from gmail_utils import get_header
+from labeler import _get_priority
 from proxy_client import GmailProxyClient, ProxyAuthError, ProxyError, ProxyForbiddenError
 
 _NETWORK_ERRORS = (
@@ -60,6 +62,12 @@ def infer_ground_truth(
 ) -> tuple[str, str]:
     """Infer sender_type and classification label from message labelIds.
 
+    The daemon only ever adds classification labels (never removes one), so a
+    thread that was upgraded — e.g. classified fyi, then needs_response when a
+    later message arrived — carries both. Gmail's labelIds are unordered, so
+    the label is the highest-priority one found across all messages, ranked by
+    the daemon's own ``labeler._PRIORITY_ORDER`` (issue #84).
+
     Args:
         messages: Gmail message resources (with labelIds).
         label_id_to_name: Mapping from Gmail label ID to label name (e.g. "Label_7" -> "agent/personal").
@@ -78,6 +86,7 @@ def infer_ground_truth(
 
     sender_type = ""
     label = ""
+    label_priority = -1  # below every rank in labeler._PRIORITY_ORDER
 
     for msg in messages:
         for label_id in msg.get("labelIds", []):
@@ -87,7 +96,11 @@ def infer_ground_truth(
             if config_key in _SENDER_TYPE_LABELS:
                 sender_type = _SENDER_TYPE_LABELS[config_key]
             elif config_key in _CLASSIFICATION_LABELS:
-                label = _CLASSIFICATION_LABELS[config_key]
+                # Config keys equal EmailLabel values, so this is the daemon's rank.
+                priority = _get_priority(EmailLabel(config_key))
+                if priority > label_priority:
+                    label_priority = priority
+                    label = _CLASSIFICATION_LABELS[config_key]
 
     return sender_type, label
 
