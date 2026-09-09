@@ -61,8 +61,10 @@ uv run python -m evals.review --unreviewed-only
 The new rows carry the daemon's inferred labels as ground truth and a note
 naming the Gmail label, so they are recognizable in `evals.review`. Leave the
 Gmail label in place: a re-run skips threads already in the golden set before
-fetching them. Flag semantics, and what the harvest can and cannot reach:
-[README-technical.md](README-technical.md#harvest).
+fetching them — until the label outgrows one fetch's message window, when the
+run warns and you either raise `--max-threads` or remove the label from
+threads already harvested. Flag semantics, and what the harvest can and cannot
+reach: [README-technical.md](README-technical.md#harvest).
 
 ## 2. Review — Manually verify ground truth labels
 
