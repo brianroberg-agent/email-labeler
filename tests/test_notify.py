@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-import notify
 from llm_client import LLMBalanceError
 from notify import HaltNotifier, halt_message, resume_message
 
@@ -122,6 +121,7 @@ class TestMessages:
             "LLM provider out of funds — status 403 [tier=cloud model=zai-org/glm-5]: ...",
             tier="cloud", model="zai-org/glm-5", status_code=403,
             detail='{"code":403,"reason":"NOT_ENOUGH_BALANCE","message":"not enough balance"}',
+            signature="NOT_ENOUGH_BALANCE",
         )
         title, body = halt_message(
             "email triage", fault, tripped_wall=1_757_419_200.0, probe_interval=3600
@@ -139,10 +139,29 @@ class TestMessages:
         assert title == "email-labeler halted: newsletter grading"
         assert "newsletter grading" in body
 
-    def test_halt_message_caps_the_provider_detail(self):
-        fault = LLMBalanceError("x", detail="y" * 5000)
+    def test_halt_message_forwards_the_signature_not_the_provider_body(self):
+        """Review of #81 (Opus F4): a 400 with a balance signature may echo the
+        request it rejected. The push carries the matched phrase and the HTTP
+        status; the response body stays in the daemon log."""
+        fault = LLMBalanceError(
+            "x", tier="cloud", model="m", status_code=400,
+            detail='{"error":"insufficient_quota","request":"Subject: Re: your invoice"}',
+            signature="insufficient_quota",
+        )
         _title, body = halt_message("email triage", fault, tripped_wall=0.0, probe_interval=3600)
-        assert len(body) < notify.DETAIL_CAP + 600
+        assert "insufficient_quota" in body
+        assert "400" in body
+        assert "your invoice" not in body
+        assert "request" not in body
+
+    def test_halt_message_for_a_402_names_the_status_only(self):
+        fault = LLMBalanceError(
+            "x", tier="cloud", model="m", status_code=402,
+            detail='{"error":"payment required","echo":"Subject: hello"}',
+        )
+        _title, body = halt_message("email triage", fault, tripped_wall=0.0, probe_interval=3600)
+        assert "402" in body
+        assert "hello" not in body
 
     def test_resume_message_names_function_and_downtime(self):
         title, body = resume_message("email triage", 5400.0)

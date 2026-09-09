@@ -411,6 +411,20 @@ class TestBalanceError:
         with pytest.raises(LLMBalanceError):
             await _post_canned(cloud_client, _mock_response(402, {"error": "payment required"}))
 
+    async def test_balance_error_carries_the_matched_signature(self, cloud_client):
+        """Review of #81 (Opus F4): the halt push used to forward the provider's
+        raw response body (capped), data the daemon does not own and which a
+        400 can echo from the request. The error now names the short recognised
+        phrase the match hit, which is all the push needs."""
+        with pytest.raises(LLMBalanceError) as exc_info:
+            await _post_canned(cloud_client, _mock_response(403, NOVITA_BALANCE_BODY))
+        assert exc_info.value.signature == "NOT_ENOUGH_BALANCE"
+
+    async def test_402_balance_error_has_no_signature(self, cloud_client):
+        with pytest.raises(LLMBalanceError) as exc_info:
+            await _post_canned(cloud_client, _mock_response(402, {"error": "payment required"}))
+        assert exc_info.value.signature is None
+
     async def test_plain_403_stays_bare_runtime_error(self, cloud_client):
         """A 403 without a balance signature (bad key etc.) must NOT halt anything."""
         with pytest.raises(RuntimeError) as exc_info:

@@ -153,9 +153,13 @@ class LLMBalanceError(RuntimeError):
     Structured provenance (issue #73), all optional so a bare
     ``LLMBalanceError("msg")`` still constructs: ``tier`` (the raising client's
     tier — which of the email function's two clients to re-probe), ``model``,
-    ``status_code`` and ``detail`` (the provider's response body, truncated) —
-    the fields the halt notification is composed from, without parsing the
-    message text.
+    ``status_code``, ``detail`` (the provider's response body, truncated — for
+    the log and the message text) and ``signature`` (the short recognised
+    balance phrase the match hit, e.g. ``NOT_ENOUGH_BALANCE``; None for a 402,
+    which is a balance error on status alone). The halt notification is
+    composed from tier, model, status_code and signature — never from
+    ``detail``, which is provider data a 400 can echo the request into
+    (review of PR #81).
     """
 
     def __init__(
@@ -166,11 +170,13 @@ class LLMBalanceError(RuntimeError):
         model: str | None = None,
         status_code: int | None = None,
         detail: str = "",
+        signature: str | None = None,
     ):
         super().__init__(message)
         self.tier = tier
         self.model = model
         self.status_code = status_code
+        self.signature = signature
         self.detail = detail
 
 
@@ -339,10 +345,12 @@ class LLMClient:
         if response.status_code != 200:
             prompt_chars = len(system_prompt) + len(user_content)
             resp_body = response.text[:500]
-            if response.status_code == 402 or (
-                response.status_code in _BALANCE_SIGNATURE_STATUSES
-                and _BALANCE_SIGNATURE.search(response.text)
-            ):
+            signature_match = (
+                _BALANCE_SIGNATURE.search(response.text)
+                if response.status_code in _BALANCE_SIGNATURE_STATUSES
+                else None
+            )
+            if response.status_code == 402 or signature_match:
                 raise LLMBalanceError(
                     f"LLM provider out of funds — status {response.status_code} "
                     f"[{self._provider()}]: {resp_body}",
@@ -350,6 +358,7 @@ class LLMClient:
                     model=self.model,
                     status_code=response.status_code,
                     detail=resp_body,
+                    signature=signature_match.group(0) if signature_match else None,
                 )
             if response.status_code == 429 or response.status_code >= 500:
                 # Provider-shaped (decision D5): an exhausted 429 (retry.py already

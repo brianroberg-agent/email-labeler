@@ -9,8 +9,12 @@ one WARNING at startup, and every ``send`` is a no-op.
 
 Contract: ``send`` never raises. A notification failure is logged and the
 daemon carries on — the push is a courtesy on top of the halt, never a reason
-to fail it. Message bodies carry provider identity, HTTP status, the provider's
-reason text (capped) and times — no email content and no credentials.
+to fail it. Message bodies are composed here from the function name, the
+provider tier and model, the HTTP status, the matched balance signature (the
+short recognised phrase, e.g. ``NOT_ENOUGH_BALANCE``) and times. The daemon
+adds no email content and no credentials; the provider's response body is not
+forwarded (it stays in the daemon log), since a 400 can echo the request it
+rejected (review of PR #81).
 """
 
 import logging
@@ -26,9 +30,6 @@ log = logging.getLogger("email-labeler")
 # Seconds to wait on the ntfy POST. Short: this runs on the poll loop's own
 # task, and a slow notification must not hold up the next cycle.
 NOTIFY_TIMEOUT = 10.0
-# Longest provider reason text carried into a push body; the full text is in
-# the daemon log already.
-DETAIL_CAP = 300
 
 DISABLED_WARNING = "halt notifications disabled: NTFY_URL/NTFY_TOKEN not set"
 
@@ -53,15 +54,17 @@ def halt_message(
     tripped_wall: float | None,
     probe_interval: int,
 ) -> tuple[str, str]:
-    """(title, body) for the halt push: what stopped, which provider said what, when."""
+    """(title, body) for the halt push: what stopped, which provider, which
+    status and matched balance phrase, when. ``fault.detail`` (the response
+    body) is deliberately not used — see the module docstring."""
     title = f"email-labeler halted: {function}"
     lines = [f"{function} stopped after repeated out-of-funds responses from its LLM provider."]
     if fault is not None:
         provider = f"tier={fault.tier or '-'} model={fault.model or '-'}"
         status = f"HTTP {fault.status_code}" if fault.status_code is not None else "no HTTP status"
         lines.append(f"Provider: {provider} ({status}).")
-        if fault.detail:
-            lines.append(f"Provider said: {fault.detail[:DETAIL_CAP]}")
+        if fault.signature:
+            lines.append(f"Matched balance signature: {fault.signature}")
     lines.append(f"Halted at: {_format_wall(tripped_wall)}.")
     lines.append(
         f"The daemon re-probes the provider every {probe_interval}s and resumes on its "
