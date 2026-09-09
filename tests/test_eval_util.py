@@ -56,16 +56,25 @@ class TestAtomicWriteJsonl:
         assert json.loads(path.read_text().strip()) == {"value": "original"}
         assert [p.name for p in tmp_path.iterdir()] == ["out.jsonl"]  # no temp left
 
-    def test_preserves_existing_file_mode(self, tmp_path):
+    @pytest.mark.parametrize("mode", [0o640, 0o600, 0o750])
+    def test_preserves_existing_file_mode(self, tmp_path, mode):
         # mkstemp creates the temp file 0600; the rename must not silently
         # narrow the permissions the owner had set on the real file (issue: the
         # golden set became root-only after every review session, and a second
         # user had to chmod o+r it each time).
+        #
+        # The seeded mode must be one the new-file fallback (0666 & ~umask)
+        # cannot produce on this host, or the test passes by coincidence: the
+        # original 0o664 equalled the fallback under umask 002 and stayed green
+        # with the existing-mode branch bypassed. 0o640 is what umask 027 would
+        # yield, so 0o750 is the one no umask at all can produce — the fallback
+        # can never set an execute bit. 0o600 is mkstemp's own default, so it
+        # pins the branch but would not notice a dropped chmod; the other two do.
         path = tmp_path / "out.jsonl"
         atomic_write_jsonl([_Rec(1)], path)
-        path.chmod(0o664)
+        path.chmod(mode)
         atomic_write_jsonl([_Rec(2)], path)
-        assert stat.S_IMODE(path.stat().st_mode) == 0o664
+        assert stat.S_IMODE(path.stat().st_mode) == mode
 
     def test_new_file_gets_umask_default_mode_not_0600(self, tmp_path):
         # A file that did not exist before should come out the way a plain
