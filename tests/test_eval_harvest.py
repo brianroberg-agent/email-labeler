@@ -402,6 +402,17 @@ class TestHarvestLoop:
         await harvest_threads(proxy, self.CONFIG, max_threads=10)
         assert "budget exhausted" in capsys.readouterr().err
 
+    async def test_budget_warning_counts_only_unharvested_threads(self, capsys):
+        # Re-run regime: the label is larger than the message window and every
+        # thread in the window is already harvested. The cap is not reached by
+        # NEW threads, so the older picks beyond the window are being missed —
+        # warn on the post-skip count, not the raw thread count.
+        proxy = _StubProxy(thread_ids=("t1", "t2"), next_page_token="abc")
+        await harvest_threads(
+            proxy, self.CONFIG, max_threads=2, skip_thread_ids={"t1", "t2"},
+        )
+        assert "budget exhausted" in capsys.readouterr().err
+
     async def test_no_budget_warning_when_cap_reached(self, capsys):
         proxy = _StubProxy(thread_ids=("t1", "t2"), next_page_token="abc")
         await harvest_threads(proxy, self.CONFIG, max_threads=2)

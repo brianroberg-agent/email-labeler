@@ -256,16 +256,6 @@ async def harvest_threads(
 
     print(f"Found {len(thread_ids)} unique threads from {len(msg_stubs)} messages", file=sys.stderr)
 
-    # The fetch is a message-level budget with no pagination, so long threads
-    # can exhaust it before max_threads distinct threads have surfaced. Say so
-    # when that happened, since matching threads are then missing silently.
-    if len(thread_ids) < max_threads and (
-        response.get("nextPageToken") or len(msg_stubs) >= max_threads * 3
-    ):
-        print("Warning: message budget exhausted (max_threads * 3) before reaching "
-              "--max-threads; some matching threads were not fetched — raise "
-              "--max-threads or narrow the query", file=sys.stderr)
-
     # Threads already in the golden set are skipped before fetching and do
     # not consume max_threads slots — otherwise a hand-picked label larger
     # than the cap could never reach its older picks on a re-run.
@@ -273,6 +263,19 @@ async def harvest_threads(
     if len(candidates) < len(thread_ids):
         print(f"Skipping {len(thread_ids) - len(candidates)} threads already in the golden set",
               file=sys.stderr)
+
+    # The fetch is a message-level budget with no pagination, so long threads
+    # can exhaust it before max_threads distinct threads have surfaced. Say so
+    # when that happened, since matching threads are then missing silently.
+    # Counted AFTER the skip: on a re-run the window may hold only known
+    # threads while the unharvested picks sit beyond it.
+    if len(candidates) < max_threads and (
+        response.get("nextPageToken") or len(msg_stubs) >= max_threads * 3
+    ):
+        print("Warning: message budget exhausted (max_threads * 3) before reaching "
+              "--max-threads with new threads; some matching threads were not "
+              "fetched — raise --max-threads, narrow the query, or remove the label "
+              "from already-harvested threads", file=sys.stderr)
 
     # Fetch each thread and build golden entries
     results: list[GoldenThread] = []
