@@ -463,19 +463,70 @@ class TestProcessSingleThread:
     ):
         """A balance error on the email tiers trips the EMAIL function's halt slot
         (decision D5's scope rule, D19: halts became per-function in Wave 2 T9),
-        signalling the poll loop to stop that function."""
+        signalling the poll loop to stop that function — on the THIRD consecutive
+        fault, not the first (issue #73, D22). The slot records the cloud client
+        as the one to re-probe, since the fault came from the cloud tier."""
         mock_proxy.get_thread.return_value = mock_thread_response
-        mock_classifier.classify_sender.side_effect = LLMBalanceError("out of funds")
+        mock_classifier.classify_sender.side_effect = LLMBalanceError(
+            "out of funds", tier="cloud"
+        )
         halts = daemon.FunctionHalts()
 
-        result = await process_single_thread(
-            "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
-            cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
-        )
+        async def attempt():
+            return await process_single_thread(
+                "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
+            )
 
-        assert result is False
+        assert await attempt() is False
+        assert await attempt() is False
+        assert halts.email.tripped is False
+        assert await attempt() is False
         assert halts.email.tripped is True
         assert "out of funds" in halts.email.reason
+        assert halts.email.probe_client is mock_classifier.cloud_llm
+
+    async def test_local_tier_balance_error_records_the_local_client_to_probe(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """A balance fault carrying tier="local" (a public stand-in on the local
+        slot, D4 — eval-only, but the daemon must still probe the right thing)
+        records the LOCAL client for the re-probe, not the cloud one."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        mock_classifier.classify.side_effect = LLMBalanceError("out of funds", tier="local")
+        halts = daemon.FunctionHalts()
+        for _ in range(3):
+            await process_single_thread(
+                "thread_broke", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
+            )
+        assert halts.email.tripped is True
+        assert halts.email.probe_client is mock_classifier.local_llm
+
+    async def test_a_successful_classification_resets_the_balance_count(
+        self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Two balance faults, a success, two more: no halt. The count is of
+        CONSECUTIVE faults (D22) — a provider that answers in between is not
+        out of funds."""
+        mock_proxy.get_thread.return_value = mock_thread_response
+        good = mock_classifier.classify_sender.return_value
+        mock_classifier.classify_sender.side_effect = [
+            LLMBalanceError("out of funds"), LLMBalanceError("out of funds"),
+            good,
+            LLMBalanceError("out of funds"), LLMBalanceError("out of funds"),
+        ]
+        halts = daemon.FunctionHalts()
+        results = []
+        for _ in range(5):
+            results.append(await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
+            ))
+        assert results == [False, False, True, False, False]
+        assert halts.email.tripped is False
 
     async def test_tripped_halt_short_circuits_before_any_work(
         self, mock_proxy, mock_classifier, mock_label_manager, cloud_sem, local_sem,
@@ -1665,6 +1716,53 @@ class TestDaemonHalt:
         halt.trip("second")
         assert halt.reason == "first"
 
+    def test_trips_only_on_the_third_consecutive_balance_error(self):
+        """Issue #73 / D22: one balance-403 was treated as permanent, and on
+        2026-08-25 it was a provider-side false 403 that cost fourteen days.
+        The slot now trips on the THIRD consecutive fault; the first two are
+        plain deferrals."""
+        halt = DaemonHalt()
+        exc = LLMBalanceError("out of funds", tier="cloud", status_code=403)
+        assert halt.record_balance_error(exc) is False
+        assert halt.tripped is False
+        assert halt.record_balance_error(exc) is False
+        assert halt.tripped is False
+        assert halt.record_balance_error(exc) is True
+        assert halt.tripped is True
+        assert halt.reason == "out of funds"
+        assert halt.fault is exc
+        # A fourth fault on a tripped slot changes nothing (first tripper wins).
+        assert halt.record_balance_error(LLMBalanceError("later")) is False
+        assert halt.reason == "out of funds"
+
+    def test_a_success_resets_the_consecutive_count(self):
+        halt = DaemonHalt()
+        exc = LLMBalanceError("out of funds")
+        halt.record_balance_error(exc)
+        halt.record_balance_error(exc)
+        halt.record_success()
+        halt.record_balance_error(exc)
+        halt.record_balance_error(exc)
+        assert halt.tripped is False
+        halt.record_balance_error(exc)
+        assert halt.tripped is True
+
+    def test_a_success_does_not_clear_a_tripped_slot(self):
+        """Only the re-probe clears a halt (D22); a stray success (a request that
+        was in flight when the slot tripped) must not un-halt the function."""
+        halt = DaemonHalt()
+        halt.trip("out of funds")
+        halt.record_success()
+        assert halt.tripped is True
+
+    def test_tripping_records_the_probe_client(self):
+        halt = DaemonHalt()
+        client = MagicMock()
+        exc = LLMBalanceError("out of funds")
+        for _ in range(3):
+            halt.record_balance_error(exc, probe_client=client)
+        assert halt.probe_client is client
+
 
 class TestSummarizeCycle:
     def test_counts_handled_threads_and_drains_give_ups(self):
@@ -2198,21 +2296,59 @@ class TestPerFunctionHalt:
             tmp_path / "assessments.jsonl",
         )
 
-        first = await self._run_cycle(halts, *args)
-        second = await self._run_cycle(halts, *args)
+        # Three consecutive faults trip the slot (D22); the fourth cycle defers.
+        cycles = [await self._run_cycle(halts, *args) for _ in range(4)]
 
-        assert first == [False, True]
-        assert second == [False, True]
+        assert cycles == [[False, True]] * 4
         assert halts.newsletter.tripped is True
         assert halts.email.tripped is False
-        # Email triage kept running across both cycles...
-        assert mock_classifier.classify.await_count == 2
-        assert mock_label_manager.apply_classification.await_count == 2
+        # ...and the slot knows which client to re-probe.
+        assert halts.newsletter.probe_client is mock_newsletter_classifier.cloud_llm
+        # Email triage kept running across every cycle...
+        assert mock_classifier.classify.await_count == 4
+        assert mock_label_manager.apply_classification.await_count == 4
         # ...while the halted newsletter function stopped calling its dead
         # provider after the trip and committed nothing.
-        assert mock_newsletter_classifier.classify_newsletter.await_count == 1
+        assert mock_newsletter_classifier.classify_newsletter.await_count == 3
         mock_label_manager.apply_newsletter_classification.assert_not_called()
         assert not (tmp_path / "assessments.jsonl").exists()
+
+    async def test_newsletter_success_resets_its_own_balance_count(
+        self, mock_proxy, mock_classifier, mock_label_manager,
+        mock_newsletter_classifier, cloud_sem, local_sem,
+        newsletter_thread_response, tmp_path,
+    ):
+        """The consecutive count is per function: a newsletter grading that
+        succeeds between two newsletter balance faults resets the NEWSLETTER
+        count, so faults separated by a success never accumulate to a halt."""
+        mock_proxy.get_thread.return_value = newsletter_thread_response
+        good = [
+            StoryResult(
+                text="Content",
+                scores={"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+                average_score=3.0,
+                tier=NewsletterTier.EXCELLENT,
+                themes={"scripture": "emphasized"},
+            )
+        ]
+        mock_newsletter_classifier.classify_newsletter.side_effect = [
+            LLMBalanceError("nl out of funds"), LLMBalanceError("nl out of funds"),
+            good,
+            LLMBalanceError("nl out of funds"), LLMBalanceError("nl out of funds"),
+        ]
+        halts = daemon.FunctionHalts(newsletter_enabled=True)
+        results = []
+        for _ in range(5):
+            results.append(await process_single_thread(
+                "thread_nl", ["thread_nl"], mock_proxy, mock_classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=50000,
+                newsletter_classifier=mock_newsletter_classifier,
+                newsletter_recipient="newsletters@dm.org",
+                newsletter_output_file=str(tmp_path / "assessments.jsonl"),
+                halts=halts,
+            ))
+        assert results == [False, False, True, False, False]
+        assert halts.newsletter.tripped is False
 
     async def test_email_balance_fault_leaves_newsletter_running(
         self, mock_proxy, mock_classifier, mock_label_manager,
@@ -2245,19 +2381,18 @@ class TestPerFunctionHalt:
             tmp_path / "assessments.jsonl",
         )
 
-        first = await self._run_cycle(halts, *args)
-        second = await self._run_cycle(halts, *args)
+        # Three consecutive faults trip the slot (D22); the fourth cycle defers.
+        cycles = [await self._run_cycle(halts, *args) for _ in range(4)]
 
-        assert first == [True, False]
-        assert second == [True, False]
+        assert cycles == [[True, False]] * 4
         assert halts.email.tripped is True
         assert halts.newsletter.tripped is False
-        # Newsletter grading kept running across both cycles...
-        assert mock_newsletter_classifier.classify_newsletter.await_count == 2
-        assert mock_label_manager.apply_newsletter_classification.await_count == 2
+        # Newsletter grading kept running across every cycle...
+        assert mock_newsletter_classifier.classify_newsletter.await_count == 4
+        assert mock_label_manager.apply_newsletter_classification.await_count == 4
         # ...while the halted email function stopped calling its dead provider
         # and committed nothing at all (no labels, no marker).
-        assert mock_classifier.classify_sender.await_count == 1
+        assert mock_classifier.classify_sender.await_count == 3
         mock_label_manager.apply_classification.assert_not_called()
         mock_label_manager.mark_processed.assert_not_called()
         mock_label_manager.mark_attempted.assert_not_called()

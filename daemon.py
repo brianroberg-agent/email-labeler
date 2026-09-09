@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 import tomllib
 from collections import Counter
 from contextlib import nullcontext
@@ -373,26 +374,102 @@ class ResultCache:
         self._entries = {tid: e for tid, e in self._entries.items() if tid in active}
 
 
+# Consecutive balance faults (LLMBalanceError) a function absorbs before its
+# halt slot trips (decision D22, issue #73). One was too few: on 2026-08-25 the
+# provider answered a single false 403 while the account had funds, and the
+# resulting halt cost fourteen days. Three consecutive faults with no success
+# in between is the ruling — a provider that is genuinely out of funds fails
+# every request, so it reaches three within one poll cycle of a normal backlog,
+# while an isolated false 403 never does. Any success resets the count.
+BALANCE_HALT_STRIKES = 3
+
+
 class DaemonHalt:
     """Halt state for ONE function's account-level faults (provider out of funds).
 
     Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
     fails EVERY request it serves: retrying per-thread just re-fails that
     function's whole backlog every cycle, against a provider that cannot answer
-    any of it. Tripping this stops the function until the admin adds funds and
-    restarts. In-memory and session-scoped by design — a restart is the only way
-    to clear it. First tripper wins: threads in one asyncio.gather cycle may
-    race to trip, and the reason must stay stable.
+    any of it. Tripping this stops the function. The slot self-heals (decision
+    D22): the poll loop re-probes ``probe_client`` on a slow schedule while
+    tripped and calls ``clear()`` when the provider answers again — a restart
+    clears it too, since the state is in-memory. First tripper wins: threads in
+    one asyncio.gather cycle may race to trip, and the reason must stay stable.
+
+    Tripping takes BALANCE_HALT_STRIKES consecutive balance faults, counted by
+    ``record_balance_error``; ``record_success`` resets the count (D22) but
+    does not clear a tripped slot — only the probe does that.
 
     One slot per function, held together by FunctionHalts.
     """
 
-    def __init__(self):
+    def __init__(self, strikes_to_trip: int = BALANCE_HALT_STRIKES):
         self.reason: str | None = None
+        self.strikes_to_trip = strikes_to_trip
+        self.consecutive_faults = 0
+        # The exception that tripped the slot — provenance for the notification.
+        self.fault: LLMBalanceError | None = None
+        # The LLMClient whose provider reported the fault; re-probed while tripped.
+        self.probe_client: LLMClient | None = None
+        # time.monotonic() at trip and at the last probe (scheduling), and
+        # time.time() at trip (the notification's wall-clock "since").
+        self.tripped_at: float | None = None
+        self.tripped_wall: float | None = None
+        self.last_probe_at: float | None = None
+        self.notified = False
 
-    def trip(self, reason: str) -> None:
+    def trip(
+        self,
+        reason: str,
+        *,
+        fault: LLMBalanceError | None = None,
+        probe_client: LLMClient | None = None,
+        now: float | None = None,
+    ) -> None:
         if self.reason is None:
             self.reason = reason
+            self.fault = fault
+            self.probe_client = probe_client
+            self.tripped_at = time.monotonic() if now is None else now
+            self.tripped_wall = time.time()
+            self.last_probe_at = self.tripped_at
+
+    def record_balance_error(
+        self,
+        exc: LLMBalanceError,
+        *,
+        probe_client: LLMClient | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Count one balance fault; trip at ``strikes_to_trip`` consecutive.
+
+        Returns True only on the call that trips the slot. A fault on an
+        already-tripped slot changes nothing (first tripper wins).
+        """
+        if self.tripped:
+            return False
+        self.consecutive_faults += 1
+        if self.consecutive_faults < self.strikes_to_trip:
+            return False
+        self.trip(str(exc), fault=exc, probe_client=probe_client, now=now)
+        return True
+
+    def record_success(self) -> None:
+        """A request this function's provider answered: the faults were not
+        consecutive after all. Does not clear a tripped slot (D22: only the
+        probe resumes a halted function)."""
+        self.consecutive_faults = 0
+
+    def clear(self) -> None:
+        """Resume: the probe got an answer. Back to the untripped initial state."""
+        self.reason = None
+        self.consecutive_faults = 0
+        self.fault = None
+        self.probe_client = None
+        self.tripped_at = None
+        self.tripped_wall = None
+        self.last_probe_at = None
+        self.notified = False
 
     @property
     def tripped(self) -> bool:
@@ -825,11 +902,17 @@ async def process_single_thread(
                         # functions apart: halt newsletter grading only — email
                         # triage keeps running (decision D5's scope rule, D19).
                         # The thread is left unprocessed, no strike, and is
-                        # re-graded after the admin adds funds and restarts.
+                        # re-graded once the function resumes (D22: the third
+                        # consecutive fault trips the slot; the poll loop's
+                        # re-probe of the newsletter client clears it).
                         log.error("Newsletter thread %s deferred — %s", thread_id, exc)
                         if halts is not None:
-                            halts.newsletter.trip(str(exc))
+                            halts.newsletter.record_balance_error(
+                                exc, probe_client=newsletter_classifier.cloud_llm
+                            )
                         return False
+                    if halts is not None:
+                        halts.newsletter.record_success()
 
                     # Determine overall tier (best story's tier)
                     best_tier = None
@@ -1008,6 +1091,11 @@ async def process_single_thread(
                 async with cloud_sem:
                     result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
 
+            if halts is not None:
+                # Both stages answered: the email function's provider is not
+                # out of funds, so any consecutive-fault count restarts (D22).
+                halts.email.record_success()
+
             label = result.label
             applied_sender_type = result.sender_type
             # Cache before the write: a write fault must not discard the
@@ -1144,14 +1232,19 @@ async def process_single_thread(
     except LLMBalanceError as exc:
         # Account-wide, not a thread fault (and must precede the RuntimeError arm,
         # which it subclasses): don't count toward give-up, don't mark anything —
-        # the thread is re-processed after the admin adds funds and restarts.
-        # Reaching this arm means the fault came from the EMAIL pipeline's tiers
-        # (the newsletter branch traps its own balance faults at the call site),
-        # so it halts email triage only — newsletter grading keeps running
-        # (decision D5's scope rule, D19).
+        # the thread is re-processed once the function resumes. Reaching this
+        # arm means the fault came from the EMAIL pipeline's tiers (the
+        # newsletter branch traps its own balance faults at the call site), so
+        # it halts email triage only — newsletter grading keeps running
+        # (decision D5's scope rule, D19). The third consecutive fault trips
+        # the slot (D22); the client to re-probe is the tier that raised —
+        # normally cloud; local only with a public stand-in on that slot (D4).
         log.error("Thread %s deferred — %s", thread_id, exc)
         if halts is not None:
-            halts.email.trip(str(exc))
+            probe_client = (
+                classifier.local_llm if exc.tier == "local" else classifier.cloud_llm
+            )
+            halts.email.record_balance_error(exc, probe_client=probe_client)
         return False
     except RuntimeError as exc:
         # Request-specific LLM failure — a non-balance 4xx-shaped response, or an
