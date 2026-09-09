@@ -332,9 +332,11 @@ class _StubProxy:
     was fetched, not just on what came back.
     """
 
-    def __init__(self, *args, thread_ids=("t1",), next_page_token=None, **kwargs):
+    def __init__(self, *args, thread_ids=("t1",), next_page_token=None,
+                 messages_per_thread=1, **kwargs):
         self.thread_ids = list(thread_ids)
         self.next_page_token = next_page_token
+        self.messages_per_thread = messages_per_thread
         self.last_query = None
         self.get_thread_calls: list[str] = []
 
@@ -343,7 +345,10 @@ class _StubProxy:
 
     async def list_messages(self, user_id="me", max_results=10, q=None, label_ids=None):
         self.last_query = q
-        response = {"messages": [{"id": f"m-{tid}", "threadId": tid} for tid in self.thread_ids]}
+        response = {"messages": [
+            {"id": f"m-{tid}-{n}", "threadId": tid}
+            for tid in self.thread_ids for n in range(self.messages_per_thread)
+        ]}
         if self.next_page_token:
             response["nextPageToken"] = self.next_page_token
         return response
@@ -411,6 +416,14 @@ class TestHarvestLoop:
         await harvest_threads(
             proxy, self.CONFIG, max_threads=2, skip_thread_ids={"t1", "t2"},
         )
+        assert "budget exhausted" in capsys.readouterr().err
+
+    async def test_warns_when_window_is_full_without_page_token(self, capsys):
+        # Gmail need not return nextPageToken; a page that fills the whole
+        # message window (max_threads * 3) with fewer threads than the cap is
+        # the same silent truncation.
+        proxy = _StubProxy(thread_ids=("t1",), messages_per_thread=6)
+        await harvest_threads(proxy, self.CONFIG, max_threads=2)
         assert "budget exhausted" in capsys.readouterr().err
 
     async def test_no_budget_warning_when_cap_reached(self, capsys):
