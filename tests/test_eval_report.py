@@ -611,3 +611,153 @@ class TestVerboseGoldenContext:
         out = capsys.readouterr().out
         assert "Project update" in out
         assert "coworker@corp.com" in out
+
+
+# ---------------------------------------------------------------------------
+# Assistant field metrics (issue #78 groundwork)
+# ---------------------------------------------------------------------------
+
+def _asst_result(
+    expected_lb: str,
+    expected_assistant: bool | None,
+    predicted_assistant: bool | None = None,
+    thread_id: str = "t",
+) -> PredictionResult:
+    return PredictionResult(
+        thread_id=thread_id,
+        expected_sender_type="person",
+        expected_label=expected_lb,
+        predicted_sender_type="person",
+        predicted_label=expected_lb,
+        sender_type_correct=True,
+        label_correct=True,
+        expected_assistant=expected_assistant,
+        predicted_assistant=predicted_assistant,
+    )
+
+
+class TestAssistantMetrics:
+    def test_scored_population_is_annotated_needs_response_threads_only(self):
+        results = [
+            _asst_result("needs_response", True, True, "a"),
+            _asst_result("needs_response", None, None, "b"),   # not annotated
+            _asst_result("fyi", None, None, "c"),              # not needs_response
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["needs_response_threads"] == 2
+        assert a["annotated"] == 1
+        assert a["count"] == 1
+
+    def test_binary_precision_recall_f1(self):
+        # 2 true positives, 1 false positive, 2 false negatives.
+        results = [
+            _asst_result("needs_response", True, True, "tp1"),
+            _asst_result("needs_response", True, True, "tp2"),
+            _asst_result("needs_response", False, True, "fp1"),
+            _asst_result("needs_response", True, False, "fn1"),
+            _asst_result("needs_response", True, False, "fn2"),
+            _asst_result("needs_response", False, False, "tn1"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["true_positives"] == 2
+        assert a["false_positives"] == 1
+        assert a["false_negatives"] == 2
+        assert a["precision"] == 2 / 3
+        assert a["recall"] == 0.5
+        assert abs(a["f1"] - 2 * (2 / 3) * 0.5 / ((2 / 3) + 0.5)) < 1e-9
+        assert a["count"] == 6
+
+    def test_prediction_outside_the_scored_set_is_a_false_positive_on_its_own_line(self):
+        results = [
+            _asst_result("needs_response", True, True, "in"),
+            _asst_result("fyi", None, True, "out_label"),          # wrong label
+            _asst_result("needs_response", None, True, "out_annot"),  # unannotated
+            _asst_result("fyi", None, False, "negative"),          # not a positive
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["out_of_scope_positives"] == 2
+        # ...and it does not contaminate the scored precision.
+        assert a["true_positives"] == 1
+        assert a["false_positives"] == 0
+        assert a["precision"] == 1.0
+
+    def test_no_predictions_reports_annotation_progress_instead_of_metrics(self):
+        results = [
+            _asst_result("needs_response", True, None, "a"),
+            _asst_result("needs_response", None, None, "b"),
+            _asst_result("needs_response", False, None, "c"),
+            _asst_result("fyi", None, None, "d"),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["predictions"] == 0
+        assert a["precision"] is None
+        assert a["recall"] is None
+        assert a["f1"] is None
+        assert a["annotated"] == 2
+        assert a["needs_response_threads"] == 3
+
+    def test_error_results_are_excluded(self):
+        results = [
+            _asst_result("needs_response", True, True, "ok"),
+            PredictionResult(
+                thread_id="boom", expected_sender_type="person",
+                expected_label="needs_response", expected_assistant=True,
+                error="timeout",
+            ),
+        ]
+        a = compute_metrics(results)["assistant"]
+        assert a["annotated"] == 1
+        assert a["needs_response_threads"] == 1
+
+    def test_empty_results_have_no_assistant_section(self):
+        assert "assistant" not in compute_metrics([])
+
+
+class TestAssistantJson:
+    def test_json_output_carries_the_assistant_section(self, capsys):
+        from evals.report import report_as_json
+
+        metrics = compute_metrics([_asst_result("needs_response", True, None, "a")])
+        report_as_json(_make_meta(), metrics)
+        payload = __import__("json").loads(capsys.readouterr().out)
+        assert payload["metrics"]["assistant"]["annotated"] == 1
+        assert payload["metrics"]["assistant"]["predictions"] == 0
+
+
+class TestPrintAssistantSection:
+    def test_no_predictions_prints_annotation_progress(self, capsys):
+        results = [
+            _asst_result("needs_response", True, None, "a"),
+            _asst_result("needs_response", False, None, "b"),
+            _asst_result("needs_response", None, None, "c"),
+            _asst_result("fyi", None, None, "d"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        out = capsys.readouterr().out
+        assert (
+            "assistant: no predictions in this run "
+            "(2 of 3 needs_response threads annotated)"
+        ) in out
+        assert "Precision" not in out.split("--- Assistant Field ---")[1]
+
+    def test_metrics_printed_with_n_on_every_figure(self, capsys):
+        results = [
+            _asst_result("needs_response", True, True, "tp1"),
+            _asst_result("needs_response", True, True, "tp2"),
+            _asst_result("needs_response", False, True, "fp1"),
+            _asst_result("needs_response", True, False, "fn1"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1]
+        assert "Precision: 66.7% (n=4)" in section
+        assert "Recall:    66.7% (n=4)" in section
+        assert "F1:        66.7% (n=4)" in section
+
+    def test_out_of_scope_positives_get_their_own_line(self, capsys):
+        results = [
+            _asst_result("needs_response", True, True, "in"),
+            _asst_result("fyi", None, True, "out"),
+        ]
+        print_report(_make_meta(), compute_metrics(results))
+        section = capsys.readouterr().out.split("--- Assistant Field ---")[1]
+        assert "outside the scored set: 1" in section
