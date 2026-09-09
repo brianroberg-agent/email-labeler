@@ -1,6 +1,7 @@
 """Tests for notify.py — ntfy pushes on daemon halt and resume (decision D22, issue #73)."""
 
 import logging
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -131,7 +132,14 @@ class TestMessages:
         assert "zai-org/glm-5" in body
         assert "403" in body
         assert "NOT_ENOUGH_BALANCE" in body
-        assert "2025-09-09" in body  # the trip time, wall clock
+        # The trip time, wall clock, in the host's zone — computed the way the
+        # message does rather than pinned to one zone's calendar date (the epoch
+        # is 2025-09-09 in America/New_York and 2025-09-10 in Pacific/Kiritimati;
+        # review of #81, Opus F3).
+        expected_time = (
+            datetime.fromtimestamp(1_757_419_200.0).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        )
+        assert f"Halted at: {expected_time}." in body
         assert "3600" in body or "60 min" in body or "1h" in body
 
     def test_halt_message_without_provenance_still_reads(self):
