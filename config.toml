@@ -49,8 +49,8 @@ max_failures = 5
 # fourteen days. Three consecutive faults with no success in between is the
 # ruling — a provider that is genuinely out of funds fails every request, so it
 # reaches three within one poll cycle of a normal backlog, while an isolated
-# false 403 never does. Any answered request the pipeline parses resets the count (an answer
-# that fails to parse records nothing). Must
+# false 403 never does. Any completion one of the function's LLM clients returns
+# resets the count; whether the pipeline can parse it is not a condition. Must
 # be an integer >= 1 (the daemon refuses to start otherwise). Override:
 # BALANCE_HALT_STRIKES.
 balance_halt_strikes = 3

@@ -17,8 +17,10 @@ import pytest
 import daemon
 from classifier import (
     ClassificationResult,
+    EmailClassifier,
     EmailLabel,
     SenderType,
+    _match_sender_type,
 )
 from daemon import (
     DaemonHalt,
@@ -562,6 +564,47 @@ class TestProcessSingleThread:
                 cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
             ))
         assert results == [False, False, False, False]
+        assert halts.email.tripped is False
+        assert halts.email.consecutive_faults == 1
+
+    async def test_an_unparseable_stage_one_reply_still_resets_the_count(
+        self, monkeypatch, mock_proxy, mock_label_manager, cloud_sem, local_sem,
+        mock_thread_response,
+    ):
+        """Delta review of #81 (Opus, candidate 2): a completion the client
+        returns is the evidence D22 item 2 wants — the provider answered, so
+        it is not out of funds — and whether the pipeline can parse it is not
+        a condition on the reset. Stage 1 defaults an unparseable reply to
+        SERVICE (parse_sender_type) rather than raising, and the daemon resets
+        on the way; the docs had claimed "and the pipeline parses". Driven
+        through the real EmailClassifier so the real parse runs: 403, 403,
+        garbage-at-Stage-1 (both senders) then a Stage-2 deferral, 403 — no
+        halt, one fault on the count."""
+        monkeypatch.delenv("VIP_SENDERS", raising=False)
+        mock_proxy.get_thread.return_value = mock_thread_response
+        garbage = "I am not able to say what kind of sender this is."
+        assert _match_sender_type(garbage.upper()) is None  # provably unparseable
+        cloud_llm = AsyncMock()
+        cloud_llm.complete.side_effect = [
+            LLMBalanceError("out of funds", tier="cloud"),
+            LLMBalanceError("out of funds", tier="cloud"),
+            (garbage, ""),  # Stage 1, first sender: unparseable -> SERVICE, try the next
+            (garbage, ""),  # Stage 1, second sender: same
+            LLMUnavailableError("cloud endpoint dropped the request"),  # Stage 2 defers
+            LLMBalanceError("out of funds", tier="cloud"),
+        ]
+        classifier = EmailClassifier(
+            cloud_llm=cloud_llm, local_llm=AsyncMock(), config=load_config(),
+        )
+        halts = daemon.FunctionHalts()
+        results = []
+        for _ in range(4):
+            results.append(await process_single_thread(
+                "thread_x", ["msg_1"], mock_proxy, classifier, mock_label_manager,
+                cloud_sem, local_sem, max_thread_chars=16000, halts=halts,
+            ))
+        assert results == [False, False, False, False]
+        assert cloud_llm.complete.await_count == 6
         assert halts.email.tripped is False
         assert halts.email.consecutive_faults == 1
 

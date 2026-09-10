@@ -403,9 +403,14 @@ together:
 2. **Consecutive balance faults trip the halt, not one.** The count is
    `balance_halt_strikes` in config.toml `[daemon]` (authoritative, with its
    rationale — D7's one-home rule; env override `BALANCE_HALT_STRIKES`;
-   validated at startup). Any request one of the function's LLM clients
-   answers *and the pipeline parses* resets the count — Stage 1 of the email pipeline included, and
-   each LLM call of a newsletter grading. Per function. Two consequences,
+   validated at startup). Any completion one of the function's LLM clients
+   returns resets the count — whether the pipeline can parse it is not a
+   condition: Stage 1 of the email pipeline included (an unparseable reply
+   defaults to SERVICE and still resets), and each LLM call of a newsletter
+   grading. Where a parse failure raises instead (Stage 2's
+   `parse_email_label`, extraction's `parse_stories`, the client's own
+   content guard) the reset is simply not reached. Per function. Two
+   consequences,
    accepted: the count is per observed outcome, not per time, so faults
    arriving back-to-back within a single poll cycle (a few-second provider
    blip under `cloud_parallel` concurrency) can reach it and trip — the cost
