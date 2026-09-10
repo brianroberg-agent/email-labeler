@@ -439,7 +439,8 @@ class DaemonHalt:
         self.tripped_wall: float | None = None
         self.last_probe_at: float | None = None
         # True once a halt push has LANDED (send returned True); a failed push is
-        # re-attempted on the probe cadence, paced by last_notify_attempt_at.
+        # re-attempted on the probe cadence (probe_due) once a first attempt has
+        # been made — last_notify_attempt_at records that first attempt.
         self.notified = False
         self.last_notify_attempt_at: float | None = None
 
@@ -663,11 +664,16 @@ async def notify_new_halts(
     The halt push therefore lags the trip by at most one poll interval. A push
     that does not land (``send`` returns False — ntfy unreachable, say, when a
     host reboot restarts both containers) is re-attempted on the probe cadence:
-    the first attempt is immediate, later ones ``probe_interval`` apart, until
-    one succeeds — so a dead ntfy costs one POST per probe interval, not one
-    per cycle, and a halt is still announced once ntfy is back. Wrapped so that
-    even a notifier bug cannot reach the loop (``HaltNotifier.send`` already
-    never raises).
+    the first attempt is immediate, later ones in the cycle the slot's re-probe
+    is due (``probe_due``) — this runs ahead of ``reprobe_halts`` — until one
+    succeeds. So a dead ntfy costs one POST per probe interval, not one per
+    cycle, and a halt is still announced once ntfy is back. Pacing the retry off
+    the probe schedule rather than off the last attempt matters when the halt
+    heals on its first probe: the attempt is one poll behind the trip, so a
+    retry paced off it would be skipped in the healing cycle and the halt push
+    with its diagnostic payload would never go out, only the resume push
+    (delta review of #81). Wrapped so that even a notifier bug cannot reach the
+    loop (``HaltNotifier.send`` already never raises).
     """
     if not notifier.enabled:
         return
@@ -675,9 +681,8 @@ async def notify_new_halts(
         for name, slot in halts.enabled_slots():
             if not slot.tripped or slot.notified:
                 continue
-            if (
-                slot.last_notify_attempt_at is not None
-                and now - slot.last_notify_attempt_at < probe_interval
+            if slot.last_notify_attempt_at is not None and not slot.probe_due(
+                now, probe_interval
             ):
                 continue
             slot.last_notify_attempt_at = now

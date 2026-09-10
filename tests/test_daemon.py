@@ -2539,6 +2539,20 @@ def _halt_email_with(client):
     return process
 
 
+def _strike_email_with(client):
+    """process_single_thread stand-in that records one cloud-tier 403 balance
+    fault per thread — three threads in one poll trip the shipped count."""
+
+    async def process(*args, **kwargs):
+        kwargs["halts"].email.record_balance_error(
+            LLMBalanceError("out of funds", tier="cloud", status_code=403),
+            probe_client=client,
+        )
+        return False
+
+    return process
+
+
 class TestHaltReprobeWiring:
     """run_daemon re-probes halted functions each cycle the interval allows
     (D22): a stood-down daemon polls again once the provider answers, an
@@ -2834,6 +2848,79 @@ class TestHaltNotificationWiring:
         # The loop lived through the raising notifier: cycle 1 polled, cycles
         # 2–3 stood down (the probe kept failing) — no exception escaped.
         assert proxy.list_messages.call_count == 1
+
+    async def test_failed_halt_push_is_retried_in_the_cycle_the_healing_probe_runs(
+        self, monkeypatch, tmp_path
+    ):
+        """Delta review of #81 (Opus, candidate 1): the retry used to pace off
+        last_notify_attempt_at — set one poll AFTER the trip — while the probe
+        paces off the trip itself, so the retry was always one poll behind the
+        probe and skipped in the very cycle the halt healed. The RESUME push
+        then arrived with no HALTED push before it, and the halt's diagnostic
+        payload (tier, model, status, signature) was lost. Three 403s trip the
+        slot; the first push fails; the probe interval elapses and the probe
+        answers: the retry must land in that cycle, ahead of the clear."""
+        fake = _fake_notifier(monkeypatch, send=AsyncMock(side_effect=[False, True, True]))
+        client = _probe_client(_OK)
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [
+                {"messages": [
+                    {"id": "m1", "threadId": "t1"},
+                    {"id": "m2", "threadId": "t2"},
+                    {"id": "m3", "threadId": "t3"},
+                ]},
+                {"messages": []},
+            ],
+            process_mock=_strike_email_with(client),
+            cycles=3,
+            # Trip at t=1020 (poll head 1010 + the trip's own monotonic() call);
+            # first push attempt at the next head (1030, fails); at 1040 the
+            # probe is due (20 s >= 15) and answers — the retry belongs there.
+            daemon_overrides={"halt_probe_interval_seconds": 15}, clock_step=10.0,
+        )
+        titles = [c.args[0] for c in fake.send.await_args_list]
+        assert titles == [
+            "email-labeler halted: email triage",
+            "email-labeler halted: email triage",
+            "email-labeler resumed: email triage",
+        ]
+
+    async def test_persisting_halt_retries_the_push_once_per_probe_ahead_of_it(
+        self, monkeypatch, tmp_path
+    ):
+        """A dead ntfy under a halt that does not heal still costs one POST per
+        probe interval (the first attempt immediate), and each retry runs in
+        the same cycle as its probe, before it — never a POST in a cycle
+        without a probe, never a second POST in one."""
+        events = []
+
+        async def send(*args, **kwargs):
+            events.append("send")
+            return False
+
+        async def probe(*args, **kwargs):
+            events.append("probe")
+            return _STILL_403
+
+        fake = _fake_notifier(monkeypatch, send=AsyncMock(side_effect=send))
+        client = MagicMock()
+        client.probe = AsyncMock(side_effect=probe)
+        await run_poll_cycles(
+            monkeypatch, tmp_path,
+            [{"messages": [
+                {"id": "m1", "threadId": "t1"},
+                {"id": "m2", "threadId": "t2"},
+                {"id": "m3", "threadId": "t3"},
+            ]}],
+            process_mock=_strike_email_with(client),
+            cycles=6,
+            daemon_overrides={"halt_probe_interval_seconds": 15}, clock_step=10.0,
+        )
+        # Heads at 1030 (first attempt), 1040 (probe due: retry, then probe),
+        # 1050 (nothing), 1060 (retry, then probe), 1070 (nothing).
+        assert events == ["send", "send", "probe", "send", "probe"]
+        assert fake.send.await_count == 3
 
     async def test_startup_builds_the_notifier_from_env(self, monkeypatch, tmp_path, caplog):
         """Unset vars → the one-time WARNING at startup, and otherwise the daemon
