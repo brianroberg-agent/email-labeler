@@ -42,6 +42,29 @@ write_parallel = 4
 # daemon starts shouting about it (that thread is retried forever, never
 # abandoned). Override: MAX_FAILURES.
 max_failures = 5
+# How many CONSECUTIVE out-of-funds responses (LLMBalanceError: HTTP 402, or a
+# 400/403 with a balance signature) a function absorbs before its halt trips
+# (decision D22, issue #73). One was too few: on 2026-08-25 the provider answered
+# a single false 403 while the account had funds, and the resulting halt cost
+# fourteen days. Three consecutive faults with no success in between is the
+# ruling — a provider that is genuinely out of funds fails every request, so it
+# reaches three within one poll cycle of a normal backlog, while an isolated
+# false 403 never does. Any completion one of the function's LLM clients returns
+# resets the count; whether the pipeline can parse it is not a condition. Must
+# be an integer >= 1 (the daemon refuses to start otherwise). Override:
+# BALANCE_HALT_STRIKES.
+balance_halt_strikes = 3
+# How often a HALTED function re-probes its LLM provider (one chat completion
+# with the client's own request shape and a fixed prompt, no email content) and
+# resumes on its own if the provider answers (decision D22, issue #73). A halt
+# trips after balance_halt_strikes consecutive out-of-funds responses (above);
+# on 2026-08-25 a single provider-side false 403 halted the daemon for fourteen
+# days because a restart was the only reset. Hourly is the balance: cheap enough
+# to run indefinitely against an account that really is empty (24 small requests
+# a day), and it bounds a false halt to an hour of downtime instead of "until
+# someone notices". Must be an integer >= 1 (the daemon refuses to start
+# otherwise). Override: HALT_PROBE_INTERVAL_SECONDS.
+halt_probe_interval_seconds = 3600
 healthcheck_file = "/tmp/healthcheck"
 
 [labels]
@@ -126,6 +149,8 @@ Classify the sender as one of:
 - PERSON: A real human being writing a personal or professional email (colleagues, friends, family, business contacts)
 - SERVICE: An automated email, newsletter, marketing, notification, receipt, shipping update, social media notification, or any email from a company/service
 
+Calendar invitations and other notifications that a service sends on a person's behalf (Google Calendar invitations, updates and cancellations, document-share and comment notifications) are SERVICE, even though the From line carries the person's name: the person chose to send it, but the service wrote the words.
+
 Respond with ONLY one word: PERSON or SERVICE
 
 Think about it carefully before answering. Use <think> tags to reason about the sender, then give your final answer."""
@@ -146,8 +171,8 @@ preamble = """You are an email classifier. Based on the full email content, clas
 Use this decision process:
 1. Is this a calendar invitation (event invite, RSVP, "you have been invited")? If yes → NEEDS_RESPONSE
 2. Does this email specifically require {env.USER_NAME} personally to respond, take action, or make a decision? (Group announcements that mention tasks or action items for a team don't count — only emails directed specifically at {env.USER_NAME}.) If yes → NEEDS_RESPONSE
-3. Is this email worth reading for awareness, even though no action is required? Payment receipts, transaction confirmations, and curated editorial newsletters (not automated product updates or account alerts) are worth reading. If yes → FYI
-4. Otherwise → LOW_PRIORITY
+3. If the sender is a real person, the email is at least FYI unless it is unsolicited sales, partnership, or cold outreach from someone with no existing relationship, which is LOW_PRIORITY. A person's mail is never LOW_PRIORITY for any other reason, even if it seems unimportant.
+4. If the sender is a service and no action is needed: is it worth reading for awareness? Payment receipts, transaction confirmations, and curated editorial newsletters (not automated product updates or account alerts) are worth reading. If yes → FYI. Otherwise → LOW_PRIORITY
 
 Important: Unsolicited outreach from unfamiliar senders — including sales pitches, partnership proposals, cold introductions, and requests to "hop on a call" from people {env.USER_NAME} does not know — is LOW_PRIORITY, even if it contains a question or call to action.
 

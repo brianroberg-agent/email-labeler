@@ -16,7 +16,7 @@ asymmetry is an accident of history, not a decision (registry D1).
 Neither function depends on the other, and design values are scoped
 per-function. The failure model (D5) scopes faults per-function as well: a
 provider-balance halt stops the affected function and leaves the other running
-(registry D5/D19).
+(registry D5/D19), and heals itself by re-probing the provider (registry D22).
 
 Non-goals: this is a single-owner deployment, not a generic multi-user
 product; org-specific content (the Ends Statement themes, the newsletter
@@ -29,6 +29,7 @@ recipient) is configuration, not something to abstract away.
 - `evals/README.md` — Human-oriented eval suite guide: pipeline stages, common workflows, key commands
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
 - `docs/decisions.md` — Decisions registry: adjudicated tradeoffs reviews must not re-litigate (see Review Charter)
+- `docs/labeling-rubric.md` — Labeling rubric: what each label means, golden-set labeling and exclusion procedure, decided vs proposed rules; the prompts in `config.toml` implement it (D21)
 - `docs/newsletter-rubric.md` — Newsletter grading rubric: purpose (coaching first, shortlisting a slice), what each dimension/theme grade means, golden-set labeling and exclusion procedure, decided vs proposed rules; the `[newsletter.prompts.*]` implement it (D23)
 - `docs/plans/` — Frozen history: every file carries a status header; superseded plans are records, not instructions
 - `docs/runbook-agent-attempted-recovery.md` — Owner-run manual sweep of threads dropped to `agent/attempted` by the issue-#64 bug; time-sensitive (cleanest while the daemon is stopped, before fresh give-ups mix into the label), and not to be executed by an agent with Gmail write access
@@ -76,7 +77,10 @@ or our own config/code): no strikes for anyone, get loud, keep the backlog.
 
 **Scope — functions fail independently.** A fault that disables one function
 (e.g. its LLM provider's balance) stops that function loudly; the other
-function continues.
+function continues. A halt is not permanent: the halted function re-probes
+its provider on a slow schedule and resumes when it answers, and the operator
+is notified at halt and at resume when `NTFY_URL`/`NTFY_TOKEN` are configured
+(registry D22); otherwise the halt is logged only.
 
 The registry entry D5 lists the corollaries — all implemented (Wave 2), each
 naming its commit. The code obeys this model; a deviation from it is a bug,
