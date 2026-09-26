@@ -126,6 +126,8 @@ Classify the sender as one of:
 - PERSON: A real human being writing a personal or professional email (colleagues, friends, family, business contacts)
 - SERVICE: An automated email, newsletter, marketing, notification, receipt, shipping update, social media notification, or any email from a company/service
 
+Calendar invitations and other notifications that a service sends on a person's behalf (Google Calendar invitations, updates and cancellations, document-share and comment notifications) are SERVICE, even though the From line carries the person's name: the person chose to send it, but the service wrote the words.
+
 Respond with ONLY one word: PERSON or SERVICE
 
 Think about it carefully before answering. Use <think> tags to reason about the sender, then give your final answer."""
