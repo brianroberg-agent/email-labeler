@@ -354,3 +354,19 @@ blames the newsletter, so one that keeps failing while its siblings grade ends
 findably under `agent/attempted`, while several failing the same way are held
 as shared cause. A successful zero-story extraction remains a valid
 `no-stories` outcome — the only one.
+
+## D21 — The labeling rubric is the spec; prompts implement it (2026-09-09)
+
+**Status:** docs implemented (`docs/labeling-rubric.md`); rule definitions P1/S1
+implementation pending merge of PRs #74 and #75.
+
+What each label means, how golden-set threads are labeled, and which rules are decided
+versus proposed live in **`docs/labeling-rubric.md`**, not in `config.toml`. The prompts
+are an implementation of that rubric for a given model; a disagreement between them is
+resolved by changing the prompt. Golden-set labels are assigned by the rubric before any
+model output is consulted; threads the rubric cannot decide are excluded rather than
+forced. Evaluation is scored by error class (person mail archived › needs_response read
+as FYI › FYI read as needs_response › cold pitch kept), never by a single accuracy figure.
+Forecloses: prompt edits that introduce a rule the rubric does not state; relabeling
+golden-set threads to match model output; ranking models or prompts on one overall
+accuracy number.
