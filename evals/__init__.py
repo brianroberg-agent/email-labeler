@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -23,6 +24,12 @@ def atomic_write_jsonl(records, path) -> None:
         with os.fdopen(fd, "w") as f:
             for record in records:
                 f.write(json.dumps(record.to_dict()) + "\n")
+        # mkstemp creates the temp file 0600. Carry the real file's mode bits
+        # across the rename (or, for a new file, what a plain open() would
+        # produce) so a save does not narrow them. Only the mode bits are
+        # carried over from the previous file: the temp file is a new inode,
+        # so its ownership is not inherited from the old one.
+        os.chmod(tmp_path, _target_mode(path))
         os.rename(tmp_path, path)
     except BaseException:
         try:
@@ -30,6 +37,25 @@ def atomic_write_jsonl(records, path) -> None:
         except OSError:
             pass
         raise
+
+
+def _target_mode(path: Path) -> int:
+    """Permission bits the atomically written file should end up with.
+
+    The existing file's mode if there is one; otherwise 0666 masked by the
+    process umask, i.e. what ``open(path, "w")`` would have created.
+
+    Any ``stat()`` failure takes the new-file branch, not just ENOENT: by the
+    time this runs the records are already in the temp file, and a symlink
+    loop or an unreadable link target (ELOOP, EACCES) should not throw that
+    write away. The rename still goes ahead -- it replaces the link itself --
+    so the content lands, with the same mode a fresh file would get."""
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        return 0o666 & ~current_umask
 
 
 def plural(n: int, singular: str, plural_form: str | None = None) -> str:
