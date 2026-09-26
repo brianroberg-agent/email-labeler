@@ -20,6 +20,11 @@ _DAEMON_SOURCES = [p for p in ROOT.glob("*.py") if p.name != "setup.py"]
 # Pattern: os.environ.get("VAR_NAME") or os.environ["VAR_NAME"]
 _ENVIRON_GET = re.compile(r'os\.environ\.get\(\s*["\'](\w+)["\']')
 _ENVIRON_BRACKET = re.compile(r'os\.environ\[\s*["\'](\w+)["\']')
+# Pattern: resolve_int_env("VAR_NAME", ...) — daemon.py's numeric overrides
+# (MAX_FAILURES, LOCAL_PARALLEL, WRITE_PARALLEL, MAX_EMAILS_PER_CYCLE,
+# HALT_PROBE_INTERVAL_SECONDS, BALANCE_HALT_STRIKES) read the environment
+# through that helper, not os.environ directly (review of #81, Opus F5).
+_RESOLVE_INT_ENV = re.compile(r'resolve_int_env\(\s*["\'](\w+)["\']')
 
 # Pattern: {env.VAR_NAME} in config.toml
 _CONFIG_ENV = re.compile(r'\{env\.(\w+)\}')
@@ -33,6 +38,7 @@ def _collect_env_vars() -> set[str]:
         text = source_file.read_text()
         env_vars.update(_ENVIRON_GET.findall(text))
         env_vars.update(_ENVIRON_BRACKET.findall(text))
+        env_vars.update(_RESOLVE_INT_ENV.findall(text))
 
     if CONFIG_PATH.exists():
         env_vars.update(_CONFIG_ENV.findall(CONFIG_PATH.read_text()))

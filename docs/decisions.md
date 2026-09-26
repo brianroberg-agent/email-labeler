@@ -66,7 +66,8 @@ Forecloses: presenting a public stand-in as a routine production configuration.
 
 ## D5 — Failure model: two rules and a scope (2026-07-30)
 
-**Status:** implemented (model Wave 0; corollaries Wave 2).
+**Status:** implemented (model Wave 0; corollaries Wave 2); restart-only-reset
+corollary reversed by D22 (2026-09-09).
 
 **Rule 1 — Outcomes only come from successes.** A committed outcome (label,
 archive, grade record, `agent/processed`) is only ever produced by a
@@ -144,6 +145,18 @@ did:
   direction accepts the fetch-and-skip churn: the query cannot express "not
   to:recipient"). A shared client ([newsletter.llm] absent) trips both slots
   within a cycle or two, which is correct: the fault disables both functions.
+  (Wording of the record; the pace is per-slot — each needs its own
+  `balance_halt_strikes` consecutive faults and accrues at most one per thread
+  per cycle, so a single pending newsletter thread trips the second slot on the
+  third cycle.)
+  **Reset superseded by D22 (2026-09-09):** "until restart" / "restart-only
+  reset" was this corollary's wording as implemented in Wave 2 and is kept
+  here as the record; the halt now trips on the `balance_halt_strikes`-th
+  consecutive balance fault (config.toml `[daemon]`), re-probes its provider
+  hourly, clears itself when the provider
+  answers (undoing the query narrowing with it), and pushes a notification at
+  halt and at resume. A restart still clears the in-memory state but is no
+  longer the only way out.
 - A keyword-free label reply raises instead of silently defaulting to
   LOW_PRIORITY→archive — implemented (Wave 2 T10, `ee3958d`).
   `parse_email_label` raises
@@ -339,7 +352,10 @@ the thread unprocessed rather than labeled-but-lost. Dedup on read: newest
 Rate-limit phrasing is indistinguishable from quota exhaustion; a wrong
 restart-only halt is worse than retry. Balance-signature 402/400/403 halts the
 function whose provider reported it — per-function under D5, implemented in
-Wave 2 T9 (was daemon-wide).
+Wave 2 T9 (was daemon-wide). The halt was restart-only when this was decided;
+since D22 it self-heals, which bounds the cost of a wrong halt to about an
+hour plus a push — still worse than retrying a rate limit, so the 429
+exclusion stands.
 
 ## D20 — Content-less grading is a failure, not an outcome (issue #30, 2026-07-08)
 
@@ -370,3 +386,72 @@ as FYI › FYI read as needs_response › cold pitch kept), never by a single ac
 Forecloses: prompt edits that introduce a rule the rubric does not state; relabeling
 golden-set threads to match model output; ranking models or prompts on one overall
 accuracy number.
+
+## D22 — Halts self-heal by re-probe; notification on halt and resume (issue #73, 2026-09-09)
+
+**Status:** implemented (PR for issue #73).
+
+Supersedes the "restart is the only reset" corollary of D5 (its text is kept
+there as the record). Background: on 2026-08-25 the cloud provider answered a
+single 403 with a balance signature while the account had funds; the daemon
+halted on that one response and, with a restart as the only reset and nothing
+reporting the halt, stayed halted for fourteen days. Four decisions, taken
+together:
+
+1. **Re-probe while halted.** A halted function sends one chat completion with
+   its own request shape (the client's real `max_tokens`, `temperature`,
+   `extra_body` and, for GLM, the thinking field — so a rejection that depends
+   on the request fails the probe too) and a fixed innocuous prompt (no email
+   content) through *its own* `LLMClient` — the client that raised, so email
+   and newsletter probe their own providers — once per
+   `halt_probe_interval_seconds` (config.toml `[daemon]`, authoritative; env
+   override `HALT_PROBE_INTERVAL_SECONDS`; validated at startup). Due probes
+   run concurrently with a short timeout (`HALT_REPROBE_TIMEOUT`), so the loop
+   head stalls for at most one probe and the heartbeat stays fresh. A 200
+   clears the halt, undoes any halt-time state (the email-only query
+   narrowing) and resumes normal processing in the same cycle (the re-probe
+   runs at the loop head, ahead of the poll), at INFO; anything else stays
+   halted and logs below ERROR. The email function re-probes a cloud-tier
+   client if any fault in the streak came from the cloud tier; the local tier
+   is a paid provider only under D4's eval-only stand-in, and there the count
+   is per function rather than per client — a cloud answer at Stage 1 resets
+   a streak of local-tier faults. Accepted as a D4-only limitation.
+2. **Consecutive balance faults trip the halt, not one.** The count is
+   `balance_halt_strikes` in config.toml `[daemon]` (authoritative, with its
+   rationale — D7's one-home rule; env override `BALANCE_HALT_STRIKES`;
+   validated at startup). Any completion one of the function's LLM clients
+   returns resets the count — whether the pipeline can parse it is not a
+   condition: Stage 1 of the email pipeline included (an unparseable reply
+   defaults to SERVICE and still resets), and each LLM call of a newsletter
+   grading. Where a parse failure raises instead (Stage 2's
+   `parse_email_label`, extraction's `parse_stories`, the client's own
+   content guard) the reset is simply not reached. Per function. Two
+   consequences,
+   accepted: the count is per observed outcome, not per time, so faults
+   arriving back-to-back within a single poll cycle (a few-second provider
+   blip under `cloud_parallel` concurrency) can reach it and trip — the cost
+   is bounded to one probe interval, after which the re-probe resumes the
+   function; and a balance-shaped 400/403 specific to one thread is counted
+   like any other, so while sibling threads answer it defers each cycle at
+   one ERROR line without halting or striking, and alone in its cycles it
+   reaches the count as a real outage would.
+3. **Notification is opt-in by two env vars**, `NTFY_URL` (full topic URL)
+   and `NTFY_TOKEN` (a bearer token minted for the labeler, not shared with
+   another service). Either unset: one WARNING at startup, then the daemon
+   behaves as before. A notification failure is logged and swallowed
+   (test-guarded), so the poll loop continues.
+4. **Push on halt and on resume.** Once per halt — not repeated hourly once it
+   has landed; a push that fails to send is re-attempted on the probe cadence
+   until one does — with provider tier, model, HTTP status, the matched
+   balance signature (the short recognised phrase, e.g. `NOT_ENOUGH_BALANCE`)
+   and the time; once per resume, with the downtime. The daemon adds no email
+   content and no credentials; the provider's response body is not forwarded
+   (a 400 can echo the rejected request) — the HTTP status and the matched
+   phrase are.
+
+Forecloses: reinstating restart-only halts; halting on a single balance
+response; retrying the halted function's backlog on the poll cadence; an hourly ERROR or an
+hourly push for an unchanged halt; forwarding the provider's response body in
+a push; a balance-*endpoint* check replacing the completion probe (a separate issue records it as a possible complement — the
+2026-08-25 fault was a completion 403 with funds present, which a balance
+check would have called fine).

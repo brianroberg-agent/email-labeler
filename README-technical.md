@@ -11,6 +11,7 @@ email-labeler/
 ├── labeler.py          Gmail label verification and application
 ├── newsletter.py       Newsletter story extraction, quality scoring, and theme classification
 ├── llm_client.py       LLM abstraction for cloud and local endpoints
+├── notify.py           ntfy push on daemon halt/resume (decision D22)
 ├── proxy_client.py     Gmail API proxy client (forked from email-agent, Feb 2026;
 │                       independently maintained here — no sync obligation, decision D9)
 ├── gmail_utils.py      Email header and body parsing (forked from email-agent, Feb 2026;
@@ -50,6 +51,7 @@ email-labeler/
     ├── test_classifier.py   Classifier tests
     ├── test_labeler.py      Label manager tests
     ├── test_daemon.py       Daemon orchestration tests
+    ├── test_notify.py       Halt/resume notifier tests
     ├── test_config_utils.py Config loading tests
     ├── test_newsletter.py   Newsletter pipeline tests
     ├── test_eval_schemas.py Golden set and result serialization tests
@@ -79,6 +81,10 @@ email-labeler/
 | `WRITE_PARALLEL` | No | `4` (from `config.toml`) | Max concurrent label-application writes (`modify_message`), overriding `write_parallel` in `config.toml`. Bounds the proxy-write burst when `max_emails_per_cycle` is large. Sized separately from reads because writes may block on human approval (`WRITE_TIMEOUT`, 300s). |
 | `GIT_SHA` | No | `unknown` | Git commit SHA of the running build, logged once at daemon startup (decision D11). Stamped by the image build (Dockerfile `ARG`/`ENV`); not an operator knob. |
 | `MAX_FAILURES` | No | `5` (from `config.toml`) | Strikes a thread takes before it is set aside under `agent/attempted`, overriding `max_failures` in `config.toml`. Only failures the cycle-level attribution blames on the thread count (decision D5 Rule 2). Also sets the masquerade escalation threshold. |
+| `BALANCE_HALT_STRIKES` | No | `3` (from `config.toml`) | Consecutive out-of-funds responses a function absorbs before its halt trips, overriding `balance_halt_strikes` in `config.toml` (decision D22). |
+| `HALT_PROBE_INTERVAL_SECONDS` | No | `3600` (from `config.toml`) | How often a halted function re-probes its LLM provider and resumes if it answers, overriding `halt_probe_interval_seconds` in `config.toml` (decision D22). |
+| `NTFY_URL` | No | — | Full ntfy topic URL for halt/resume push notifications (decision D22). Unset (or `NTFY_TOKEN` unset): notifications are disabled, one WARNING at startup, otherwise no change in behaviour. |
+| `NTFY_TOKEN` | No | — | Bearer token for `NTFY_URL`. Mint one for the labeler alone — do not reuse another service's. Secret — kept out of log lines. |
 
 Note: The cloud LLM **model name** is configured in `config.toml` under `[llm.cloud]`, not in `.env`. The local LLM **model name** is set via the `MLX_MODEL` environment variable (shared with email-agent) and referenced in `config.toml` as `{env.MLX_MODEL}`. This keeps secrets (keys, URLs) in `.env` while operational parameters (temperature, prompts) stay in version-controlled `config.toml`.
 
@@ -97,8 +103,14 @@ search; excludes the `agent/processed` and `agent/attempted` markers) ·
 `local_parallel` / `fetch_parallel` / `write_parallel` (concurrency
 semaphores; env overrides `LOCAL_PARALLEL` / `WRITE_PARALLEL`) ·
 `max_failures` (strikes before `agent/attempted`, and the masquerade
-escalation threshold; env override `MAX_FAILURES`) · `healthcheck_file`
-(heartbeat path).
+escalation threshold; env override `MAX_FAILURES`) ·
+`balance_halt_strikes` (consecutive out-of-funds responses before a
+function's halt trips, decision D22; env override `BALANCE_HALT_STRIKES`) ·
+`halt_probe_interval_seconds` (how often a halted function re-probes its
+provider and resumes if it answers, decision D22; env override
+`HALT_PROBE_INTERVAL_SECONDS`) · `healthcheck_file` (heartbeat path). The
+two halt settings must be integers >= 1; the daemon refuses to start
+otherwise.
 
 Threads found in a poll cycle are processed concurrently, bounded by the
 `cloud_parallel` and `local_parallel` semaphores. **`local_parallel` defaults to 1**:
@@ -413,47 +425,80 @@ docker inspect --format='{{.State.Health.Status}}' agent-stack-email-labeler-1
 When an LLM provider reports the account is out of funds (HTTP 402, or a
 400/403 whose body carries a balance signature such as Novita's
 `NOT_ENOUGH_BALANCE` or Anthropic's "credit balance is too low" — raised as
-`LLMBalanceError`), the **function whose provider it is** stops: the fault is
-account-wide, so per-thread retries would only re-fail that function's whole
-backlog every cycle against a provider that cannot answer any of it. The halt
-is per-function (decisions D5, D19): a newsletter-tier balance fault halts
-newsletter grading while email triage keeps
-classifying, and vice versa; when the two share one client (`[newsletter.llm]`
-absent) a shared-provider fault halts both within a cycle or two. HTTP 429 never
-halts, even with quota phrasing — a
-per-minute rate limit is worded identically to hard quota exhaustion, and a
-wrong restart-only halt is worse than treating a rare 429-signaled
-out-of-funds as provider unavailability: deferred and retried each cycle,
-never a strike (decision D5). Note what that costs in visibility. Neither
-loud-failure ERROR covers it: the shared-cause line is emitted only over
-*candidate* (thread-attributable) failures, and the masquerade escalation
-requires exactly one affected thread while siblings succeed. An account-wide
-429 fails every thread, so a sustained one is visible as the per-thread
-`LLM unavailable processing thread …` WARNING each cycle and a flat
-`Processed 0/N threads` summary — no ERROR. The triggering thread is left
-unprocessed. The halt is in-memory only; **restarting the daemon is the only
-reset**.
+`LLMBalanceError`) on **consecutive requests** from one function — `balance_halt_strikes`
+of them (config.toml `[daemon]`, which holds the count and its rationale; env
+override `BALANCE_HALT_STRIKES`) with no answered request in between — the
+**function whose provider it is** stops: the fault is account-wide, so
+per-thread retries would only re-fail that function's whole backlog every
+cycle against a provider that cannot answer any of it. With the shipped count
+a single such response does not halt — on 2026-08-25 a single provider-side
+false 403 did, and cost fourteen days (issue #73, decision D22). The count is
+per function and per observed outcome, not per time: faults arriving
+back-to-back within one poll cycle can reach it, and an answered request from
+either of the function's LLM clients (Stage 1 of the email pipeline included;
+each call of a newsletter grading) resets it. The halt is
+per-function (decisions D5, D19): a newsletter-tier balance fault halts
+newsletter grading while email triage keeps classifying, and vice versa; when
+the two share one client (`[newsletter.llm]` absent) a shared-provider fault
+halts both, but not at the same moment: each function's slot needs its own
+`balance_halt_strikes` consecutive faults, and a function accrues at most one
+fault per thread per cycle — with a single pending newsletter thread the
+newsletter slot trips on the third cycle. HTTP 429 never halts, even with quota
+phrasing — a per-minute rate limit is worded identically to hard quota
+exhaustion, and a wrong halt (an hour's outage and a push, since D22) is worse
+than treating a rare 429-signaled out-of-funds as provider unavailability:
+deferred and retried each cycle, never a strike (decision D5). Note what that
+costs in visibility. Neither loud-failure ERROR covers it: the shared-cause
+line is emitted only over *candidate* (thread-attributable) failures, and the
+masquerade escalation requires exactly one affected thread while siblings
+succeed. An account-wide 429 fails every thread, so a sustained one is visible
+as the per-thread `LLM unavailable processing thread …` WARNING each cycle and
+a flat `Processed 0/N threads` summary — no ERROR. The triggering threads are
+left unprocessed.
+
+**The halt heals itself (decision D22).** While a function is halted the
+daemon sends one probe — a chat completion with the client's own request
+shape (its real `max_tokens`, `temperature`, `extra_body` and, for GLM, the
+thinking field) and a fixed one-word prompt carrying no email content —
+through that function's own LLM client, once per
+`halt_probe_interval_seconds` (config.toml `[daemon]`; override
+`HALT_PROBE_INTERVAL_SECONDS`). Probes for several halted functions run
+concurrently with a short timeout (`HALT_REPROBE_TIMEOUT` in `llm_client.py`), so the loop
+head stalls for at most one probe. A 200 clears the halt: the function
+resumes in the same cycle (the re-probe runs at the loop head, before the
+poll), an INFO line reports how long it was down, and any halt-time query
+narrowing (below) is undone. A failed probe leaves the halt in place and logs
+below ERROR. A restart also clears the in-memory halt state,
+but is no longer required. While halted, the function's backlog is not
+retried on the poll cadence; the probe is what it sends.
+
+**Notification.** With `NTFY_URL` and `NTFY_TOKEN` both set (env table), the
+daemon pushes once when a function halts — naming the function, the provider
+tier and model, the HTTP status, the matched balance signature (the short
+phrase such as `NOT_ENOUGH_BALANCE`) and the time — and once when it resumes,
+with the downtime. A halt push that fails to send is re-attempted on the probe
+cadence until one lands; once it has, it is not repeated. With either variable
+unset the daemon logs one WARNING at startup and sends nothing. A failed push
+is logged and the cycle continues. The daemon adds no email content and no
+credentials to a push; what it forwards from the provider is the HTTP status
+and the matched signature phrase, not the response body (which stays in the
+daemon log).
 
 While **one** function is halted the loop keeps polling for the other, and logs
-this line at ERROR once per poll interval. If email triage is the halted one and
-newsletter grading is enabled, the Gmail query also gains a `to:<recipient>`
-clause for the rest of the session, so the halted function's backlog neither
-costs a thread fetch per cycle nor crowds newsletter threads out of the
-`max_emails_per_cycle` page:
-
-```
-Function halted — email triage: <reason>. Add funds to the provider account, then restart the daemon to resume it; the other function keeps running.
-```
+a line at ERROR once per poll interval naming the halted function and its
+reason, saying that the daemon re-probes and resumes on its own, and that the
+other function keeps running. If email triage is the halted one and newsletter
+grading is enabled, the Gmail query also gains a `to:<recipient>` clause until
+email triage resumes, so the halted function's backlog neither costs a thread
+fetch per cycle nor crowds newsletter threads out of the
+`max_emails_per_cycle` page.
 
 Once **every enabled** function is halted (newsletter grading counts as enabled
 iff `[newsletter]` is configured, email triage iff `NEWSLETTER_ONLY` is unset)
-the daemon stops polling altogether, logging this line at ERROR once per poll
-interval and keeping the healthcheck timestamp fresh (deliberately halted, not
-hung — the container stays healthy):
-
-```
-Daemon halted — every enabled function stopped (<function: reason>; …). Add funds to the provider account, then restart the daemon to resume processing.
-```
+the daemon stops polling altogether — probes excepted — logging the
+every-function-stopped line at ERROR once per poll interval and keeping the
+healthcheck timestamp fresh (deliberately halted, not hung — the container
+stays healthy).
 
 ## Release Identity
 
@@ -501,7 +546,8 @@ Conventions shared by every TUI:
 | `test_llm_client.py` | `llm_client.py` | Request format, auth headers, `<think>` tag stripping, separate reasoning-field capture (`reasoning`/`reasoning_content`), `finish_reason: length` handling, error handling, out-of-funds (`LLMBalanceError`) detection including the 429 exclusion asserted against balance-signature bodies (decision D19), availability checks |
 | `test_classifier.py` | `classifier.py` | `parse_sender` formats, `parse_sender_type` edge cases and its SERVICE default, `parse_email_label` edge cases and its keyword-free raise, cloud/local routing, full pipeline |
 | `test_labeler.py` | `labeler.py` | Label verification (all present, partial, none), label ID mapping, inbox/archive actions, single API call per email, per-write semaphore bound on every write path (LabelManager-owned `write_sem`, slot released between messages — classification, markers, and newsletter writes; issue #33) |
-| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`: enabled-slot arithmetic, the `NEWSLETTER_ONLY` stand-down), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29 — reuse, fingerprint invalidation, clear/prune, and the poll-loop session wiring), cycle-level failure attribution (correlation strikes, timeout candidates, marking from this cycle's strikes only, count cleared beside a landed marker, adjudicated singleton/zero-success edges, deferral-only threads excluded from the correlation denominator — decision D5 Rule 2), masquerade bookkeeping and escalation (`MasqueradeTracker`: success-clear, prune, single-suspect + success increment condition, throttle reset), halt deferrals that record no failure and commit nothing, the `MAX_FAILURES` knob |
+| `test_daemon.py` | `daemon.py` | Service email path, person email path, MLX-unavailable skip, error isolation, per-function out-of-funds halt (`FunctionHalts`: enabled-slot arithmetic, the `NEWSLETTER_ONLY` stand-down), config loading, assessment-sink preflight + write-before-label durability, classification result reuse across write-retry cycles (`ResultCache`, issue #29 — reuse, fingerprint invalidation, clear/prune, and the poll-loop session wiring), cycle-level failure attribution (correlation strikes, timeout candidates, marking from this cycle's strikes only, count cleared beside a landed marker, adjudicated singleton/zero-success edges, deferral-only threads excluded from the correlation denominator — decision D5 Rule 2), masquerade bookkeeping and escalation (`MasqueradeTracker`: success-clear, prune, single-suspect + success increment condition, throttle reset), halt deferrals that record no failure and commit nothing, the `MAX_FAILURES` knob, the consecutive-fault halt (`balance_halt_strikes`) with success reset at every answered call, startup validation of the halt settings, the concurrent short-timeout re-probe and self-resume incl. query un-narrowing (`reprobe_halts`, `HALT_PROBE_INTERVAL_SECONDS`), halt/resume push wiring incl. re-attempt on the probe cadence — decision D22 |
+| `test_notify.py` | `notify.py` | `HaltNotifier` env parsing (both vars required, one WARNING when disabled, no values echoed), send swallows and logs failures (transport error, non-2xx, unexpected exception), disabled no-op, halt/resume message content (matched signature, not the provider body) |
 | `test_privacy.py` | `classifier.py`, `daemon.py` | Negative-form privacy tests (registry D2/D3): person-classified bodies reach only the local tier (classifier and daemon level), Stage 1 whole-call payload discipline, unparseable-Stage-1 SERVICE-default pin, VIP short-circuit, newsletter ownership bypass, no cloud fallback on local failure, metadata-shape allowlist |
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |

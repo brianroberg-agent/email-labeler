@@ -479,6 +479,33 @@ class TestClassifyNewsletter:
         assert results[0].themes == {"christlikeness": "present", "disciple_making": "emphasized"}
         assert results[0].quality_cot == "quality cot"
         assert results[0].theme_cot == "theme cot"
+
+    async def test_on_answer_fires_per_answered_call_even_when_a_later_call_fails(
+        self, nl_classifier, mock_cloud_llm
+    ):
+        """Review of #81 (Fable 2 / Opus F1): the daemon's halt slot needs to know
+        the provider ANSWERED, per call — extraction answering and quality then
+        dropping the connection is one answer, recorded before the raise."""
+        answers = []
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: A student named Jake...", ""),
+            LLMUnavailableError("connection dropped"),
+        ]
+        with pytest.raises(LLMUnavailableError):
+            await nl_classifier.classify_newsletter("body", on_answer=lambda: answers.append(1))
+        assert answers == [1]
+
+    async def test_on_answer_fires_for_every_call_of_a_full_grading(
+        self, nl_classifier, mock_cloud_llm
+    ):
+        answers = []
+        mock_cloud_llm.complete.side_effect = [
+            ("STORY: A student named Jake...", ""),
+            ("SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: GOOD\nDYNAMIC: OK", "quality cot"),
+            ("CHRISTLIKENESS: PRESENT\nDISCIPLE_MAKING: EMPHASIZED", "theme cot"),
+        ]
+        await nl_classifier.classify_newsletter("body", on_answer=lambda: answers.append(1))
+        assert answers == [1, 1, 1]
         assert mock_cloud_llm.complete.call_count == 3
 
     async def test_no_stories_returns_empty(self, nl_classifier, mock_cloud_llm):

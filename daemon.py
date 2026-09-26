@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 import tomllib
 from collections import Counter
 from contextlib import nullcontext
@@ -23,7 +24,7 @@ from classifier import EmailClassifier, EmailLabel, SenderType, ThreadMetadata
 from config_utils import substitute_env_vars
 from gmail_utils import decode_body, get_header
 from labeler import LabelManager, _get_priority
-from llm_client import LLMBalanceError, LLMClient, LLMUnavailableError
+from llm_client import HALT_REPROBE_TIMEOUT, LLMBalanceError, LLMClient, LLMUnavailableError
 from newsletter import (
     AssessmentSinkError,
     NewsletterClassifier,
@@ -39,6 +40,7 @@ from newsletter import (
     sink_writability_warning,
     write_assessment,
 )
+from notify import HaltNotifier, format_downtime, halt_message, resume_message
 from proxy_client import (
     TRANSIENT_TRANSPORT_ERRORS,
     GmailProxyClient,
@@ -122,6 +124,26 @@ def resolve_int_env(env_var: str, default: int, minimum: int = 1) -> int:
             "%s=%d is below the minimum of %d; using %d", env_var, value, minimum, default
         )
         return default
+    return value
+
+
+def positive_int_setting(daemon_config: dict, key: str, default: int) -> int:
+    """Return config.toml ``[daemon] key`` as an int >= 1, or *default* if absent.
+
+    Raises ValueError with an operator-readable message for anything else — a
+    quoted number, 0, a negative, a float, a bool. The halt machinery's
+    settings are validated here at startup rather than where they are first
+    used: ``halt_probe_interval_seconds`` feeds ``DaemonHalt.probe_due`` at the
+    loop head, outside the cycle's try/except, and only once a halt has
+    tripped — so a quoted value used to pass startup and kill the daemon at
+    the first poll after a halt, exactly when self-heal was meant to take over
+    (review of PR #81). Callers exit(1) on the error, like a missing label.
+    """
+    value = daemon_config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"config.toml [daemon] {key} must be an integer >= 1, got {value!r}"
+        )
     return value
 
 
@@ -373,30 +395,133 @@ class ResultCache:
         self._entries = {tid: e for tid, e in self._entries.items() if tid in active}
 
 
+# Fallback for config.toml [daemon] balance_halt_strikes when the key is absent.
+# The value and its rationale are homed there (decision D7's one-home rule; D22,
+# issue #73) — do not restate them here.
+DEFAULT_BALANCE_HALT_STRIKES = 3
+
+
 class DaemonHalt:
     """Halt state for ONE function's account-level faults (provider out of funds).
 
     Unlike a poison thread (FailureTracker's territory), an out-of-funds provider
     fails EVERY request it serves: retrying per-thread just re-fails that
     function's whole backlog every cycle, against a provider that cannot answer
-    any of it. Tripping this stops the function until the admin adds funds and
-    restarts. In-memory and session-scoped by design — a restart is the only way
-    to clear it. First tripper wins: threads in one asyncio.gather cycle may
-    race to trip, and the reason must stay stable.
+    any of it. Tripping this stops the function. The slot self-heals (decision
+    D22): the poll loop re-probes ``probe_client`` on a slow schedule while
+    tripped and calls ``clear()`` when the provider answers again — a restart
+    clears it too, since the state is in-memory. First tripper wins: threads in
+    one asyncio.gather cycle may race to trip, and the reason must stay stable.
+
+    Tripping takes ``strikes_to_trip`` consecutive balance faults (config.toml
+    ``[daemon] balance_halt_strikes``), counted by ``record_balance_error``;
+    ``record_success`` resets the count (D22) but does not clear a tripped
+    slot — only the probe does that.
 
     One slot per function, held together by FunctionHalts.
     """
 
-    def __init__(self):
+    def __init__(self, strikes_to_trip: int = DEFAULT_BALANCE_HALT_STRIKES):
         self.reason: str | None = None
+        self.strikes_to_trip = strikes_to_trip
+        self.consecutive_faults = 0
+        # The exception that tripped the slot — provenance for the notification.
+        self.fault: LLMBalanceError | None = None
+        # The LLMClient whose provider reported the fault; re-probed while tripped.
+        self.probe_client: LLMClient | None = None
+        # The cloud-tier client seen in the CURRENT streak, if any: preferred over
+        # the third fault's client at trip, since the local tier is a paid
+        # provider only under D4's eval-only stand-in (review of PR #81).
+        self._streak_cloud_client: LLMClient | None = None
+        # time.monotonic() at trip and at the last probe (scheduling), and
+        # time.time() at trip (the notification's wall-clock "since").
+        self.tripped_at: float | None = None
+        self.tripped_wall: float | None = None
+        self.last_probe_at: float | None = None
+        # True once a halt push has LANDED (send returned True); a failed push is
+        # re-attempted on the probe cadence (probe_due) once a first attempt has
+        # been made — last_notify_attempt_at records that first attempt.
+        self.notified = False
+        self.last_notify_attempt_at: float | None = None
 
-    def trip(self, reason: str) -> None:
+    def trip(
+        self,
+        reason: str,
+        *,
+        fault: LLMBalanceError | None = None,
+        probe_client: LLMClient | None = None,
+        now: float | None = None,
+    ) -> None:
         if self.reason is None:
             self.reason = reason
+            if fault is not None:
+                # Kept for the notification's four scalar fields, not for its
+                # frames: a live traceback would pin the thread JSON, transcript,
+                # request body and response below the raise for the whole halt
+                # (hours to days). Same object, so `halt.fault is exc` still holds.
+                fault.__traceback__ = None
+            self.fault = fault
+            self.probe_client = probe_client
+            self.tripped_at = time.monotonic() if now is None else now
+            self.tripped_wall = time.time()
+            self.last_probe_at = self.tripped_at
+
+    def record_balance_error(
+        self,
+        exc: LLMBalanceError,
+        *,
+        probe_client: LLMClient | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Count one balance fault; trip at ``strikes_to_trip`` consecutive.
+
+        Returns True only on the call that trips the slot. A fault on an
+        already-tripped slot changes nothing (first tripper wins). The client
+        recorded for the re-probe is a cloud-tier one if any fault in the
+        streak came from the cloud tier, otherwise the tripping fault's.
+        """
+        if self.tripped:
+            return False
+        self.consecutive_faults += 1
+        if probe_client is not None and exc.tier != "local" and self._streak_cloud_client is None:
+            self._streak_cloud_client = probe_client
+        if self.consecutive_faults < self.strikes_to_trip:
+            return False
+        self.trip(
+            str(exc), fault=exc, probe_client=self._streak_cloud_client or probe_client, now=now
+        )
+        return True
+
+    def record_success(self) -> None:
+        """A request this function's provider answered: the faults were not
+        consecutive after all. Does not clear a tripped slot (D22: only the
+        probe resumes a halted function)."""
+        self.consecutive_faults = 0
+        self._streak_cloud_client = None
+
+    def clear(self) -> None:
+        """Resume: the probe got an answer. Back to the untripped initial state."""
+        self.reason = None
+        self.consecutive_faults = 0
+        self.fault = None
+        self.probe_client = None
+        self._streak_cloud_client = None
+        self.tripped_at = None
+        self.tripped_wall = None
+        self.last_probe_at = None
+        self.notified = False
+        self.last_notify_attempt_at = None
 
     @property
     def tripped(self) -> bool:
         return self.reason is not None
+
+    def probe_due(self, now: float, interval: float) -> bool:
+        """True when this tripped slot's next re-probe is due: ``interval``
+        seconds since the trip, then since the last probe (D22)."""
+        if not self.tripped or self.last_probe_at is None:
+            return False
+        return now - self.last_probe_at >= interval
 
 
 class FunctionHalts:
@@ -405,9 +530,9 @@ class FunctionHalts:
     The two functions fail independently, so an out-of-funds provider stops only
     the function whose requests it was serving: a newsletter-tier balance fault
     halts newsletter grading while email triage keeps classifying, and vice
-    versa. Each function owns a DaemonHalt slot (first-tripper-wins,
-    restart-only reset); the poll loop stands down entirely only when EVERY
-    enabled function is halted.
+    versa. Each function owns a DaemonHalt slot (first-tripper-wins, cleared by
+    a successful re-probe of its own provider — D22); the poll loop stands down
+    entirely only when EVERY enabled function is halted.
 
     "Enabled" is a deployment fact, not a runtime one: newsletter grading iff
     [newsletter] is configured, email triage iff NEWSLETTER_ONLY is unset. A
@@ -415,17 +540,27 @@ class FunctionHalts:
     halted when deciding whether anything is left to do.
 
     When the two functions share one LLM client ([newsletter.llm] absent), a
-    shared-provider fault trips both slots within a cycle or two as each
-    function hits its own request — correct, since the fault does disable both.
+    shared-provider fault eventually trips both slots as each function hits its
+    own request — correct, since the fault does disable both. Not at the same
+    moment, though: each slot needs its own ``strikes_to_trip`` consecutive
+    faults, and a function accrues at most one fault per thread per cycle, so
+    with a single pending newsletter thread the newsletter slot trips on the
+    third cycle (shipped count: config.toml [daemon] balance_halt_strikes).
     """
 
-    def __init__(self, email_enabled: bool = True, newsletter_enabled: bool = False):
-        self.email = DaemonHalt()
-        self.newsletter = DaemonHalt()
+    def __init__(
+        self,
+        email_enabled: bool = True,
+        newsletter_enabled: bool = False,
+        strikes_to_trip: int = DEFAULT_BALANCE_HALT_STRIKES,
+    ):
+        self.email = DaemonHalt(strikes_to_trip)
+        self.newsletter = DaemonHalt(strikes_to_trip)
         self.email_enabled = email_enabled
         self.newsletter_enabled = newsletter_enabled
 
-    def _enabled_slots(self) -> list[tuple[str, DaemonHalt]]:
+    def enabled_slots(self) -> list[tuple[str, DaemonHalt]]:
+        """(function name, slot) for each ENABLED function, in a fixed order."""
         slots = []
         if self.email_enabled:
             slots.append(("email triage", self.email))
@@ -436,12 +571,12 @@ class FunctionHalts:
     @property
     def all_halted(self) -> bool:
         """True when every enabled function is halted — nothing is left to poll for."""
-        slots = self._enabled_slots()
+        slots = self.enabled_slots()
         return bool(slots) and all(h.tripped for _name, h in slots)
 
     @property
     def any_halted(self) -> bool:
-        return any(h.tripped for _name, h in self._enabled_slots())
+        return any(h.tripped for _name, h in self.enabled_slots())
 
     @property
     def email_only_halted(self) -> bool:
@@ -459,8 +594,117 @@ class FunctionHalts:
     def halted_summary(self) -> str:
         """`function: reason` for each halted enabled function — the operator line."""
         return "; ".join(
-            f"{name}: {h.reason}" for name, h in self._enabled_slots() if h.tripped
+            f"{name}: {h.reason}" for name, h in self.enabled_slots() if h.tripped
         )
+
+
+async def reprobe_halts(
+    halts: FunctionHalts, now: float, interval: float
+) -> list[tuple[str, float]]:
+    """Re-probe each halted enabled function whose probe is due; clear the ones
+    whose provider answers (decision D22, issue #73).
+
+    One request (``LLMClient.probe``: the client's own request shape and a
+    fixed innocuous prompt, no email content) per ``interval`` seconds per
+    halted function, through THAT function's own client — email and newsletter
+    may sit on different providers. Every due slot is probed at once
+    (``asyncio.gather``) with ``HALT_REPROBE_TIMEOUT``, so the loop head stalls
+    for at most one short timeout however many slots hang, keeping the
+    heartbeat well inside the healthcheck threshold. A probe that answers 200
+    clears the slot and the function resumes in this very cycle (the loop
+    re-probes at its head, before the poll); a probe that
+    does not leaves the slot tripped and logs below ERROR (the per-cycle halt
+    line is already the loudness — an hourly ERROR would only repeat it).
+    Nothing raised by a probe escapes: this runs outside the poll loop's
+    try/except.
+
+    Returns ``(function name, seconds halted)`` for each function that resumed,
+    in enabled-slot order, so the caller can notify and undo any halt-time
+    state of its own.
+    """
+    due = [(name, slot) for name, slot in halts.enabled_slots() if slot.probe_due(now, interval)]
+    for _name, slot in due:
+        slot.last_probe_at = now
+
+    async def probe_one(name: str, slot: DaemonHalt) -> tuple[str, float] | None:
+        if slot.probe_client is None:
+            log.info("%s still halted — no provider client recorded to re-probe", name)
+            return None
+        try:
+            result = await slot.probe_client.probe(timeout=HALT_REPROBE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — a probe fault must never kill the loop
+            log.warning("%s still halted — re-probe raised %s: %s", name, type(exc).__name__, exc)
+            return None
+        if result.ok:
+            downtime = now - (slot.tripped_at if slot.tripped_at is not None else now)
+            log.info(
+                "%s resumed — provider answered the re-probe after %s halted; "
+                "normal processing resumes in this cycle",
+                name, format_downtime(downtime),
+            )
+            slot.clear()
+            return (name, downtime)
+        log.info(
+            "%s still halted — re-probe failed (%s); next probe in %ds",
+            name, result.detail() or "no response detail", interval,
+        )
+        return None
+
+    outcomes = await asyncio.gather(*(probe_one(name, slot) for name, slot in due))
+    return [outcome for outcome in outcomes if outcome is not None]
+
+
+async def notify_new_halts(
+    halts: FunctionHalts, notifier: HaltNotifier, probe_interval: int, now: float
+) -> None:
+    """Push once per halt (D22): each tripped slot whose push has not yet landed.
+
+    Called at the top of each poll cycle, BEFORE the re-probe, so a halt that
+    trips and resumes between two cycles still reports both events in order.
+    The halt push therefore lags the trip by at most one poll interval. A push
+    that does not land (``send`` returns False — ntfy unreachable, say, when a
+    host reboot restarts both containers) is re-attempted on the probe cadence:
+    the first attempt is immediate, later ones in the cycle the slot's re-probe
+    is due (``probe_due``) — this runs ahead of ``reprobe_halts`` — until one
+    succeeds. So a dead ntfy costs one POST per probe interval, not one per
+    cycle, and a halt is still announced once ntfy is back. Pacing the retry off
+    the probe schedule rather than off the last attempt matters when the halt
+    heals on its first probe: the attempt is one poll behind the trip, so a
+    retry paced off it would be skipped in the healing cycle and the halt push
+    with its diagnostic payload would never go out, only the resume push
+    (delta review of #81). Wrapped so that even a notifier bug cannot reach the
+    loop (``HaltNotifier.send`` already never raises).
+    """
+    if not notifier.enabled:
+        return
+    try:
+        for name, slot in halts.enabled_slots():
+            if not slot.tripped or slot.notified:
+                continue
+            if slot.last_notify_attempt_at is not None and not slot.probe_due(
+                now, probe_interval
+            ):
+                continue
+            slot.last_notify_attempt_at = now
+            landed = await notifier.send(
+                *halt_message(
+                    name, slot.fault, tripped_wall=slot.tripped_wall,
+                    probe_interval=probe_interval,
+                )
+            )
+            if landed:
+                slot.notified = True
+    except Exception as exc:  # noqa: BLE001 — a notification must never fail the daemon
+        log.warning("Halt notification failed (%s: %s)", type(exc).__name__, exc)
+
+
+async def notify_resumes(notifier: HaltNotifier, resumed: list[tuple[str, float]]) -> None:
+    """Push once per resume (D22), in the cycle the probe answered."""
+    try:
+        for name, downtime in resumed:
+            await notifier.send(*resume_message(name, downtime))
+    except Exception as exc:  # noqa: BLE001 — a notification must never fail the daemon
+        log.warning("Resume notification failed (%s: %s)", type(exc).__name__, exc)
 
 
 def attribute_cycle_failures(
@@ -510,7 +754,7 @@ def attribute_cycle_failures(
     # zero-success forever, so the poisoned thread never struck and never
     # converged to a findable agent/attempted — silently voiding D5 Rule 1's
     # set-aside guarantee (a halted function re-fetches and re-defers its
-    # threads every cycle, so the shielding persists until restart).
+    # threads every cycle, so the shielding persists until it resumes).
     failed_threads = {f.thread_id for f in failures}
     attempted = {
         tid
@@ -814,8 +1058,15 @@ async def process_single_thread(
 
                     try:
                         async with cloud_sem:
+                            # Grading is several LLM calls; each one the provider
+                            # answers resets the newsletter slot's consecutive-fault
+                            # count as it lands (D22 item 2), so an answer followed
+                            # by a dropped connection still counts as an answer.
                             story_results = await newsletter_classifier.classify_newsletter(
-                                transcript
+                                transcript,
+                                on_answer=(
+                                    halts.newsletter.record_success if halts is not None else None
+                                ),
                             )
                     except LLMBalanceError as exc:
                         # The NEWSLETTER function's provider is out of funds. Its
@@ -825,11 +1076,20 @@ async def process_single_thread(
                         # functions apart: halt newsletter grading only — email
                         # triage keeps running (decision D5's scope rule, D19).
                         # The thread is left unprocessed, no strike, and is
-                        # re-graded after the admin adds funds and restarts.
+                        # re-graded once the function resumes (D22: the third
+                        # consecutive fault trips the slot; the poll loop's
+                        # re-probe of the newsletter client clears it).
                         log.error("Newsletter thread %s deferred — %s", thread_id, exc)
                         if halts is not None:
-                            halts.newsletter.trip(str(exc))
+                            halts.newsletter.record_balance_error(
+                                exc, probe_client=newsletter_classifier.cloud_llm
+                            )
                         return False
+                    if halts is not None:
+                        # The whole grading landed (every call answered — on_answer
+                        # above already recorded each; this keeps the reset explicit
+                        # at the call site).
+                        halts.newsletter.record_success()
 
                     # Determine overall tier (best story's tier)
                     best_tier = None
@@ -999,6 +1259,13 @@ async def process_single_thread(
             # Stage 1: classify sender (always cloud LLM)
             async with cloud_sem:
                 sender_type, sender_raw, sender_cot = await classifier.classify_sender(metadata)
+            if halts is not None and sender_raw != "VIP":
+                # The cloud provider answered Stage 1: whatever Stage 2 does (the
+                # local tier may be offline), the email function's provider is not
+                # out of funds, so its consecutive-fault count restarts here (D22
+                # item 2). The VIP short-circuit makes no LLM call and so says
+                # nothing about the provider.
+                halts.email.record_success()
 
             # Stage 2: classify email (routed by sender type)
             if sender_type == SenderType.PERSON:
@@ -1007,6 +1274,11 @@ async def process_single_thread(
             else:
                 async with cloud_sem:
                     result = await classifier.classify(metadata, transcript, sender_type, sender_raw)
+
+            if halts is not None:
+                # Stage 2 answered too. Stage 1 already recorded its answer above;
+                # this covers the VIP path, whose only LLM call is Stage 2 (D22).
+                halts.email.record_success()
 
             label = result.label
             applied_sender_type = result.sender_type
@@ -1144,14 +1416,21 @@ async def process_single_thread(
     except LLMBalanceError as exc:
         # Account-wide, not a thread fault (and must precede the RuntimeError arm,
         # which it subclasses): don't count toward give-up, don't mark anything —
-        # the thread is re-processed after the admin adds funds and restarts.
-        # Reaching this arm means the fault came from the EMAIL pipeline's tiers
-        # (the newsletter branch traps its own balance faults at the call site),
-        # so it halts email triage only — newsletter grading keeps running
-        # (decision D5's scope rule, D19).
+        # the thread is re-processed once the function resumes. Reaching this
+        # arm means the fault came from the EMAIL pipeline's tiers (the
+        # newsletter branch traps its own balance faults at the call site), so
+        # it halts email triage only — newsletter grading keeps running
+        # (decision D5's scope rule, D19). The balance_halt_strikes-th
+        # consecutive fault trips the slot (D22); the client to re-probe is the
+        # tier that raised — normally cloud; local only with a public stand-in
+        # on that slot (D4), and even then a cloud client seen earlier in the
+        # streak is preferred (DaemonHalt.record_balance_error).
         log.error("Thread %s deferred — %s", thread_id, exc)
         if halts is not None:
-            halts.email.trip(str(exc))
+            probe_client = (
+                classifier.local_llm if exc.tier == "local" else classifier.cloud_llm
+            )
+            halts.email.record_balance_error(exc, probe_client=probe_client)
         return False
     except RuntimeError as exc:
         # Request-specific LLM failure — a non-balance 4xx-shaped response, or an
@@ -1470,12 +1749,33 @@ async def run_daemon() -> None:
 
     # Account-level fault switches (provider out of funds), one per function
     # (decision D5's scope rule, D19): a tripped slot stops that function until
-    # the admin adds funds and restarts; the poll loop stands down only once
-    # every enabled function is halted. Session-scoped.
+    # its re-probe gets an answer (D22); the poll loop stands down only once
+    # every enabled function is halted. Session-scoped. Both knobs are homed in
+    # config.toml [daemon] (authoritative, with rationale): balance_halt_strikes
+    # (override BALANCE_HALT_STRIKES) and halt_probe_interval_seconds (override
+    # HALT_PROBE_INTERVAL_SECONDS). They are validated HERE, at startup: a bad
+    # value must not wait for the first halt to surface (review of PR #81).
+    try:
+        balance_halt_strikes = positive_int_setting(
+            daemon_config, "balance_halt_strikes", DEFAULT_BALANCE_HALT_STRIKES
+        )
+        halt_probe_interval_default = positive_int_setting(
+            daemon_config, "halt_probe_interval_seconds", 3600
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
     halts = FunctionHalts(
         email_enabled=not newsletter_only,
         newsletter_enabled=bool(newsletter_classifier and newsletter_recipient),
+        strikes_to_trip=resolve_int_env("BALANCE_HALT_STRIKES", balance_halt_strikes),
     )
+    halt_probe_interval = resolve_int_env(
+        "HALT_PROBE_INTERVAL_SECONDS", halt_probe_interval_default
+    )
+    # Push on halt and on resume (D22). Disabled — one WARNING here, then
+    # no-ops — unless NTFY_URL and NTFY_TOKEN are both set.
+    notifier = HaltNotifier.from_env()
 
     # Wait for a transiently-unreachable api-proxy to come up, then verify labels.
     missing = await verify_labels_with_retry(label_manager)
@@ -1489,11 +1789,13 @@ async def run_daemon() -> None:
     poll_interval = daemon_config["poll_interval_seconds"]
     max_emails = resolve_int_env("MAX_EMAILS_PER_CYCLE", daemon_config["max_emails_per_cycle"])
     gmail_query = daemon_config["gmail_query"]
-    query_narrowed = False  # set once an email-only halt narrows the query below
     if newsletter_only and newsletter_recipient:
         gmail_query += f" to:{newsletter_recipient}"
-        query_narrowed = True
         log.info("Gmail query narrowed to: %s", gmail_query)
+    # The query as configured (plus any NEWSLETTER_ONLY clause), restored when
+    # an email-only halt that narrowed it resumes (D22).
+    base_query = gmail_query
+    narrowed_by_halt = False
     healthcheck_file = Path(daemon_config["healthcheck_file"])
     backoff = poll_interval
     status_interval = daemon_config.get("status_interval_seconds", 900)
@@ -1501,17 +1803,31 @@ async def run_daemon() -> None:
     proxy_lost = False  # set by the lost-connection arm, cleared on the next good poll
 
     while True:
+        # Halted functions re-probe their provider on the slow schedule and
+        # clear themselves when it answers (D22). Runs before the stand-down
+        # check so a resumed function polls in this very cycle.
+        now = time.monotonic()
+        await notify_new_halts(halts, notifier, halt_probe_interval, now)
+        resumed = await reprobe_halts(halts, now, halt_probe_interval)
+        await notify_resumes(notifier, resumed)
+        if narrowed_by_halt and not halts.email.tripped:
+            # Email triage resumed: its backlog must be fetched again.
+            gmail_query = base_query
+            narrowed_by_halt = False
+            log.info("Email triage resumed — Gmail query restored: %s", gmail_query)
         if halts.all_halted:
             # Every enabled function's provider is out of funds, and such a fault
             # fails EVERY request — polling on would only burn the backlog into
             # agent/attempted. Stand down but stay alive: the heartbeat stays
             # fresh (deliberately halted, not hung), and the instruction repeats
-            # at ERROR every cycle so it can't scroll out of the logs.
-            # Restarting the daemon is the only reset.
+            # at ERROR every cycle so it can't scroll out of the logs. The
+            # re-probe above is the reset (a restart also clears the in-memory
+            # state, but is no longer required — D22).
             log.error(
-                "Daemon halted — every enabled function stopped (%s). Add funds to "
-                "the provider account, then restart the daemon to resume processing.",
-                halts.halted_summary(),
+                "Daemon halted — every enabled function stopped (%s). Add funds if "
+                "the provider account is out of them; the daemon re-probes the "
+                "provider every %ds and resumes on its own once it answers.",
+                halts.halted_summary(), halt_probe_interval,
             )
             try:
                 healthcheck_file.write_text(str(asyncio.get_event_loop().time()))
@@ -1528,19 +1844,20 @@ async def run_daemon() -> None:
             # quiet about it — same repeated-ERROR discipline as the full
             # stand-down, naming which function needs the funds.
             log.error(
-                "Function halted — %s. Add funds to the provider account, then "
-                "restart the daemon to resume it; the other function keeps running.",
-                halts.halted_summary(),
+                "Function halted — %s. Add funds if the provider account is out of "
+                "them; the daemon re-probes the provider every %ds and resumes on its "
+                "own once it answers; the other function keeps running.",
+                halts.halted_summary(), halt_probe_interval,
             )
-            if halts.email_only_halted and not query_narrowed:
+            if halts.email_only_halted and not narrowed_by_halt:
                 # Email triage is stopped but newsletter grading is not: narrow
                 # the query the way NEWSLETTER_ONLY does, so the halted
                 # function's backlog stops costing a get_thread per thread per
                 # cycle and can't crowd newsletter threads out of the
-                # max_results page. Halts are restart-reset, so this holds for
-                # the rest of the session.
-                gmail_query += f" to:{newsletter_recipient}"
-                query_narrowed = True
+                # max_results page. Holds until the email function resumes,
+                # when the block at the top of the loop restores base_query.
+                gmail_query = f"{base_query} to:{newsletter_recipient}"
+                narrowed_by_halt = True
                 log.info(
                     "Email triage halted — Gmail query narrowed to the newsletter "
                     "function: %s",
