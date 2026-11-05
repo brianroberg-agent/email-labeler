@@ -258,6 +258,61 @@ TUI details:
 > extraction/quality/theme `prompt_hash`, so runs recorded before the change are
 > no longer prompt-comparable.
 
+### newsletter_grade
+
+| Flag | Description |
+|---|---|
+| `--assessments` | Production assessments JSONL to draw stories from (default: `[newsletter] output_file` in the config, relative to the CWD) |
+| `--labels` | Story-label log to append to (default: `evals/newsletter_story_labels.jsonl`) |
+| `--golden-set` | Hand-curated golden set whose newsletters are left out of the queue (default: `evals/newsletter_golden_set.jsonl`; a missing file means none) |
+| `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD); read for `[newsletter] output_file` and `[newsletter.rubric]` |
+| `--miscut` | List the stories set aside as miscut (by thread, with reason, opening words and note), then exit |
+
+Grades ready-made stories, one at a time, into an append-only label log. Needs
+no LLM endpoint and no proxy.
+
+**Queue.** Built in memory at launch from the assessments file (read with the
+review TUI's `load_assessments`, so the newest record per thread is used and
+pre-#53 records must be migrated first). Only each story's text, its thread id
+and the record's timestamp are read; grades, tiers, reasoning, model, sender and
+subject are not carried into the queue or onto the screen. Left out: threads in
+the curated golden set, stories already labeled, blank texts, and a text already
+queued. Order is by story key (a hash of the text), so it is the same on every
+launch and does not group a newsletter's stories together.
+
+**Screen.** The story (scrollable with the arrow keys, PgUp/PgDn, Home/End at
+any time, including while a note is typed), the question being asked with the
+wording from `[newsletter.rubric]`, the answers so far, and the keys:
+
+| Key | Action |
+|---|---|
+| `1` `2` `3` | Answer the current question: low / middle / high |
+| `0` | Answer Absent for the remaining themes (ignored while a dimension is asked) |
+| `t` | Flag the current question as torn; a card with a torn flag asks why before it is saved |
+| `n` | Add or edit the story's note |
+| `backspace` | Take back the last answer; at a story's first question, reopen the story labeled just before |
+| `x` | Mark the story miscut, then `1`-`4` for the reason and an optional note |
+| `s` | Move the story to the end of the queue (answers given so far are dropped) |
+| `Esc` | Cancel the note or the miscut menu |
+| `q` | Quit (a half-answered story is not saved) |
+
+**Label log.** One JSON line per finished story (`StoryLabel` in
+`evals/newsletter_schemas.py`): `story_key`, `thread_id`, `text`, `status`
+(`graded` or `miscut`), `scores`, `themes`, `torn`, `note`, `miscut_reason`,
+`recut_of`, `labeled_at`, `seconds`, `source_timestamp`. Lines are appended and
+synced; earlier lines are not rewritten. The newest line per `story_key` is the
+one in force, by `labeled_at` (file order breaks ties), so re-grading a story
+appends a line and two machines' logs are combined by concatenating them. A
+label that cannot be written leaves the story on screen. The file holds story
+text and is gitignored.
+
+**Miscut stories** stay in the log with their text, reason and note, and are left
+out of the queue under that key. When a later assessment of the same thread
+contains a story that shares most of its words with a miscut one, that story is
+queued as its recut (`recut_of`); one that shares most of its words with an
+already graded story of the thread is not queued again. A miscut story leaves
+the `--miscut` list when its recut has been graded or it is graded itself.
+
 ### newsletter_run
 
 | Flag | Description |

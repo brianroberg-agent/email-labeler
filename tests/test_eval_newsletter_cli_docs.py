@@ -18,6 +18,7 @@ README_PATH = Path(__file__).parent.parent / "evals" / "README-technical.md"
 _CLI_MODULES = {
     "evals.newsletter_harvest": "### newsletter_harvest",
     "evals.newsletter_label": "### newsletter_label",
+    "evals.newsletter_grade": "### newsletter_grade",
     "evals.newsletter_run": "### newsletter_run",
     "evals.newsletter_report": "### newsletter_report",
 }
