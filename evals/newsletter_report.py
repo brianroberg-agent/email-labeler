@@ -688,27 +688,40 @@ def _text_excerpt(text: str) -> str:
     return collapsed[:57] + "..." if len(collapsed) > 60 else collapsed
 
 
-def load_story_excerpts(golden_set_path: str) -> dict[str, str]:
-    """Best-effort story_id -> text-excerpt map from the run's golden set file.
-
-    Results rows carry only story_ids; the story text lives in the golden set,
-    so verbose output labels a story by the first words of its text. Any failure
-    (moved/deleted file, malformed line) degrades to {} so verbose output falls
-    back to bare story_ids.
-    """
+def _excerpts_from(path: str, records) -> dict[str, str]:
+    """story id -> excerpt from one JSONL file; {} if it cannot be read."""
     excerpts: dict[str, str] = {}
     try:
-        with open(golden_set_path) as f:
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                d = json.loads(line)
-                for s in d.get("stories", []):
-                    if s.get("story_id") and s.get("text"):
-                        excerpts[s["story_id"]] = _text_excerpt(s["text"])
-    except (OSError, json.JSONDecodeError):
+                for story_id, text in records(json.loads(line)):
+                    if story_id and text:
+                        excerpts[story_id] = _text_excerpt(text)
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
         return {}
+    return excerpts
+
+
+def load_story_excerpts(golden_set_path: str, story_labels_path: str = "") -> dict[str, str]:
+    """Best-effort story_id -> text-excerpt map for a run's stories.
+
+    Results rows carry only story_ids; the story text lives in the curated
+    golden set and, for stories graded in newsletter_grade, in the story-label
+    log (keyed by ``story_key``). Verbose output labels a story by the first
+    words of its text. A file that is missing or malformed contributes nothing,
+    so verbose output falls back to bare story_ids for its stories.
+    """
+    excerpts = _excerpts_from(
+        golden_set_path,
+        lambda d: [(s.get("story_id"), s.get("text")) for s in d.get("stories", [])],
+    )
+    if story_labels_path:
+        excerpts.update(_excerpts_from(
+            story_labels_path, lambda d: [(d.get("story_key"), d.get("text"))],
+        ))
     return excerpts
 
 
@@ -891,7 +904,7 @@ def print_report(
             story_results or [],
             extraction_results or [],
             match_threshold=match_threshold,
-            excerpts=load_story_excerpts(meta.golden_set_path),
+            excerpts=load_story_excerpts(meta.golden_set_path, meta.story_labels_path),
             anomalies=metrics.get("theme_anomalies", []),
         )
 

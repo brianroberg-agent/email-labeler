@@ -1485,3 +1485,39 @@ class TestFormatRateDelta:
     def test_no_change_and_missing_values(self):
         assert format_rate_delta(0.25, 0.25) == "+0.0%"
         assert format_rate_delta(None, 0.25) == "N/A"
+
+
+class TestExcerptsForLabelLogStories:
+    def _label_line(self, key, text):
+        return json.dumps({
+            "type": "story_label", "story_key": key, "thread_id": "t_900020", "text": text,
+            "status": "graded",
+            "scores": {"simple": 3, "concrete": 3, "personal": 3, "dynamic": 3},
+        }) + "\n"
+
+    def test_label_log_stories_are_excerpted_by_their_key(self, tmp_path):
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(self._label_line("0123456789abcdef", "Priya led the Tuesday study."))
+        excerpts = load_story_excerpts("/nope/absent.jsonl", str(labels))
+        assert excerpts == {"0123456789abcdef": "Priya led the Tuesday study."}
+
+    def test_verbose_report_names_a_label_log_story_by_its_text(self, tmp_path, capsys):
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(self._label_line("0123456789abcdef", "Priya led the Tuesday study."))
+        row = _pred(story_id="0123456789abcdef", predicted_scores={"simple": 3},
+                    expected_tier="good", predicted_tier="fair")
+        print_report(_meta(golden_set_path="/nope/absent.jsonl", story_labels_path=str(labels),
+                           story_label_count=1),
+                     compute_all_metrics([row]), verbose=True, story_results=[row])
+        assert "Priya led the Tuesday study" in capsys.readouterr().out
+
+    def test_an_unreadable_label_log_degrades_to_curated_excerpts_only(self, tmp_path):
+        golden = tmp_path / "golden.jsonl"
+        golden.write_text(json.dumps({
+            "type": "golden_newsletter", "thread_id": "t", "message_id": "m",
+            "sender": "s", "subject": "subj", "body": "b",
+            "stories": [{"story_id": "t:0", "text": "Marcus came to dinner"}],
+        }) + "\n")
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text("{not json}\n")
+        assert load_story_excerpts(str(golden), str(labels)) == {"t:0": "Marcus came to dinner"}
