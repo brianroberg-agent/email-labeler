@@ -31,6 +31,7 @@ email-labeler/
 │   ├── newsletter_schemas.py  Newsletter golden-set and result dataclasses
 │   ├── newsletter_harvest.py  Pull candidate newsletters → golden set (unlabeled)
 │   ├── newsletter_label.py    Hand-label story quality scores and themes
+│   ├── newsletter_grade.py    Grade ready-made stories into the append-only story-label log
 │   ├── newsletter_run.py      Replay golden stories through the newsletter classifier
 │   ├── newsletter_report.py   Newsletter tier/dimension/theme/extraction metrics
 │   └── results/        Timestamped result files from evaluation runs
@@ -191,6 +192,12 @@ to the newsletter function) and `output_file` (the assessment JSONL sink);
 `temperature` / `timeout` — values and sizing rationale in config.toml
 (authoritative; the budget/timeout comments there are deliberate issue-#64
 calibration).
+
+`[newsletter.rubric]` holds the rubric wording the grading labeler
+(`evals.newsletter_grade`) shows beside a story: `grades`, `dimensions`,
+`theme_grades` and `themes`. The daemon does not read it. Each string is the
+same text the matching `[newsletter.prompts.*]` system prompt gives the model,
+and a test fails when the two differ, so a rubric edit is made in both places.
 
 **`output_file` is relative to the process working directory** and the daemon
 `mkdir`s it silently if missing. In Docker (`WORKDIR /app`) that means
@@ -556,8 +563,9 @@ Conventions shared by every TUI:
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication and pre-fetch skip of known threads, Gmail query building (`--label`/`--gmail-label` resolution, quoting, ordering, validation), append-only writes, `main()` wiring |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
-| `test_eval_newsletter_schemas.py` | `evals/newsletter_schemas.py` | Golden-set/result dataclass round-trips, missing-key tolerance |
+| `test_eval_newsletter_schemas.py` | `evals/newsletter_schemas.py` | Golden-set/result dataclass round-trips, missing-key tolerance; `StoryLabel` validation (status, all four dimensions when graded, known theme names, miscut reason, no grades on a miscut story) and its conversion to a golden story |
 | `test_eval_newsletter_harvest.py` | `evals/newsletter_harvest.py` | Newsletter filtering, body build, dedup, no ground-truth inference |
+| `test_eval_newsletter_grade.py` | `evals/newsletter_grade.py` | Story key (whitespace-insensitive), label log (append without rewriting, trailing-newline repair, located errors), newest-label-wins across merged logs, queue building (curated threads and labeled stories left out, nothing the model said carried along, stable order, recuts linked to the miscut story they replace), miscut bucket, `[newsletter.rubric]` loading, and the shipped rubric strings appearing verbatim in the grading prompts |
 | `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo + Pilot UI tests (seed guard, undo stack, delete/label flows, selection, skip-through, autosave) |
 | `test_eval_newsletter_run.py` | `evals/newsletter_run.py` | `prompt_hash`, cache reuse, extraction vs quality/theme modes |
 | `test_eval_newsletter_report.py` | `evals/newsletter_report.py` | `match_stories`, tier/dimension/theme metrics, comparison deltas |

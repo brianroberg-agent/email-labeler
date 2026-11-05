@@ -7,6 +7,8 @@ older golden sets and result files keep loading as the schema grows.
 
 from dataclasses import dataclass, field
 
+from newsletter import _DIMENSIONS, _VALID_THEMES, compute_tier
+
 # Grades that ever appear in a stored theme dict. Kept in lockstep with
 # newsletter.parse_themes (which only stores present/emphasized; absent is
 # omitted) and evals.newsletter_label._THEME_CYCLE / _GRADE_ABBR (which only
@@ -121,6 +123,137 @@ class GoldenStory:
             reviewed=d.get("reviewed", False),
             notes=d.get("notes", ""),
             excluded=d.get("excluded", False),
+        )
+
+
+# A story-label line's status. "graded" carries ground truth; "miscut" sets the
+# story aside for recutting and carries none.
+STORY_LABEL_STATUSES = ("graded", "miscut")
+
+# What the operator said is wrong with a miscut story. "not_a_story" is the one
+# reason no recut can fix; the others describe a boundary to redraw.
+MISCUT_REASONS = ("cut_short", "runs_long", "several_stories", "not_a_story")
+
+_THEME_NAMES = frozenset(name.lower() for name in _VALID_THEMES)
+
+
+@dataclass
+class StoryLabel:
+    """One line of the append-only story-label log written by
+    ``evals.newsletter_grade``: the operator's judgment of one ready-made story.
+
+    Self-contained on purpose (it carries the story text), so the log is a
+    grading golden set by itself and two machines' logs merge by concatenation.
+    A later line for the same ``story_key`` supersedes an earlier one.
+    Validated on load, theme names included, because the file is written by a
+    tool and merged by hand.
+    """
+
+    story_key: str  # hash of the normalized story text
+    thread_id: str
+    text: str
+    status: str  # one of STORY_LABEL_STATUSES
+    scores: dict[str, int] | None = None  # all four dimensions, 1-3, when graded
+    themes: dict[str, str] = field(default_factory=dict)  # theme -> "present"/"emphasized"
+    torn: list[str] = field(default_factory=list)  # dimensions/themes the operator was torn on
+    note: str = ""
+    miscut_reason: str = ""  # one of MISCUT_REASONS when status == "miscut"
+    recut_of: str = ""  # story_key of the miscut story this one replaces
+    labeled_at: str = ""  # ISO-8601 UTC
+    seconds: float | None = None  # time the card was open
+    source_timestamp: str = ""  # the assessment record the text came from
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "story_label",
+            "story_key": self.story_key,
+            "thread_id": self.thread_id,
+            "text": self.text,
+            "status": self.status,
+            "scores": self.scores,
+            "themes": self.themes,
+            "torn": self.torn,
+            "note": self.note,
+            "miscut_reason": self.miscut_reason,
+            "recut_of": self.recut_of,
+            "labeled_at": self.labeled_at,
+            "seconds": self.seconds,
+            "source_timestamp": self.source_timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StoryLabel":
+        key = d["story_key"]
+        status = d["status"]
+        if status not in STORY_LABEL_STATUSES:
+            raise ValueError(
+                f"story label {key!r}: status {status!r} is not one of "
+                f"{', '.join(STORY_LABEL_STATUSES)}"
+            )
+        scores = _coerce_scores(d.get("scores"), story_id=key, field_name="scores")
+        themes = _coerce_themes(d.get("themes"), story_id=key, field_name="themes")
+        unknown = sorted(set(themes) - _THEME_NAMES)
+        if unknown:
+            raise ValueError(
+                f"themes for story {key!r}: unknown theme name(s) {', '.join(unknown)}; "
+                f"expected only {', '.join(sorted(_THEME_NAMES))}"
+            )
+        torn = list(d.get("torn") or [])
+        stray = sorted(set(torn) - _THEME_NAMES - set(_DIMENSIONS))
+        if stray:
+            raise ValueError(
+                f"torn for story {key!r}: {', '.join(stray)} is not a dimension or a theme"
+            )
+        reason = d.get("miscut_reason", "")
+        if status == "graded":
+            if scores is None:
+                raise ValueError(f"story label {key!r}: a graded label needs scores")
+            missing = [dim for dim in _DIMENSIONS if dim not in scores]
+            if missing:
+                raise ValueError(
+                    f"scores for story {key!r}: missing dimension(s) {', '.join(missing)}"
+                )
+        else:
+            if reason not in MISCUT_REASONS:
+                raise ValueError(
+                    f"story label {key!r}: miscut_reason {reason!r} is not one of "
+                    f"{', '.join(MISCUT_REASONS)}"
+                )
+            if scores is not None or themes:
+                raise ValueError(
+                    f"story label {key!r}: a miscut story carries no scores or themes"
+                )
+        return cls(
+            story_key=key,
+            thread_id=d["thread_id"],
+            text=d["text"],
+            status=status,
+            scores=scores,
+            themes=themes,
+            torn=torn,
+            note=d.get("note", ""),
+            miscut_reason=reason,
+            recut_of=d.get("recut_of", ""),
+            labeled_at=d.get("labeled_at", ""),
+            seconds=d.get("seconds"),
+            source_timestamp=d.get("source_timestamp", ""),
+        )
+
+    def to_golden_story(self) -> "GoldenStory":
+        """This label as grading ground truth, in the shape the eval runs on."""
+        if self.status != "graded":
+            raise ValueError(
+                f"story label {self.story_key!r} is {self.status}, not graded: "
+                "a miscut story has no ground truth"
+            )
+        return GoldenStory(
+            story_id=self.story_key,
+            text=self.text,
+            expected_scores=dict(self.scores),
+            expected_tier=compute_tier(self.scores).value,
+            expected_themes=dict(self.themes),
+            reviewed=True,
+            notes=self.note,
         )
 
 

@@ -242,6 +242,34 @@ church = "agent/newsletter/theme/church"
 vocation_family = "agent/newsletter/theme/vocation-family"
 disciple_making = "agent/newsletter/theme/disciple-making"
 
+# The rubric wording the grading labeler (evals.newsletter_grade) shows beside a
+# story: the same words the grading prompts below give the model. Each string
+# must appear verbatim in its prompt (tests/test_eval_newsletter_grade.py,
+# TestShippedRubricMatchesThePrompts), so editing a prompt's rubric text means
+# editing it here too. docs/newsletter-rubric.md is the spec for both (D23).
+[newsletter.rubric.grades]
+poor = "The story does not display this dimension of storytelling in any meaningful way."
+ok = "The story displays this dimension, but only partially or inconsistently. There is significant room for improvement."
+good = "The story consistently displays this dimension. While not necessarily perfect, it could serve as an example of what this dimension means."
+
+[newsletter.rubric.dimensions]
+simple = "Does the story focus on one key idea or progression, with no tangents or extraneous details?"
+concrete = "Does the story narrate particular events involving particular people at particular times and places, with vivid specifics rather than abstractions?"
+personal = "Does the story center on one person or a few people, such that what matters to them is what matters to the story — rather than events, numbers, or ideas disconnected from people?"
+dynamic = "Does the story describe how a person changes over time — a clear arc of transformation rather than a static account with no before-and-after?"
+
+[newsletter.rubric.theme_grades]
+absent = "The theme is not present in the story at all."
+present = "The theme is present, but underdeveloped."
+emphasized = "The theme is well-developed and highlighted in the story."
+
+[newsletter.rubric.themes]
+scripture = "Study the Scriptures correctly, apply them to all of life, and teach them to others"
+christlikeness = "Exhibit increasing Christlikeness in response to the Gospel. Look for a specific person growing in character, attitude, or behavior in a way that reflects Christ — not merely faith or spiritual activity mentioned in passing."
+church = "A college student actively participates in or serves at a local church (not just a campus fellowship). Look for substantial involvement in a local church community during college; a passing mention of attending church or a church name does not qualify."
+vocation_family = "Honor God in their vocation and family relationships"
+disciple_making = "Continue to make disciples wherever God takes them"
+
 [newsletter.prompts.story_extraction]
 system = """You are a newsletter analyst. Given a ministry newsletter email, extract each distinct story from the content.
 
