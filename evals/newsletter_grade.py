@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -258,3 +258,185 @@ def miscut_bucket(labels: dict[str, StoryLabel]) -> list[StoryLabel]:
         if label.status == "miscut" and label.story_key not in redressed
     ]
     return sorted(waiting, key=lambda label: (label.thread_id, label.labeled_at, label.story_key))
+
+
+# The nine judgments asked about a story, in order: the four dimensions, then
+# the five themes in the order the theme prompt lists them.
+THEMES = ("scripture", "christlikeness", "church", "vocation_family", "disciple_making")
+QUESTIONS = tuple(_DIMENSIONS) + THEMES
+
+
+@dataclass(frozen=True)
+class Card:
+    """One story being graded: the answers so far, oldest first."""
+
+    candidate: Candidate
+    answers: tuple[int, ...] = ()  # 1/2/3 per answered question, in QUESTIONS order
+    torn: frozenset[str] = frozenset()  # questions the operator was torn on
+    note: str = ""
+
+
+def current_question(card: Card) -> str | None:
+    """The question the next answer goes to, or None once all nine are answered."""
+    if len(card.answers) >= len(QUESTIONS):
+        return None
+    return QUESTIONS[len(card.answers)]
+
+
+def answer(card: Card, value: int) -> Card:
+    """Record 1/2/3 (low/middle/high) for the current question.
+
+    Anything else, or an answer to a finished card, leaves the card unchanged.
+    """
+    if value not in (1, 2, 3) or current_question(card) is None:
+        return card
+    return replace(card, answers=card.answers + (value,))
+
+
+def answer_rest_absent(card: Card) -> Card:
+    """Answer Absent for every theme not yet answered.
+
+    Only while a theme is being asked: a dimension has no "none" answer.
+    """
+    if current_question(card) not in THEMES:
+        return card
+    remaining = len(QUESTIONS) - len(card.answers)
+    return replace(card, answers=card.answers + (1,) * remaining)
+
+
+def back(card: Card) -> Card:
+    """Take back the last answer. Torn flags stay with their question."""
+    if not card.answers:
+        return card
+    return replace(card, answers=card.answers[:-1])
+
+
+def toggle_torn(card: Card) -> Card:
+    """Flag (or unflag) the current question as one the operator is torn on."""
+    question = current_question(card)
+    if question is None:
+        return card
+    return replace(card, torn=card.torn ^ {question})
+
+
+_THEME_GRADE_BY_ANSWER = {2: "present", 3: "emphasized"}  # 1 = absent, stored by omission
+
+
+def graded_label(card: Card, *, labeled_at: str, seconds: float | None) -> StoryLabel:
+    """The label line for a fully answered card."""
+    if current_question(card) is not None:
+        raise ValueError(
+            f"story {card.candidate.story_key!r} has unanswered questions "
+            f"(next: {current_question(card)})"
+        )
+    by_question = dict(zip(QUESTIONS, card.answers))
+    return StoryLabel(
+        story_key=card.candidate.story_key,
+        thread_id=card.candidate.thread_id,
+        text=card.candidate.text,
+        status="graded",
+        scores={dim: by_question[dim] for dim in _DIMENSIONS},
+        themes={
+            theme: _THEME_GRADE_BY_ANSWER[by_question[theme]]
+            for theme in THEMES if by_question[theme] in _THEME_GRADE_BY_ANSWER
+        },
+        torn=[question for question in QUESTIONS if question in card.torn],
+        note=card.note,
+        recut_of=card.candidate.recut_of,
+        labeled_at=labeled_at,
+        seconds=seconds,
+        source_timestamp=card.candidate.source_timestamp,
+    )
+
+
+def miscut_label(card: Card, reason: str, note: str, *, labeled_at: str,
+                 seconds: float | None) -> StoryLabel:
+    """The label line that sets a story aside for recutting. Any answers already
+    given on the card are dropped: a miscut story carries no grades."""
+    return StoryLabel(
+        story_key=card.candidate.story_key,
+        thread_id=card.candidate.thread_id,
+        text=card.candidate.text,
+        status="miscut",
+        note=note,
+        miscut_reason=reason,
+        recut_of=card.candidate.recut_of,
+        labeled_at=labeled_at,
+        seconds=seconds,
+        source_timestamp=card.candidate.source_timestamp,
+    )
+
+
+_ANSWER_BY_THEME_GRADE = {"present": 2, "emphasized": 3}
+
+
+def card_from_label(label: StoryLabel) -> Card:
+    """Reopen a story from its label, for stepping back into it.
+
+    A graded story reopens at its last question with the earlier answers, torn
+    flags and note in place; a miscut story reopens as a fresh card.
+    """
+    candidate = Candidate(
+        story_key=label.story_key,
+        thread_id=label.thread_id,
+        text=label.text,
+        source_timestamp=label.source_timestamp,
+        recut_of=label.recut_of,
+    )
+    if label.status != "graded":
+        return Card(candidate)
+    answers = tuple(label.scores[dim] for dim in _DIMENSIONS) + tuple(
+        _ANSWER_BY_THEME_GRADE.get(label.themes.get(theme), 1) for theme in THEMES
+    )
+    return Card(candidate, answers[:-1], frozenset(label.torn), label.note)
+
+
+_DIMENSION_GRADES = ((1, "Poor", "poor"), (2, "OK", "ok"), (3, "Good", "good"))
+_THEME_GRADES = ((1, "Absent", "absent"), (2, "Present", "present"), (3, "Emphasized", "emphasized"))
+
+# Rubric section 1, Decided 2026-09-09. Shown when a question is flagged torn.
+GRADE_DOWN_RULE = "torn: when torn, grade down and say why"
+
+
+def question_panel(card: Card, rubric: Rubric) -> list[str]:
+    """The lines shown beside the story for the question being asked: its name,
+    the rubric's wording for it, and the three grades with their anchors."""
+    question = current_question(card)
+    if question is None:
+        return []
+    if question in THEMES:
+        wording, grades, anchors = rubric.themes[question], _THEME_GRADES, rubric.theme_grades
+    else:
+        wording, grades, anchors = rubric.dimensions[question], _DIMENSION_GRADES, rubric.grades
+    lines = [f"{question.upper()}   {wording}", ""]
+    lines += [f"  {key}  {name:<11}{anchors[anchor]}" for key, name, anchor in grades]
+    if question in card.torn:
+        lines += ["", f"  {GRADE_DOWN_RULE}"]
+    return lines
+
+
+def answers_strip(card: Card) -> str:
+    """One line of the answers so far; ``?`` marks the question being asked."""
+    parts = []
+    for index, question in enumerate(QUESTIONS):
+        names = _THEME_GRADES if question in THEMES else _DIMENSION_GRADES
+        if index < len(card.answers):
+            value = names[card.answers[index] - 1][1]
+        elif index == len(card.answers):
+            value = "?"
+        else:
+            value = "-"
+        flag = " (torn)" if question in card.torn else ""
+        parts.append(f"{question} {value}{flag}")
+    return "   ".join(parts)
+
+
+def count_labeled_on(labels: dict[str, StoryLabel], day, tz=None) -> int:
+    """How many stories' current label was made on *day*, in timezone *tz*
+    (the local timezone when None)."""
+    count = 0
+    for label in labels.values():
+        stamp = _labeled_at(label)
+        if stamp is not None and stamp.astimezone(tz).date() == day:
+            count += 1
+    return count
