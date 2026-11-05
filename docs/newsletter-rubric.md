@@ -57,9 +57,7 @@ output is ever shown to staff directly.
   lands in good/excellent, and the shortlist is read by a person.
 - **When torn, grade down and say why — Decided 2026-09-09.** A lower grade with a stated reason is
   coachable; an inflated grade is invisible as an error. Themes already resolve every undecidable path to
-  no label (D14), which is the same rule. In both grading prompts since 2026-11-05 (quality and themes;
-  pinned by `test_config_grading_prompts_carry_the_grade_down_rule`). Its effect is not yet measured: the
-  golden set is too small (§7).
+  no label (D14), which is the same rule. How the prompts state it: §8, 2026-11-05.
 
 ## 2. Extraction — what is a story
 
@@ -209,7 +207,15 @@ peer trainer reading cold (§1 audience).
   shortlist filter, rationale, example/test instruments, scarcity ruling, golden-set procedure (Brian's
   rulings of 2026-09-09); §2–§5 transcribed from the prompts, D14/D15/D20 and commit history with
   provenance.
-- **2026-11-05** — the grade-down rule (§1) is written into the quality and theme prompts, on Brian's
-  ruling of the same day that it ships before it can be measured. `prompt_hash` changes with it, so eval
-  runs from before and after are not prompt-comparable. The `config.toml` line references in §2–§5 stay
-  as recorded at `f7245f9`.
+- **2026-11-05** — the grade-down rule (§1) is written into the grading prompts, on Brian's ruling of
+  that day that it ships before it can be measured (§7: the golden set is too small to show its effect).
+  - Quality prompt: between any two grades, the lower. Theme prompt: between PRESENT and EMPHASIZED,
+    PRESENT. The ABSENT/PRESENT boundary is left to "Do not force a match", because ABSENT is stored by
+    omission and a torn-down PRESENT would leave no trace of a theme the story touched.
+  - The why goes in the model's stored reasoning, not in the answer lines, which the parsers read. The
+    rationale sentence of §1 is for readers of this rubric and is not in the prompts.
+  - It takes effect at the first daemon deploy after the change is merged, not on this date. Assessment
+    records do not carry a prompt identity, so grades from before and after are told apart by a record's
+    timestamp against that deploy date: note the date here when it is deployed.
+  - `prompt_hash` changes with it, so eval runs from before and after are not prompt-comparable. The
+    `config.toml` line references in §2–§5 stay as recorded at `f7245f9`.

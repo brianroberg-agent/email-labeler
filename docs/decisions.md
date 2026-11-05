@@ -458,8 +458,8 @@ check would have called fine).
 
 ## D23 — The newsletter grading rubric is the spec; the newsletter prompts implement it (2026-09-09)
 
-**Status:** docs implemented (`docs/newsletter-rubric.md`); the grade-down rule is in both grading
-prompts (2026-11-05); the other prompt and eval changes it proposes are pending.
+**Status:** docs implemented (`docs/newsletter-rubric.md`); the grade-down rule is in the grading
+prompts (rubric §8, 2026-11-05); the other prompt and eval changes it proposes are pending.
 
 What the newsletter grader's outputs mean — story extraction, the four storytelling dimensions and their
 grades, the tier, the five Ends-Statement themes and their grades — and how golden-set stories are
