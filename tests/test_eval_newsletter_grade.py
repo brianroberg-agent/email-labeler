@@ -977,7 +977,7 @@ class TestCli:
         ])
         _write_jsonl(tmp_path / "golden.jsonl", [{
             "type": "golden_newsletter", "thread_id": "t_900002", "message_id": "m",
-            "sender": "s", "subject": "s", "body": "b", "stories": [],
+            "sender": "s", "subject": "s", "body": "b", "stories": [], "reviewed": True,
         }])
         append_label(tmp_path / "labels.jsonl", _graded(STORY_B))
         opened = {}
@@ -985,6 +985,32 @@ class TestCli:
         cli(self._paths(tmp_path))
         assert [candidate.text for candidate in opened["app"].queue] == [STORY_A]
         assert opened["app"].label_path == tmp_path / "labels.jsonl"
+
+    def test_only_reviewed_or_excluded_newsletters_keep_their_stories_out_of_the_queue(
+        self, tmp_path, monkeypatch,
+    ):
+        # newsletter_harvest seeds every newsletter unreviewed with no stories.
+        # Those have no ground truth anywhere, so their stories are exactly the
+        # ones to grade here. A reviewed newsletter is curated ground truth, and
+        # an excluded one was ruled not a staff newsletter at all.
+        def golden(thread_id, **flags):
+            return {"type": "golden_newsletter", "thread_id": thread_id, "message_id": "m",
+                    "sender": "s", "subject": "s", "body": "b", "stories": [], **flags}
+        _write_jsonl(tmp_path / "golden.jsonl", [
+            golden("t_900001", reviewed=True),
+            golden("t_900002"),                 # harvested, never reviewed
+            golden("t_900003", excluded=True),
+        ])
+        _write_jsonl(tmp_path / "assessments.jsonl", [
+            _assessment("t_900001", ["A story from a reviewed newsletter."]),
+            _assessment("t_900002", ["A story from a harvested, unreviewed newsletter."]),
+            _assessment("t_900003", ["A story from an excluded newsletter."]),
+        ])
+        opened = {}
+        monkeypatch.setattr(GradeApp, "run", lambda self: opened.update(app=self))
+        cli(self._paths(tmp_path))
+        assert [c.text for c in opened["app"].queue] == [
+            "A story from a harvested, unreviewed newsletter."]
 
     def test_a_missing_curated_golden_set_is_not_an_error(self, tmp_path, monkeypatch):
         _write_jsonl(tmp_path / "assessments.jsonl", [_assessment("t_900001", [STORY_A])])

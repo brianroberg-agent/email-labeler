@@ -264,7 +264,7 @@ TUI details:
 |---|---|
 | `--assessments` | Production assessments JSONL to draw stories from (default: `[newsletter] output_file` in the config, relative to the CWD) |
 | `--labels` | Story-label log to append to (default: `evals/newsletter_story_labels.jsonl`) |
-| `--golden-set` | Hand-curated golden set whose newsletters are left out of the queue (default: `evals/newsletter_golden_set.jsonl`; a missing file means none) |
+| `--golden-set` | Hand-curated golden set; newsletters it has reviewed or excluded are left out of the queue (default: `evals/newsletter_golden_set.jsonl`; a missing file means none) |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD); read for `[newsletter] output_file` and `[newsletter.rubric]` |
 | `--miscut` | List the stories set aside as miscut (by thread, with reason, opening words and note), then exit |
 
@@ -275,8 +275,9 @@ no LLM endpoint and no proxy.
 review TUI's `load_assessments`, so the newest record per thread is used and
 pre-#53 records must be migrated first). Only each story's text, its thread id
 and the record's timestamp are read; grades, tiers, reasoning, model, sender and
-subject are not carried into the queue or onto the screen. Left out: threads in
-the curated golden set, stories already labeled, blank texts, and a text already
+subject are not carried into the queue or onto the screen. Left out: threads the
+curated golden set has reviewed or excluded (a newsletter that was only
+harvested stays in), stories already labeled, blank texts, and a text already
 queued. Order is by story key (a hash of the text), so it is the same on every
 launch and does not group a newsletter's stories together.
 

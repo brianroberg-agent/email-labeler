@@ -780,14 +780,23 @@ def _fail(message: str) -> None:
 
 
 def _curated_thread_ids(path: Path) -> set[str]:
-    """Thread ids in the hand-curated golden set; none if the file is absent."""
+    """Threads whose stories do not belong in the grading queue: newsletters the
+    operator has reviewed in the curated golden set (they are ground truth
+    already) and ones excluded from it (ruled not a staff newsletter).
+
+    A newsletter that was only harvested is neither: it has no ground truth
+    anywhere, so its stories are graded here. None if the file is absent.
+    """
     if not path.exists():
         return set()
     ids = set()
     with open(path) as f:
         for line in f:
-            if line.strip():
-                ids.add(json.loads(line).get("thread_id", ""))
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("reviewed") or record.get("excluded"):
+                ids.add(record.get("thread_id", ""))
     return ids
 
 
@@ -826,8 +835,8 @@ def cli(argv=None):
     parser.add_argument("--labels", default="evals/newsletter_story_labels.jsonl",
                         help="Story-label log to append to")
     parser.add_argument("--golden-set", default="evals/newsletter_golden_set.jsonl",
-                        help="Hand-curated golden set whose newsletters are left out of "
-                             "the queue (a missing file means none)")
+                        help="Hand-curated golden set; newsletters it has reviewed or "
+                             "excluded are left out of the queue (a missing file means none)")
     parser.add_argument("--config",
                         help="Path to config.toml (default: the repo-root config.toml, "
                              "regardless of CWD)")

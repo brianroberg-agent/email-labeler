@@ -821,8 +821,10 @@ async def main(args: argparse.Namespace) -> None:
     labels_path = getattr(args, "story_labels", None)
     if labels_path and args.mode != "extraction":
         try:
+            # Only a reviewed newsletter is curated ground truth. One loaded
+            # by --include-unreviewed carries no scored story of its own.
             extra_stories, label_stats = load_story_labels(
-                Path(labels_path), {nl.thread_id for nl in golden_set}
+                Path(labels_path), {nl.thread_id for nl in golden_set if nl.reviewed}
             )
         except ValueError as exc:
             print(f"Error: cannot read the story-label log: {exc}", file=sys.stderr)

@@ -1444,6 +1444,34 @@ class TestMainStoryLabels:
         assert (meta["story_count"], meta["story_label_count"]) == (1, 0)
 
 
+class TestLabelStoriesFromUnreviewedNewsletters:
+    def test_a_label_story_is_scored_when_its_newsletter_was_only_harvested(
+        self, tmp_path, monkeypatch,
+    ):
+        # --include-unreviewed loads harvested newsletters that carry no scored
+        # story. A story graded in newsletter_grade from such a thread must not
+        # be "left to the curated set", which has nothing for it.
+        def fake_build(config, no_cache):
+            llm = FakeLLM([("story", "SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: OK\nDYNAMIC: OK", "q")])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [
+            _newsletter("nl1", reviewed=True, stories=[_story("nl1:0", text="curated story")]),
+            _newsletter("nl2", reviewed=False),
+        ])
+        labels = tmp_path / "labels.jsonl"
+        append_label(labels, _label("labeled story from nl2", thread_id="nl2"))
+        append_label(labels, _label("labeled story from nl1", thread_id="nl1"))
+        out = tmp_path / "results"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="quality",
+            include_unreviewed=True, story_labels=str(labels),
+        )))
+        meta = _read_meta(out)
+        assert meta["story_label_count"] == 1   # nl2's story; nl1's is left to the curated set
+
+
 class TestMainLabelLogAlone:
     """The label log is a grading golden set by itself: a machine that has only
     graded ready-made stories, with no curated newsletters, can still be scored."""
