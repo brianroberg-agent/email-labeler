@@ -280,8 +280,9 @@ the curated golden set, stories already labeled, blank texts, and a text already
 queued. Order is by story key (a hash of the text), so it is the same on every
 launch and does not group a newsletter's stories together.
 
-**Screen.** The story (scrollable with the arrow keys, PgUp/PgDn, Home/End at
-any time, including while a note is typed), the question being asked with the
+**Screen.** The story (scrollable with Up/Down, PgUp/PgDn and Home/End while
+grading; while a note is typed Up/Down and PgUp/PgDn still scroll it, and
+Home/End move within the note), the question being asked with the
 wording from `[newsletter.rubric]`, the answers so far, and the keys:
 
 | Key | Action |

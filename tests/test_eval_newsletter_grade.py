@@ -727,6 +727,27 @@ class TestGradeScreen:
             await pilot.press("2")
             assert "DYNAMIC" in _text(app, "#question")
 
+    async def test_the_story_scrolls_while_a_note_is_being_typed(self, tmp_path):
+        # Up/Down and PgUp/PgDn reach the story from the note line; Home and
+        # End belong to the note (they move its cursor), as the docs say.
+        app = _app(tmp_path, LONG_STORY)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("n")
+            note = app.query_one("#note", Input)
+            story = app.query_one("#story")
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert note.has_focus
+            paged = story.scroll_y
+            assert paged > 1  # a page, not a line
+            await pilot.press("down")
+            await pilot.pause()
+            scrolled = story.scroll_y
+            assert scrolled > paged
+            await pilot.press("home")
+            await pilot.pause()
+            assert story.scroll_y == scrolled
+
     async def test_a_new_story_starts_scrolled_to_its_top(self, tmp_path):
         app = _app(tmp_path, LONG_STORY, STORY_B)
         async with app.run_test(size=SIZE) as pilot:

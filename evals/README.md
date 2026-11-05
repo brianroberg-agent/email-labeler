@@ -209,7 +209,7 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   answer and steps back into the previous story, `s` skips. `x` marks a story
   **miscut** (cut short, runs past its end, several stories in one, not a story):
   it is set aside for recutting, not graded and not thrown away. The story
-  scrolls at any time. Each finished story is appended to
+  scrolls while you grade and while you type a note. Each finished story is appended to
   `evals/newsletter_story_labels.jsonl`; nothing else is saved or accepted. No
   LLM endpoint is needed.
 - **run** — Replay the golden set through the real classifier (LLM-cached) and

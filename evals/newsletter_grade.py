@@ -525,8 +525,9 @@ class GradeApp(App):
     """One story at a time: the text, the question being asked with the rubric's
     wording for it, and nine single-key answers.
 
-    Nothing here is modal over the story. It scrolls at any moment, including
-    while a note is being typed, and scrolling never touches the answers.
+    Nothing here is modal over the story, and scrolling never touches the
+    answers. While a note is being typed the arrow and page keys still scroll
+    the story; Home and End then move within the note.
     Every finished card is appended to the label log before the next story is
     shown; a card that cannot be saved stays on screen.
     """
