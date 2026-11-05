@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-from evals import plural
+from evals import clean_for_display, plural
 from evals.newsletter_schemas import (
     ExtractionPrediction,
     NewsletterRunMeta,
@@ -683,8 +683,11 @@ def load_results(
 
 
 def _text_excerpt(text: str) -> str:
-    """Whitespace-collapse *text* and truncate to a short label (~60 chars)."""
-    collapsed = re.sub(r"\s+", " ", text or "").strip()
+    """Whitespace-collapse *text* and truncate to a short label (~60 chars).
+
+    Control characters are removed first: excerpts are printed to a terminal and
+    the stored text is email content."""
+    collapsed = re.sub(r"\s+", " ", clean_for_display(text or "")).strip()
     return collapsed[:57] + "..." if len(collapsed) > 60 else collapsed
 
 

@@ -930,6 +930,24 @@ class TestGradeScreen:
         (label,) = _written(tmp_path)
         assert label.text == hostile  # the eval grades the text as extracted
 
+    async def test_unusual_spaces_are_drawn_as_spaces_not_removed(self, tmp_path):
+        # HTML email is full of non-breaking and thin spaces. Dropping them
+        # glues words together, so the operator would grade text that differs
+        # from what is stored and scored.
+        story = "Dr.\xa0Lee met\u2009her at\u202f10\xa0am.\u2028She stayed."
+        app = _app(tmp_path, story)
+        async with app.run_test(size=SIZE) as pilot:
+            shown = _text(app, "#story-text")
+            assert "Dr. Lee met her at 10 am." in shown
+            assert "She stayed." in shown and "am.She" not in shown
+            await pilot.press("n")
+            app.query_one("#note", Input).value = "grade\xa0down\x1b[2J here"
+            await pilot.press("enter")
+            await pilot.press("3", "3", "3", "3", "0")
+        (label,) = _written(tmp_path)
+        assert label.note == "grade down[2J here"
+        assert label.text == story
+
     async def test_nothing_the_model_said_reaches_the_screen(self, tmp_path):
         queue = build_queue([_assessment("t_900001", [STORY_A])], set(), {})
         app = GradeApp(queue, RUBRIC, tmp_path / "labels.jsonl")
@@ -1053,3 +1071,9 @@ class TestFormatMiscutBucket:
         assert "A synthetic story" in out and "with an escape in it." in out
         assert "pasted" in out and "note" in out
         assert "t_900001" in out
+
+    def test_unusual_spaces_stay_spaces(self):
+        label = _miscut("Dr.\xa0Lee met\u2009her.", note="see\xa0above")
+        out = format_miscut_bucket([label])
+        assert "Dr. Lee met her." in out
+        assert "see above" in out

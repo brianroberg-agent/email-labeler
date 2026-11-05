@@ -1511,6 +1511,16 @@ class TestExcerptsForLabelLogStories:
                      compute_all_metrics([row]), verbose=True, story_results=[row])
         assert "Priya led the Tuesday study" in capsys.readouterr().out
 
+    def test_excerpts_carry_no_control_characters(self, tmp_path):
+        # Excerpts are printed to a terminal by --verbose; the label log stores
+        # story text exactly as extracted from email.
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(self._label_line(
+            "0123456789abcdef", "\x1b[2J\x1b]0;owned\x07Priya led\xa0the study."))
+        (excerpt,) = load_story_excerpts("/nope/absent.jsonl", str(labels)).values()
+        assert "\x1b" not in excerpt and "\x07" not in excerpt
+        assert "Priya led the study." in excerpt
+
     def test_an_unreadable_label_log_degrades_to_curated_excerpts_only(self, tmp_path):
         golden = tmp_path / "golden.jsonl"
         golden.write_text(json.dumps({

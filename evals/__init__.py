@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -56,6 +57,37 @@ def _target_mode(path: Path) -> int:
         current_umask = os.umask(0)
         os.umask(current_umask)
         return 0o666 & ~current_umask
+
+
+def clean_for_display(text: str, keep_newlines: bool = False) -> str:
+    """*text* made safe and faithful to show: no control characters, every kind
+    of space still a space.
+
+    Story text comes from email. Printed as stored, an escape sequence in it
+    would be obeyed by the terminal, so control characters (Unicode category Cc)
+    are dropped. Non-breaking, thin and other Unicode spaces are NOT control
+    characters; they become a plain space, because deleting them glues words
+    together and the reader would see text that differs from what is stored.
+    Line breaks (including U+2028/U+2029) are kept only with *keep_newlines*,
+    otherwise they become spaces; a tab becomes spaces either way.
+    """
+    out = []
+    for ch in text:
+        if ch == "\n":
+            out.append("\n" if keep_newlines else " ")
+        elif ch == "\t":
+            out.append("    " if keep_newlines else " ")
+        else:
+            category = unicodedata.category(ch)
+            if category == "Cc":
+                continue
+            if category in ("Zl", "Zp"):
+                out.append("\n" if keep_newlines else " ")
+            elif category == "Zs":
+                out.append(" ")
+            else:
+                out.append(ch)
+    return "".join(out)
 
 
 def plural(n: int, singular: str, plural_form: str | None = None) -> str:
