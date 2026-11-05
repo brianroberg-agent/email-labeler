@@ -794,6 +794,24 @@ class TestGradeScreen:
             assert label.torn == ["concrete"]
             assert label.note == "one named moment, the rest is summary"
 
+    async def test_a_torn_card_is_not_saved_without_a_why(self, tmp_path):
+        # Rubric §1: "When torn, grade down and say why." The why is the point.
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("t", "3", "2", "2", "1", "0")
+            await pilot.press("enter")                 # empty
+            note = app.query_one("#note", Input)
+            assert _written(tmp_path) == []
+            assert note.has_focus
+            assert "say why" in _text(app, "#status").lower()
+            note.value = "   "
+            await pilot.press("enter")                 # blank
+            assert _written(tmp_path) == []
+            note.value = "more summary than moment"
+            await pilot.press("enter")
+        (label,) = _written(tmp_path)
+        assert (label.torn, label.note) == (["simple"], "more summary than moment")
+
     async def test_escape_from_the_why_returns_to_the_last_question(self, tmp_path):
         app = _app(tmp_path, STORY_A)
         async with app.run_test(size=SIZE) as pilot:

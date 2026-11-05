@@ -743,6 +743,14 @@ class GradeApp(App):
                 self._card, self._miscut_reason, text,
                 labeled_at=self._stamp(), seconds=self._seconds()))
             return
+        if self._note_purpose == "torn" and not text:
+            # "Grade down and say why": the why is what makes the lower grade
+            # usable. Esc goes back to the question instead.
+            self._status = "Say why in a few words, or press Esc to go back to the question."
+            self._refresh()
+            self.query_one("#note", Input).focus()
+            return
+        self._status = ""
         self._card = replace(self._card, note=text)
         if self._note_purpose == "torn":
             self._commit(graded_label(

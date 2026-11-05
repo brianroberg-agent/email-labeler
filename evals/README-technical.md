@@ -290,7 +290,7 @@ wording from `[newsletter.rubric]`, the answers so far, and the keys:
 |---|---|
 | `1` `2` `3` | Answer the current question: low / middle / high |
 | `0` | Answer Absent for the remaining themes (ignored while a dimension is asked) |
-| `t` | Flag the current question as torn; a card with a torn flag asks why before it is saved |
+| `t` | Flag the current question as torn; a card with a torn flag asks why and is not saved until a reason is given (`Esc` returns to the question) |
 | `n` | Add or edit the story's note |
 | `backspace` | Take back the last answer; at a story's first question, reopen the story labeled just before |
 | `x` | Mark the story miscut, then `1`-`4` for the reason and an optional note |
