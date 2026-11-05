@@ -10,6 +10,7 @@ from evals.newsletter_schemas import (
     GoldenStory,
     NewsletterRunMeta,
     NewsletterThinkingEntry,
+    StoryLabel,
     StoryPrediction,
 )
 
@@ -466,3 +467,119 @@ class TestSeededFromRemoved:
             }
         )
         assert not hasattr(nl, "seeded_from")
+
+
+def _graded_label(**overrides) -> dict:
+    """A complete graded story-label line, as the grading tool writes it."""
+    line = {
+        "type": "story_label",
+        "story_key": "0123456789abcdef",
+        "thread_id": "t_900001",
+        "text": "A synthetic story about a student and a hard semester.",
+        "status": "graded",
+        "scores": {"simple": 3, "concrete": 2, "personal": 2, "dynamic": 1},
+        "themes": {"scripture": "emphasized", "church": "present"},
+        "torn": ["concrete", "church"],
+        "note": "concrete: one named moment, the rest is summary",
+        "miscut_reason": "",
+        "recut_of": "",
+        "labeled_at": "2026-11-05T21:00:00+00:00",
+        "seconds": 74.5,
+        "source_timestamp": "2026-10-30T12:00:00+00:00",
+    }
+    line.update(overrides)
+    return line
+
+
+class TestStoryLabel:
+    def test_graded_round_trip_via_json(self):
+        label = StoryLabel.from_dict(_graded_label())
+        restored = StoryLabel.from_dict(json.loads(json.dumps(label.to_dict())))
+        assert restored == label
+        assert restored.status == "graded"
+        assert restored.scores == {"simple": 3, "concrete": 2, "personal": 2, "dynamic": 1}
+        assert restored.themes == {"scripture": "emphasized", "church": "present"}
+        assert restored.torn == ["concrete", "church"]
+        assert restored.seconds == 74.5
+        assert label.to_dict()["type"] == "story_label"
+
+    def test_miscut_round_trip_keeps_text_reason_and_note(self):
+        label = StoryLabel.from_dict(_graded_label(
+            status="miscut", scores=None, themes={}, torn=[],
+            miscut_reason="cut_short", note="the ending is in the next paragraph",
+        ))
+        restored = StoryLabel.from_dict(json.loads(json.dumps(label.to_dict())))
+        assert restored.status == "miscut"
+        assert restored.scores is None
+        assert restored.miscut_reason == "cut_short"
+        assert restored.note == "the ending is in the next paragraph"
+        assert restored.text.startswith("A synthetic story")
+
+    def test_optional_fields_default(self):
+        label = StoryLabel.from_dict({
+            "story_key": "k", "thread_id": "t_900002", "text": "Story.",
+            "status": "graded",
+            "scores": {"simple": 1, "concrete": 1, "personal": 1, "dynamic": 1},
+        })
+        assert label.themes == {}
+        assert label.torn == []
+        assert label.note == ""
+        assert label.recut_of == ""
+        assert label.seconds is None
+
+    def test_unknown_status_rejected(self):
+        with pytest.raises(ValueError, match="status"):
+            StoryLabel.from_dict(_graded_label(status="rejected"))
+
+    def test_graded_requires_all_four_dimensions(self):
+        with pytest.raises(ValueError, match="dynamic"):
+            StoryLabel.from_dict(_graded_label(
+                scores={"simple": 3, "concrete": 2, "personal": 2}))
+
+    def test_graded_rejects_missing_scores(self):
+        with pytest.raises(ValueError, match="scores"):
+            StoryLabel.from_dict(_graded_label(scores=None))
+
+    def test_score_out_of_range_rejected(self):
+        with pytest.raises(ValueError, match="1..3"):
+            StoryLabel.from_dict(_graded_label(
+                scores={"simple": 5, "concrete": 2, "personal": 2, "dynamic": 1}))
+
+    def test_unknown_theme_name_rejected(self):
+        # GoldenStory does not check theme names; a label line is written by a
+        # tool and merged across machines, so a stray name is caught at load.
+        with pytest.raises(ValueError, match="evangelism"):
+            StoryLabel.from_dict(_graded_label(themes={"evangelism": "present"}))
+
+    def test_absent_is_not_a_stored_theme_grade(self):
+        with pytest.raises(ValueError, match="absent"):
+            StoryLabel.from_dict(_graded_label(themes={"church": "absent"}))
+
+    def test_miscut_requires_a_known_reason(self):
+        with pytest.raises(ValueError, match="miscut_reason"):
+            StoryLabel.from_dict(_graded_label(
+                status="miscut", scores=None, themes={}, miscut_reason="ugly"))
+
+    def test_miscut_carries_no_grades(self):
+        with pytest.raises(ValueError, match="miscut"):
+            StoryLabel.from_dict(_graded_label(status="miscut", miscut_reason="cut_short"))
+
+    def test_torn_names_must_be_dimensions_or_themes(self):
+        with pytest.raises(ValueError, match="torn"):
+            StoryLabel.from_dict(_graded_label(torn=["vibes"]))
+
+    def test_to_golden_story_carries_ground_truth(self):
+        story = StoryLabel.from_dict(_graded_label()).to_golden_story()
+        assert story.story_id == "0123456789abcdef"
+        assert story.text.startswith("A synthetic story")
+        assert story.expected_scores == {"simple": 3, "concrete": 2, "personal": 2, "dynamic": 1}
+        assert story.expected_themes == {"scripture": "emphasized", "church": "present"}
+        assert story.expected_tier == "fair"  # mean 2.0 -> fair band (D15)
+        assert story.reviewed is True
+        assert story.excluded is False
+
+    def test_miscut_has_no_golden_story(self):
+        label = StoryLabel.from_dict(_graded_label(
+            status="miscut", scores=None, themes={}, torn=[], miscut_reason="not_a_story"))
+        with pytest.raises(ValueError, match="miscut"):
+            label.to_golden_story()
