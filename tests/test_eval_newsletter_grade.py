@@ -53,6 +53,10 @@ STORY_B = (
 )
 STORY_A_CUT_SHORT = "Dana had never led anything before this fall. In September she agreed to"
 
+# _assessment() records are stamped SAME; OLDER is an earlier grading of the thread.
+SAME = "2026-10-30T12:00:00+00:00"
+OLDER = "2026-09-01T12:00:00+00:00"
+
 
 def _assessment(thread_id, texts, timestamp="2026-10-30T12:00:00+00:00"):
     """A production assessment record, with the grades a real one carries."""
@@ -265,7 +269,7 @@ class TestBuildQueue:
         assert forward == backward == sorted(forward)
 
     def test_a_new_cut_of_a_miscut_story_comes_back_linked_to_it(self):
-        labels = latest_labels([_miscut(STORY_A_CUT_SHORT)])
+        labels = latest_labels([_miscut(STORY_A_CUT_SHORT, source_timestamp=OLDER)])
         queue = build_queue([_assessment("t_900001", [STORY_A, STORY_B])], set(), labels)
         recut = next(c for c in queue if c.text == STORY_A)
         assert recut.recut_of == story_key(STORY_A_CUT_SHORT)
@@ -273,17 +277,42 @@ class TestBuildQueue:
         assert other.recut_of == ""
 
     def test_a_new_cut_overlapping_a_graded_story_is_not_queued_again(self):
-        labels = latest_labels([_graded(STORY_A_CUT_SHORT)])
+        labels = latest_labels([_graded(STORY_A_CUT_SHORT, source_timestamp=OLDER)])
         queue = build_queue([_assessment("t_900001", [STORY_A, STORY_B])], set(), labels)
         assert [c.text for c in queue] == [STORY_B]
 
     def test_overlap_is_judged_within_the_thread_only(self):
-        labels = latest_labels([_graded(STORY_A_CUT_SHORT, thread_id="t_900009")])
+        labels = latest_labels([_graded(STORY_A_CUT_SHORT, thread_id="t_900009",
+                                        source_timestamp=OLDER)])
         queue = build_queue([_assessment("t_900001", [STORY_A])], set(), labels)
         assert [c.text for c in queue] == [STORY_A]
 
+    def test_a_neighbor_from_the_same_extraction_is_not_a_recut(self):
+        # The extractor returned a cut that ran long (it swallowed most of the
+        # next story) alongside that next story. Marking the long cut miscut
+        # must not turn its neighbor into "the recut": both came from one
+        # extraction, so nothing has been recut yet.
+        swallowed = STORY_A + " " + STORY_B
+        labels = latest_labels([_miscut(swallowed, reason="runs_long", source_timestamp=SAME)])
+        queue = build_queue([_assessment("t_900001", [swallowed, STORY_B])], set(), labels)
+        (neighbor,) = queue
+        assert neighbor.text == STORY_B
+        assert neighbor.recut_of == ""
+
+    def test_a_neighbor_from_the_same_extraction_is_not_a_duplicate(self):
+        overlapping = STORY_A + " She plans to keep hosting in the spring."
+        labels = latest_labels([_graded(STORY_A, source_timestamp=SAME)])
+        queue = build_queue([_assessment("t_900001", [STORY_A, overlapping])], set(), labels)
+        assert [c.text for c in queue] == [overlapping]
+
+    def test_a_label_with_no_known_source_links_nothing(self):
+        labels = latest_labels([_miscut(STORY_A_CUT_SHORT, source_timestamp="")])
+        (candidate,) = build_queue([_assessment("t_900001", [STORY_A])], set(), labels)
+        assert candidate.recut_of == ""
+
     def test_graded_overlap_outranks_miscut_overlap(self):
-        labels = latest_labels([_miscut(STORY_A_CUT_SHORT), _graded(STORY_A)])
+        labels = latest_labels([_miscut(STORY_A_CUT_SHORT, source_timestamp=OLDER),
+                                _graded(STORY_A, source_timestamp=OLDER)])
         longer = STORY_A + " She plans to keep hosting in the spring."
         queue = build_queue([_assessment("t_900001", [longer])], set(), labels)
         assert queue == []

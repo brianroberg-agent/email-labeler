@@ -313,8 +313,11 @@ become ground truth for the quality and theme metrics.
 out of the queue under that key. When a later assessment of the same thread
 contains a story that shares most of its words with a miscut one, that story is
 queued as its recut (`recut_of`); one that shares most of its words with an
-already graded story of the thread is not queued again. A miscut story leaves
-the `--miscut` list when its recut has been graded or it is graded itself.
+already graded story of the thread is not queued again. "Later" is by the
+assessment record's timestamp against the label's `source_timestamp`: stories
+from the same extraction as a labeled story are its neighbors, queued plainly,
+even when a cut that ran long contains them. A miscut story leaves the
+`--miscut` list when its recut has been graded or it is graded itself.
 
 ### newsletter_run
 

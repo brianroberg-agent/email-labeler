@@ -161,6 +161,22 @@ def _labeled_at(label: StoryLabel) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
+def _parse_time(value) -> datetime | None:
+    try:
+        stamp = datetime.fromisoformat(value or "")
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def _later(record_timestamp, label_source_timestamp) -> bool:
+    """Whether an assessment record is a later extraction than the one a label's
+    story came from. False when either time is unknown: without knowing, no
+    story is treated as another's recut or duplicate."""
+    record_at, source_at = _parse_time(record_timestamp), _parse_time(label_source_timestamp)
+    return record_at is not None and source_at is not None and record_at > source_at
+
+
 def latest_labels(labels: list[StoryLabel]) -> dict[str, StoryLabel]:
     """The label in force for each story: the newest by ``labeled_at``.
 
@@ -213,9 +229,11 @@ def build_queue(
 
     Left out: threads in the hand-curated golden set (their stories are already
     ground truth), stories already labeled under their key, blank texts, and a
-    text already queued. A story that overlaps one already *graded* in the same
-    thread is left out as a near-duplicate; one that overlaps a *miscut* story
-    in the same thread is that story's recut and comes back linked to it.
+    text already queued. When the thread has been extracted again since a story
+    was labeled, a story of the newer extraction that overlaps one already
+    *graded* is left out as a near-duplicate, and one that overlaps a *miscut*
+    story is that story's recut and comes back linked to it. Stories from the
+    same extraction as a labeled one are its neighbors and are queued plainly.
 
     Sorted by story key, which is a hash: the order survives restarts and one
     newsletter's stories are not graded back to back.
@@ -239,6 +257,11 @@ def build_queue(
             recut_of = ""
             already_graded = False
             for label in by_thread.get(thread_id, ()):
+                # Only a LATER extraction can recut or duplicate a labeled story.
+                # A story from the same extraction is its neighbor, however much
+                # text the two share (a cut that ran long contains the next one).
+                if not _later(record.get("timestamp"), label.source_timestamp):
+                    continue
                 if text_overlap(text, label.text) < OVERLAP_THRESHOLD:
                     continue
                 if label.status == "graded":
