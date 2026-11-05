@@ -13,13 +13,16 @@ from evals.newsletter_report import (
     cli,
     comparison_as_json,
     compute_all_metrics,
+    compute_dimension_direction,
     compute_dimension_exact_match,
     compute_dimension_mae,
     compute_extraction_metrics,
     compute_multilabel_metrics,
+    compute_theme_direction,
     compute_tier_metrics,
     format_mae_delta,
     format_metric_delta,
+    format_rate_delta,
     load_story_excerpts,
     match_stories,
     match_stories_detailed,
@@ -1235,3 +1238,157 @@ class TestStoryLabelCountInHeader:
         del old["story_labels_path"]
         restored = NewsletterRunMeta.from_dict(old)
         assert (restored.story_label_count, restored.story_labels_path) == (0, "")
+
+
+def _scores(simple, concrete, personal, dynamic):
+    return {"simple": simple, "concrete": concrete, "personal": personal, "dynamic": dynamic}
+
+
+def _themed(story_id, expected, predicted):
+    row = _pred(story_id=story_id, expected_themes=expected, predicted_themes=predicted)
+    row.themes_raw = "raw"
+    return row
+
+
+class TestDimensionDirection:
+    """Over-grading is the rubric's costliest error (docs/newsletter-rubric.md §1);
+    agreement metrics alone cannot tell it from under-grading."""
+
+    def _rows(self):
+        return [
+            _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(3, 2, 1, 2)),
+            _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(3, 2, 3, 2)),
+            _pred("c", expected_scores=_scores(2, 2, 2, 2), predicted_scores=None),  # parse failure
+        ]
+
+    def test_counts_how_often_the_model_graded_higher_and_lower(self):
+        direction = compute_dimension_direction(self._rows())
+        assert direction["simple"] == {"n": 2, "over": 1.0, "under": 0.0, "signed": 1.5}
+        assert direction["concrete"] == {"n": 2, "over": 0.0, "under": 0.0, "signed": 0.0}
+        assert direction["personal"] == {"n": 2, "over": 0.0, "under": 0.5, "signed": -0.5}
+
+    def test_all_pools_every_dimension_judgment(self):
+        direction = compute_dimension_direction(self._rows())
+        assert direction["all"]["n"] == 8
+        assert direction["all"]["over"] == pytest.approx(2 / 8)
+        assert direction["all"]["under"] == pytest.approx(1 / 8)
+        assert direction["all"]["signed"] == pytest.approx((1 + 2 - 1) / 8)
+
+    def test_no_scored_stories_is_not_a_rate_of_zero(self):
+        direction = compute_dimension_direction([])
+        assert direction["simple"] == {"n": 0, "over": None, "under": None, "signed": None}
+        assert direction["all"]["over"] is None
+
+
+class TestThemeDirection:
+    def _rows(self):
+        return [
+            _themed("a", {"scripture": "present"}, {"scripture": "emphasized"}),
+            _themed("b", {}, {"scripture": "emphasized", "church": "present"}),
+            _themed("c", {"scripture": "emphasized", "church": "emphasized"},
+                    {"scripture": "present"}),
+            _pred("d", expected_themes={"scripture": "present"}),  # theme call never ran
+        ]
+
+    def test_counts_theme_grades_that_came_out_higher_and_lower(self):
+        direction = compute_theme_direction(self._rows(), THEMES)
+        scripture = direction["scripture"]
+        assert scripture["n"] == 3
+        assert scripture["over"] == pytest.approx(2 / 3)
+        assert scripture["under"] == pytest.approx(1 / 3)
+        church = direction["church"]
+        assert (church["over"], church["under"]) == (pytest.approx(1 / 3), pytest.approx(1 / 3))
+
+    def test_names_the_wrong_emphasized_labels_by_what_the_story_deserved(self):
+        # EMPHASIZED is what earns a Gmail label (D14), so a wrong one is split
+        # by the true grade: merely Present, or Absent.
+        direction = compute_theme_direction(self._rows(), THEMES)
+        assert direction["scripture"]["emphasized_for_present"] == 1
+        assert direction["scripture"]["emphasized_for_absent"] == 1
+        assert direction["scripture"]["present_for_emphasized"] == 1
+        assert direction["church"]["absent_for_emphasized"] == 1
+
+    def test_all_pools_every_theme_judgment(self):
+        direction = compute_theme_direction(self._rows(), THEMES)
+        assert direction["all"]["n"] == 3 * len(THEMES)
+        assert direction["all"]["over"] == pytest.approx(3 / 15)
+        assert direction["all"]["under"] == pytest.approx(2 / 15)
+
+    def test_no_scored_stories_is_not_a_rate_of_zero(self):
+        direction = compute_theme_direction([], THEMES)
+        assert direction["scripture"]["n"] == 0
+        assert direction["scripture"]["over"] is None
+        assert direction["all"]["under"] is None
+
+
+class TestDirectionInReports:
+    def _rows(self):
+        rows = [
+            _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(3, 2, 1, 2),
+                  expected_themes={"scripture": "present"},
+                  predicted_themes={"scripture": "emphasized"}),
+            _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(3, 2, 3, 2)),
+        ]
+        for row in rows:
+            row.themes_raw = "raw"
+        return rows
+
+    def test_metrics_bundle_carries_both_directions(self):
+        metrics = compute_all_metrics(self._rows(), [])
+        assert metrics["dimension_direction"]["simple"]["over"] == 1.0
+        assert metrics["theme_direction"]["scripture"]["emphasized_for_present"] == 1
+
+    def test_single_run_report_shows_too_high_and_too_low_with_n(self, capsys):
+        rows = self._rows()
+        print_report(_meta(mode="all", story_count=2), compute_all_metrics(rows, []),
+                     story_results=rows)
+        out = capsys.readouterr().out
+        assert "--- Grading direction" in out
+        assert "Too high" in out and "Too low" in out
+        simple = next(line for line in out.splitlines() if line.strip().startswith("simple")
+                      and "100.0%" in line)
+        assert " 2 " in f" {simple} "  # n beside the figure
+        assert "Emph. for Present" in out
+
+    def test_single_run_report_prints_na_when_nothing_was_scored(self, capsys):
+        rows = [_pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=None)]
+        print_report(_meta(mode="quality"), compute_all_metrics(rows, []), story_results=rows)
+        out = capsys.readouterr().out
+        direction = out[out.index("--- Grading direction"):]
+        simple = next(line for line in direction.splitlines()
+                      if line.strip().startswith("simple"))
+        assert "N/A" in simple and "%" not in simple
+
+    def test_comparison_shows_whether_over_grading_fell(self, capsys):
+        before = self._rows()
+        after = [
+            _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(2, 2, 1, 2),
+                  expected_themes={"scripture": "present"},
+                  predicted_themes={"scripture": "present"}),
+            _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(2, 2, 3, 2)),
+        ]
+        for row in after:
+            row.themes_raw = "raw"
+        print_comparison(
+            _meta(tag="before", newsletter_model="model-a"), compute_all_metrics(before, []),
+            _meta(tag="after", newsletter_model="model-b"), compute_all_metrics(after, []),
+        )
+        out = capsys.readouterr().out
+        assert "Graded too high (lower=better)" in out
+        simple = next(line for line in out[out.index("Graded too high"):].splitlines()
+                      if line.strip().startswith("simple"))
+        assert "100.0%" in simple and "50.0%" in simple and "(improved)" in simple
+        assert "Graded too low (lower=better)" in out
+        assert "model=model-a" in out and "model=model-b" in out
+
+
+class TestFormatRateDelta:
+    def test_a_lower_rate_is_an_improvement(self):
+        assert format_rate_delta(0.5, 0.25) == "-25.0% (improved)"
+
+    def test_a_higher_rate_is_worse(self):
+        assert format_rate_delta(0.25, 0.5) == "+25.0% (worse)"
+
+    def test_no_change_and_missing_values(self):
+        assert format_rate_delta(0.25, 0.25) == "+0.0%"
+        assert format_rate_delta(None, 0.25) == "N/A"

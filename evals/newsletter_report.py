@@ -79,6 +79,89 @@ def compute_dimension_exact_match(results: list[StoryPrediction]) -> dict[str, f
     return _dimension_mean(results, lambda e, p: e == p)
 
 
+def _direction(pairs: list[tuple[int, int]]) -> dict:
+    """Direction of (expected, predicted) pairs on an ordered scale.
+
+    over/under are the fractions graded higher/lower than the label and signed
+    is the mean of predicted - expected. All three are None with no pairs: an
+    empty cell is "no data", not a rate of zero.
+    """
+    n = len(pairs)
+    if not n:
+        return {"n": 0, "over": None, "under": None, "signed": None}
+    return {
+        "n": n,
+        "over": sum(p > e for e, p in pairs) / n,
+        "under": sum(p < e for e, p in pairs) / n,
+        "signed": sum(p - e for e, p in pairs) / n,
+    }
+
+
+def compute_dimension_direction(results: list[StoryPrediction]) -> dict:
+    """Per dimension, how often the model graded higher or lower than the label.
+
+    Agreement metrics (MAE, exact match) cannot tell over-grading from
+    under-grading, and the rubric ranks over-grading as the costliest error
+    (docs/newsletter-rubric.md section 1). Keys are the dimensions plus "all",
+    which pools every dimension judgment.
+    """
+    out = {}
+    pooled: list[tuple[int, int]] = []
+    for dim in DIMENSIONS:
+        pairs = _dimension_pairs(results, dim)
+        pooled += pairs
+        out[dim] = _direction(pairs)
+    out["all"] = _direction(pooled)
+    return out
+
+
+_THEME_RANK = {None: 0, "present": 1, "emphasized": 2}
+_THEME_GRADE_NAME = {None: "absent", "present": "present", "emphasized": "emphasized"}
+# predicted_for_expected confusions worth naming: a wrong EMPHASIZED earns a
+# Gmail label the story did not deserve (D14); the rest are its mirror images.
+_THEME_CONFUSIONS = (
+    "emphasized_for_present", "emphasized_for_absent", "present_for_absent",
+    "present_for_emphasized", "absent_for_emphasized", "absent_for_present",
+)
+
+
+def compute_theme_direction(results: list[StoryPrediction], themes: list[str]) -> dict:
+    """Per theme, how often the model's grade came out higher or lower than the
+    label on Absent < Present < Emphasized, and which confusions those were
+    (issue #55). Only rows whose theme call succeeded count. Keys are the themes
+    plus "all", which pools every theme judgment.
+    """
+    scored = [r for r in results if _theme_scored(r)]
+    out = {}
+    pooled: list[tuple[int, int]] = []
+    pooled_confusions = dict.fromkeys(_THEME_CONFUSIONS, 0)
+    for theme in themes:
+        pairs = []
+        confusions = dict.fromkeys(_THEME_CONFUSIONS, 0)
+        for r in scored:
+            expected = _theme_grade(r.expected_themes, theme)
+            predicted = _theme_grade(r.predicted_themes, theme)
+            pairs.append((_THEME_RANK[expected], _THEME_RANK[predicted]))
+            if expected != predicted:
+                key = f"{_THEME_GRADE_NAME[predicted]}_for_{_THEME_GRADE_NAME[expected]}"
+                confusions[key] += 1
+                pooled_confusions[key] += 1
+        pooled += pairs
+        out[theme] = {**_direction(pairs), **confusions}
+    out["all"] = {**_direction(pooled), **pooled_confusions}
+    return out
+
+
+def format_rate_delta(a: float | None, b: float | None) -> str:
+    """Delta for a lower-is-better rate (graded too high / too low), as a percent."""
+    if a is None or b is None:
+        return "N/A"
+    d = b - a
+    sign = "+" if d >= 0 else ""
+    label = " (improved)" if d < 0 else (" (worse)" if d > 0 else "")
+    return f"{sign}{d:.1%}{label}"
+
+
 # NB: a "within-1" dimension metric was dropped in the 3-value migration (#53):
 # on a 1-3 scale the only pair NOT within 1 is a Poor<->Good confusion, so it was
 # ~always 1.0 and added no signal beyond MAE (now 0-2) + exact-match.
@@ -122,6 +205,9 @@ def compute_all_metrics(
         "tier": compute_tier_metrics(story_results, mode),
         "dimension_mae": compute_dimension_mae(story_results),
         "dimension_exact": compute_dimension_exact_match(story_results),
+        # Which way the disagreements run: over-grading is the costly direction.
+        "dimension_direction": compute_dimension_direction(story_results),
+        "theme_direction": compute_theme_direction(story_results, THEMES),
         # Primary, production-aligned: only Emphasized earns a Gmail label (#53).
         "themes": compute_multilabel_metrics(story_results, THEMES, positive="emphasized"),
         # Secondary: whether the theme was detected at all (Present or Emphasized).
@@ -611,6 +697,33 @@ def _format_dim_table(
     return "\n".join(lines)
 
 
+def _format_signed(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:+.2f}"
+
+
+def _format_direction_tables(dimension: dict, theme: dict) -> str:
+    """Too-high / too-low rates per dimension and per theme, with n beside each."""
+    name_width = max(len("Dimension"), len("all"), *(len(t) for t in THEMES))
+    widths = [name_width, 4, 10, 10, 8]
+    lines = ["  " + format_table_row(["Dimension", "n", "Too high", "Too low", "Signed"], widths),
+             "  " + "-" * sum(w + 2 for w in widths)]
+    for dim in [*DIMENSIONS, "all"]:
+        d = dimension[dim]
+        lines.append("  " + format_table_row(
+            [dim, str(d["n"]), format_pct(d["over"]), format_pct(d["under"]),
+             _format_signed(d["signed"])], widths))
+    widths = [name_width, 4, 10, 10, 18, 18]
+    lines += ["", "  " + format_table_row(
+        ["Theme", "n", "Too high", "Too low", "Emph. for Present", "Emph. for Absent"], widths),
+        "  " + "-" * sum(w + 2 for w in widths)]
+    for name in [*THEMES, "all"]:
+        t = theme[name]
+        lines.append("  " + format_table_row(
+            [name, str(t["n"]), format_pct(t["over"]), format_pct(t["under"]),
+             str(t["emphasized_for_present"]), str(t["emphasized_for_absent"])], widths))
+    return "\n".join(lines)
+
+
 def _format_theme_table(themes: dict) -> str:
     widths = [max(len(t) for t in THEMES), 10, 10, 10]
     lines = []
@@ -696,6 +809,11 @@ def print_report(
                   f"(invalid/unparseable theme output; --verbose shows raw)")
         print()
         print(_format_theme_table(themes))
+
+        if "dimension_direction" in metrics:
+            print("\n--- Grading direction (too high is the costly error) ---")
+            print(_format_direction_tables(
+                metrics["dimension_direction"], metrics["theme_direction"]))
 
     extraction = metrics["extraction"]
     if extraction["count"] or extraction.get("errors"):
@@ -847,9 +965,9 @@ def print_comparison(
     print(f"\n{'=' * 60}")
     print("Newsletter Comparison Report")
     print(f"{'=' * 60}")
-    print(f"  Run A: {meta1.run_id[:8]}  mode={meta1.mode}  "
+    print(f"  Run A: {meta1.run_id[:8]}  mode={meta1.mode}  model={meta1.newsletter_model}  "
           f"prompt_hash={meta1.prompt_hash or 'n/a'}  tag={meta1.tag or '-'}")
-    print(f"  Run B: {meta2.run_id[:8]}  mode={meta2.mode}  "
+    print(f"  Run B: {meta2.run_id[:8]}  mode={meta2.mode}  model={meta2.newsletter_model}  "
           f"prompt_hash={meta2.prompt_hash or 'n/a'}  tag={meta2.tag or '-'}")
     if meta1.mode != meta2.mode:
         print(f"\n  WARNING: run modes differ ({meta1.mode} vs {meta2.mode}); "
@@ -884,6 +1002,22 @@ def print_comparison(
         a_s = "N/A" if a is None else f"{a:.2f}"
         b_s = "N/A" if b is None else f"{b:.2f}"
         print("  " + format_table_row([dim, a_s, b_s, format_mae_delta(a, b)], widths))
+
+    # Direction: is the model grading too high (the costly error) less often?
+    da, db = metrics1.get("dimension_direction"), metrics2.get("dimension_direction")
+    ta_dir, tb_dir = metrics1.get("theme_direction"), metrics2.get("theme_direction")
+    if da and db and ta_dir and tb_dir:
+        for title, key in (("Graded too high (lower=better)", "over"),
+                           ("Graded too low (lower=better)", "under")):
+            header(title)
+            for label, a_cell, b_cell in (
+                [(dim, da[dim], db[dim]) for dim in DIMENSIONS]
+                + [("all dimensions", da["all"], db["all"]),
+                   ("all themes", ta_dir["all"], tb_dir["all"])]
+            ):
+                a, b = a_cell[key], b_cell[key]
+                print("  " + format_table_row(
+                    [label, format_pct(a), format_pct(b), format_rate_delta(a, b)], widths))
 
     # Themes — primary Emphasized rows, then the secondary detection (>=Present)
     # rows so a detection-level regression between runs is visible here too

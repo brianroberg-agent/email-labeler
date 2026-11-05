@@ -461,6 +461,17 @@ and exit code 1 (all three modes) — and when the offending path is a
 `match_stories_detailed()`, `theme_parse_anomalies()`, `load_story_excerpts()`,
 `build_trend_rows()`, `comparison_as_json()`.
 
+
+**Grading direction.** Agreement metrics (MAE, exact match, F1) do not say which
+way the model disagrees with the labels, and the rubric ranks over-grading as
+the costliest error. The single-run report therefore prints, per dimension and
+per theme, how often the model graded **too high** and **too low** (with `n`
+beside each, and `N/A` where nothing was scored), the signed mean error per
+dimension, and for themes how many wrong EMPHASIZED grades were given to a story
+labeled Present or Absent (issue #55). `--compare` shows the too-high and
+too-low rates of both runs side by side, lower being better, and names each
+run's model.
+
 ### Newsletter shared cache & prompt separation
 
 The newsletter runner reuses the **same** disk cache as the email eval —

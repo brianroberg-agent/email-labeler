@@ -217,7 +217,8 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   the quality and theme metrics only; the report's header says how many stories
   came from each source.
 - **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
-  or show a trend across runs.
+  or show a trend across runs. It also reports the *direction* of disagreement:
+  how often the model graded too high and too low, per dimension and per theme.
 
 **Environment.** `newsletter_run` calls the `[newsletter.llm]` endpoint resolved
 from `NEWSLETTER_LLM_URL` / `NEWSLETTER_LLM_API_KEY`, falling back to
