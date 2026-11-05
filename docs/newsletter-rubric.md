@@ -209,11 +209,18 @@ peer trainer reading cold (§1 audience).
   provenance.
 - **2026-11-05** — the grade-down rule (§1) is written into the grading prompts, on Brian's ruling of
   that day that it ships before it can be measured (§7: the golden set is too small to show its effect).
-  - Quality prompt: between any two grades, the lower. Theme prompt: between PRESENT and EMPHASIZED,
-    PRESENT. The ABSENT/PRESENT boundary is left to "Do not force a match", because ABSENT is stored by
-    omission and a torn-down PRESENT would leave no trace of a theme the story touched.
-  - The why goes in the model's stored reasoning, not in the answer lines, which the parsers read. The
-    rationale sentence of §1 is for readers of this rubric and is not in the prompts.
+  - **Decided 2026-11-05.** Quality prompt: between any two grades, the lower. Theme prompt: between
+    PRESENT and EMPHASIZED, PRESENT.
+  - **Implicit (what the theme prompt does, not ruled on).** The theme prompt does not apply the rule
+    between ABSENT and PRESENT; that boundary is left to "Do not force a match". The reason given in
+    review: ABSENT is stored by omission, so a torn-down PRESENT would leave nothing in the record's
+    `themes` for a theme the story touched (the model's reasoning text would still mention it). §1
+    states the rule without this exception, so it needs Brian's ruling either way.
+  - The prompts ask for the why inside the `<think>` reasoning rather than among the answer lines,
+    because the parsers read grade lines wherever they find them. That is a request to the model, not
+    a guarantee. It stands in for §6 (one reason sentence per grade, stored with the grade), which is
+    still pending; implementing §6 replaces this wording. The rationale sentence of §1 is for readers
+    of this rubric and is not in the prompts.
   - It takes effect at the first daemon deploy after the change is merged, not on this date. Assessment
     records do not carry a prompt identity, so grades from before and after are told apart by a record's
     timestamp against that deploy date: note the date here when it is deployed.
