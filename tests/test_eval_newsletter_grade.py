@@ -28,6 +28,7 @@ from evals.newsletter_grade import (
     cli,
     count_labeled_on,
     current_question,
+    format_miscut_bucket,
     graded_label,
     latest_labels,
     load_rubric,
@@ -855,6 +856,20 @@ class TestGradeScreen:
             assert "2 queued" in _text(app, "#progress")
             assert "DISCIPLE_MAKING" in _text(app, "#question")
 
+    async def test_control_characters_in_a_story_are_not_drawn_but_are_kept_in_the_label(
+        self, tmp_path,
+    ):
+        hostile = "First line\x1b[2J of a synthetic story.\r\nSecond\x07 line."
+        app = _app(tmp_path, hostile)
+        async with app.run_test(size=SIZE) as pilot:
+            shown = _text(app, "#story-text")
+            for control in ("\x1b", "\x07", "\r"):
+                assert control not in shown
+            assert "First line" in shown and "Second" in shown and "line." in shown
+            await pilot.press("3", "3", "3", "3", "0")
+        (label,) = _written(tmp_path)
+        assert label.text == hostile  # the eval grades the text as extracted
+
     async def test_nothing_the_model_said_reaches_the_screen(self, tmp_path):
         queue = build_queue([_assessment("t_900001", [STORY_A])], set(), {})
         app = GradeApp(queue, RUBRIC, tmp_path / "labels.jsonl")
@@ -937,3 +952,18 @@ class TestCli:
         _write_jsonl(tmp_path / "assessments.jsonl", [])
         cli(self._paths(tmp_path) + ["--miscut"])
         assert "No miscut stories" in capsys.readouterr().out
+
+
+class TestFormatMiscutBucket:
+    def test_control_characters_never_reach_the_terminal(self):
+        # Story text comes from email and notes may be pasted. Printed raw, an
+        # escape sequence in either could repaint or retitle the terminal.
+        hostile = "A synthetic story\x1b[2J\x1b]0;owned\x07 with an escape in it."
+        label = _miscut(hostile, thread_id="t_900001\x1b[31m",
+                        note="pasted \x1b[5mnote\x07")
+        out = format_miscut_bucket([label])
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        assert "A synthetic story" in out and "with an escape in it." in out
+        assert "pasted" in out and "note" in out
+        assert "t_900001" in out

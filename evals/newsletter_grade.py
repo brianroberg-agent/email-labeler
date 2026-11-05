@@ -489,6 +489,15 @@ def miscut_menu() -> list[str]:
     return lines
 
 
+def _displayable(text: str) -> str:
+    """Story text as drawn on screen: line breaks kept, tabs widened, every other
+    control character dropped. The label still stores the text as extracted."""
+    return "".join(
+        "    " if ch == "\t" else ch
+        for ch in text if ch in "\n\t" or ch.isprintable()
+    )
+
+
 class GradeApp(App):
     """One story at a time: the text, the question being asked with the rubric's
     wording for it, and nine single-key answers.
@@ -577,7 +586,7 @@ class GradeApp(App):
         self._card = card
         self._mode = "grade"
         self._opened_at = self._clock()
-        self.query_one("#story-text", Static).update(card.candidate.text)
+        self.query_one("#story-text", Static).update(_displayable(card.candidate.text))
         self.query_one("#story", VerticalScroll).scroll_home(animate=False)
         self._refresh()
 
@@ -755,6 +764,12 @@ def _curated_thread_ids(path: Path) -> set[str]:
     return ids
 
 
+def _printable(text: str) -> str:
+    """*text* without control characters. Story text comes from email and is
+    printed to a terminal here, where an escape sequence would be obeyed."""
+    return "".join(ch for ch in text if ch.isprintable())
+
+
 def format_miscut_bucket(bucket: list[StoryLabel]) -> str:
     """The miscut bucket as text: each thread, then its stories with the reason,
     the opening words and the operator's note."""
@@ -766,12 +781,12 @@ def format_miscut_bucket(bucket: list[StoryLabel]) -> str:
     for label in bucket:
         if label.thread_id != thread:
             thread = label.thread_id
-            lines += ["", thread]
+            lines += ["", _printable(thread)]
         reason = MISCUT_REASON_TEXT[label.miscut_reason].split(":")[0]
-        opening = truncate(" ".join(label.text.split()), 70)
+        opening = truncate(_printable(" ".join(label.text.split())), 70)
         lines.append(f"  {reason}: {opening}")
         if label.note:
-            lines.append(f"    note: {label.note}")
+            lines.append(f"    note: {_printable(label.note)}")
     return "\n".join(lines)
 
 
