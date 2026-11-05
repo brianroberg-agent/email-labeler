@@ -1245,8 +1245,11 @@ def _scores(simple, concrete, personal, dynamic):
 
 
 def _themed(story_id, expected, predicted):
+    """A row whose theme reply is the well-formed one that parses to *predicted*."""
     row = _pred(story_id=story_id, expected_themes=expected, predicted_themes=predicted)
-    row.themes_raw = "raw"
+    row.themes_raw = "\n".join(
+        f"{theme.upper()}: {predicted.get(theme, 'absent').upper()}" for theme in THEMES
+    )
     return row
 
 
@@ -1261,23 +1264,53 @@ class TestDimensionDirection:
             _pred("c", expected_scores=_scores(2, 2, 2, 2), predicted_scores=None),  # parse failure
         ]
 
-    def test_counts_how_often_the_model_graded_higher_and_lower(self):
+    def test_too_high_is_measured_over_the_labels_that_could_be_graded_higher(self):
+        simple = compute_dimension_direction(self._rows())["simple"]
+        assert (simple["n"], simple["over_count"], simple["over_of"]) == (2, 2, 2)
+        assert simple["over"] == 1.0
+        assert simple["signed"] == 1.5
+
+    def test_too_low_is_measured_over_the_labels_that_could_be_graded_lower(self):
         direction = compute_dimension_direction(self._rows())
-        assert direction["simple"] == {"n": 2, "over": 1.0, "under": 0.0, "signed": 1.5}
-        assert direction["concrete"] == {"n": 2, "over": 0.0, "under": 0.0, "signed": 0.0}
-        assert direction["personal"] == {"n": 2, "over": 0.0, "under": 0.5, "signed": -0.5}
+        # simple's labels are OK and Poor: only the OK can be graded lower.
+        assert (direction["simple"]["under_count"], direction["simple"]["under_of"]) == (0, 1)
+        personal = direction["personal"]
+        assert (personal["under_count"], personal["under_of"], personal["under"]) == (1, 2, 0.5)
+        # personal's labels are OK and Good: a Good cannot be over-graded.
+        assert (personal["over_count"], personal["over_of"]) == (0, 1)
+
+    def test_a_good_label_is_never_counted_as_a_chance_to_over_grade(self):
+        rows = [_pred("a", expected_scores=_scores(3, 3, 3, 3), predicted_scores=_scores(3, 3, 3, 3))]
+        simple = compute_dimension_direction(rows)["simple"]
+        assert (simple["over_of"], simple["over"]) == (0, None)
+        assert (simple["under_of"], simple["under"]) == (1, 0.0)
+
+    def test_a_wrong_good_is_counted_apart_from_other_over_grades(self):
+        # The rubric's worst error is GOOD for a story that has not earned it;
+        # OK for a Poor story is its cheapest. One pooled rate hides the difference.
+        rows = [
+            _pred("a", expected_scores=_scores(1, 2, 2, 2), predicted_scores=_scores(2, 3, 2, 2)),
+        ]
+        direction = compute_dimension_direction(rows)
+        assert direction["simple"]["over_count"] == 1
+        assert direction["simple"]["wrong_good"] == 0
+        assert direction["concrete"]["wrong_good"] == 1
+        assert direction["all"]["wrong_good"] == 1
+        assert direction["all"]["wrong_good_rate"] == pytest.approx(1 / 4)
 
     def test_all_pools_every_dimension_judgment(self):
-        direction = compute_dimension_direction(self._rows())
-        assert direction["all"]["n"] == 8
-        assert direction["all"]["over"] == pytest.approx(2 / 8)
-        assert direction["all"]["under"] == pytest.approx(1 / 8)
-        assert direction["all"]["signed"] == pytest.approx((1 + 2 - 1) / 8)
+        direction = compute_dimension_direction(self._rows())["all"]
+        assert direction["n"] == 8
+        assert (direction["over_count"], direction["over_of"]) == (2, 7)
+        assert (direction["under_count"], direction["under_of"]) == (1, 7)
+        assert direction["signed"] == pytest.approx((1 + 2 - 1) / 8)
 
     def test_no_scored_stories_is_not_a_rate_of_zero(self):
         direction = compute_dimension_direction([])
-        assert direction["simple"] == {"n": 0, "over": None, "under": None, "signed": None}
-        assert direction["all"]["over"] is None
+        assert direction["simple"]["n"] == 0
+        assert direction["simple"]["over"] is None and direction["simple"]["under"] is None
+        assert direction["simple"]["signed"] is None
+        assert direction["all"]["wrong_good_rate"] is None
 
 
 class TestThemeDirection:
@@ -1290,29 +1323,40 @@ class TestThemeDirection:
             _pred("d", expected_themes={"scripture": "present"}),  # theme call never ran
         ]
 
-    def test_counts_theme_grades_that_came_out_higher_and_lower(self):
+    def test_rates_are_over_the_labels_that_could_move_that_way(self):
         direction = compute_theme_direction(self._rows(), THEMES)
         scripture = direction["scripture"]
         assert scripture["n"] == 3
-        assert scripture["over"] == pytest.approx(2 / 3)
-        assert scripture["under"] == pytest.approx(1 / 3)
+        assert (scripture["over_count"], scripture["over_of"], scripture["over"]) == (2, 2, 1.0)
+        assert (scripture["under_count"], scripture["under_of"], scripture["under"]) == (1, 2, 0.5)
         church = direction["church"]
-        assert (church["over"], church["under"]) == (pytest.approx(1 / 3), pytest.approx(1 / 3))
+        assert (church["over_count"], church["over_of"]) == (1, 2)
+        assert (church["under_count"], church["under_of"]) == (1, 1)
 
-    def test_names_the_wrong_emphasized_labels_by_what_the_story_deserved(self):
+    def test_missing_every_labeled_theme_reads_as_always_too_low(self):
+        # Ten stories, two labeled scripture=emphasized, the model finds no
+        # theme anywhere. Measured over all cells that would read as 4%.
+        rows = [_themed(f"s{i}", {"scripture": "emphasized"} if i < 2 else {}, {})
+                for i in range(10)]
+        direction = compute_theme_direction(rows, THEMES)
+        assert direction["scripture"]["under"] == 1.0
+        assert (direction["all"]["under_count"], direction["all"]["under_of"]) == (2, 2)
+        assert direction["all"]["under"] == 1.0
+
+    def test_wrong_emphasized_grades_come_with_how_many_stories_could_have_one(self):
         # EMPHASIZED is what earns a Gmail label (D14), so a wrong one is split
-        # by the true grade: merely Present, or Absent.
-        direction = compute_theme_direction(self._rows(), THEMES)
-        assert direction["scripture"]["emphasized_for_present"] == 1
-        assert direction["scripture"]["emphasized_for_absent"] == 1
-        assert direction["scripture"]["present_for_emphasized"] == 1
-        assert direction["church"]["absent_for_emphasized"] == 1
+        # by the true grade, each against the number of stories so labeled.
+        scripture = compute_theme_direction(self._rows(), THEMES)["scripture"]
+        assert (scripture["emphasized_for_present"], scripture["present_labeled"]) == (1, 1)
+        assert (scripture["emphasized_for_absent"], scripture["absent_labeled"]) == (1, 1)
+        church = compute_theme_direction(self._rows(), THEMES)["church"]
+        assert (church["emphasized_for_absent"], church["absent_labeled"]) == (0, 2)
 
     def test_all_pools_every_theme_judgment(self):
-        direction = compute_theme_direction(self._rows(), THEMES)
-        assert direction["all"]["n"] == 3 * len(THEMES)
-        assert direction["all"]["over"] == pytest.approx(3 / 15)
-        assert direction["all"]["under"] == pytest.approx(2 / 15)
+        direction = compute_theme_direction(self._rows(), THEMES)["all"]
+        assert direction["n"] == 3 * len(THEMES)
+        assert (direction["over_count"], direction["over_of"]) == (3, 13)
+        assert (direction["under_count"], direction["under_of"]) == (2, 3)
 
     def test_no_scored_stories_is_not_a_rate_of_zero(self):
         direction = compute_theme_direction([], THEMES)
@@ -1330,7 +1374,7 @@ class TestDirectionInReports:
             _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(3, 2, 3, 2)),
         ]
         for row in rows:
-            row.themes_raw = "raw"
+            row.themes_raw = "SCRIPTURE: ABSENT"
         return rows
 
     def test_metrics_bundle_carries_both_directions(self):
@@ -1338,17 +1382,20 @@ class TestDirectionInReports:
         assert metrics["dimension_direction"]["simple"]["over"] == 1.0
         assert metrics["theme_direction"]["scripture"]["emphasized_for_present"] == 1
 
-    def test_single_run_report_shows_too_high_and_too_low_with_n(self, capsys):
+    def test_single_run_report_shows_counts_with_their_denominators(self, capsys):
         rows = self._rows()
         print_report(_meta(mode="all", story_count=2), compute_all_metrics(rows, []),
                      story_results=rows)
         out = capsys.readouterr().out
-        assert "--- Grading direction" in out
-        assert "Too high" in out and "Too low" in out
-        simple = next(line for line in out.splitlines() if line.strip().startswith("simple")
-                      and "100.0%" in line)
-        assert " 2 " in f" {simple} "  # n beside the figure
-        assert "Emph. for Present" in out
+        direction = out[out.index("--- Grading direction"):]
+        assert "Too high" in direction and "Too low" in direction and "Wrong GOOD" in direction
+        simple = next(line for line in direction.splitlines()
+                      if line.strip().startswith("simple"))
+        assert "2/2 (100.0%)" in simple   # too high
+        assert "0/1 (0.0%)" in simple     # too low: only one label could be graded lower
+        scripture = next(line for line in direction.splitlines()
+                         if line.strip().startswith("scripture"))
+        assert "1/1" in scripture         # Emphasized given to the one Present-labeled story
 
     def test_single_run_report_prints_na_when_nothing_was_scored(self, capsys):
         rows = [_pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=None)]
@@ -1359,8 +1406,7 @@ class TestDirectionInReports:
                       if line.strip().startswith("simple"))
         assert "N/A" in simple and "%" not in simple
 
-    def test_comparison_shows_whether_over_grading_fell(self, capsys):
-        before = self._rows()
+    def _after(self):
         after = [
             _pred("a", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(2, 2, 1, 2),
                   expected_themes={"scripture": "present"},
@@ -1368,18 +1414,65 @@ class TestDirectionInReports:
             _pred("b", expected_scores=_scores(1, 2, 3, 2), predicted_scores=_scores(2, 2, 3, 2)),
         ]
         for row in after:
-            row.themes_raw = "raw"
+            row.themes_raw = "SCRIPTURE: PRESENT"
+        return after
+
+    def test_comparison_shows_whether_over_grading_fell(self, capsys):
+        before, after = self._rows(), self._after()
         print_comparison(
             _meta(tag="before", newsletter_model="model-a"), compute_all_metrics(before, []),
             _meta(tag="after", newsletter_model="model-b"), compute_all_metrics(after, []),
+            story1=before, story2=after,
         )
         out = capsys.readouterr().out
-        assert "Graded too high (lower=better)" in out
-        simple = next(line for line in out[out.index("Graded too high"):].splitlines()
-                      if line.strip().startswith("simple"))
+        too_high = out[out.index("Graded too high (lower=better)"):]
+        simple = next(line for line in too_high.splitlines() if line.strip().startswith("simple"))
         assert "100.0%" in simple and "50.0%" in simple and "(improved)" in simple
+        assert "wrong GOOD" in too_high
+        assert "Emph. for Present" in too_high
         assert "Graded too low (lower=better)" in out
         assert "model=model-a" in out and "model=model-b" in out
+        assert "WARNING: the two runs scored different stories" not in out
+
+    def test_comparison_warns_when_the_runs_scored_different_stories(self, capsys):
+        # newsletter_run reads the story-label log by default, so a run taken
+        # after more labeling scores more stories than the one before it.
+        before = self._rows()
+        after = self._after() + [
+            _pred("new", expected_scores=_scores(2, 2, 2, 2), predicted_scores=_scores(2, 2, 2, 2)),
+        ]
+        print_comparison(
+            _meta(tag="before", story_count=2), compute_all_metrics(before, []),
+            _meta(tag="after", story_count=3, story_label_count=1), compute_all_metrics(after, []),
+            story1=before, story2=after,
+        )
+        out = capsys.readouterr().out
+        assert "WARNING: the two runs scored different stories" in out
+        assert "2 in common" in out
+        assert "stories=2" in out and "stories=3 (1 from the story-label log)" in out
+
+
+class TestThemeDirectionSkipsUnreadableReplies:
+    def test_a_reply_the_parser_could_not_read_is_not_counted_as_too_low(self):
+        # "DISCIPLE-MAKING: EMPHASIZED" is a near-miss line parse_themes skips.
+        # That is a parser gap, reported under Parse anomalies, not the model
+        # grading the theme Absent.
+        unreadable = _pred("a", expected_themes={"disciple_making": "emphasized"})
+        unreadable.themes_raw = "DISCIPLE-MAKING: EMPHASIZED"
+        read = _themed("b", {"disciple_making": "emphasized"}, {"disciple_making": "emphasized"})
+        read.themes_raw = "DISCIPLE_MAKING: EMPHASIZED"
+        direction = compute_theme_direction([unreadable, read], THEMES)
+        assert direction["disciple_making"]["n"] == 1
+        assert direction["disciple_making"]["under_count"] == 0
+        assert direction["all"]["unreadable"] == 1
+
+    def test_the_report_says_how_many_replies_were_left_out(self, capsys):
+        unreadable = _pred("a", expected_themes={"disciple_making": "emphasized"})
+        unreadable.themes_raw = "DISCIPLE-MAKING: EMPHASIZED"
+        print_report(_meta(mode="themes"), compute_all_metrics([unreadable], [], mode="themes"),
+                     story_results=[unreadable])
+        out = capsys.readouterr().out
+        assert "1 story left out of the theme rows" in out
 
 
 class TestFormatRateDelta:

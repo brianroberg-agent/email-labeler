@@ -468,12 +468,24 @@ and exit code 1 (all three modes) — and when the offending path is a
 **Grading direction.** Agreement metrics (MAE, exact match, F1) do not say which
 way the model disagrees with the labels, and the rubric ranks over-grading as
 the costliest error. The single-run report therefore prints, per dimension and
-per theme, how often the model graded **too high** and **too low** (with `n`
-beside each, and `N/A` where nothing was scored), the signed mean error per
-dimension, and for themes how many wrong EMPHASIZED grades were given to a story
-labeled Present or Absent (issue #55). `--compare` shows the too-high and
-too-low rates of both runs side by side, lower being better, and names each
-run's model.
+per theme, how often the model graded **too high** and **too low**.
+
+- Each figure is a count over the labels it could apply to: a label already at
+  the top of its scale cannot be graded too high, nor one at the bottom too
+  low, so those are not in the denominator. `N/A` means nothing could count.
+- Dimensions also show **Wrong GOOD** (GOOD given where the label was lower,
+  the error the rubric ranks worst) and the signed mean error.
+- Themes also show wrong EMPHASIZED grades split by the label (Present or
+  Absent), each over the number of stories so labeled (issue #55).
+- A story whose theme reply the parser could not fully read is left out of the
+  theme rows and counted in a line beneath them; it is listed under Parse
+  anomalies, not scored as the model grading a theme Absent.
+
+`--compare` shows the too-high and too-low rates of both runs, lower being
+better, with the wrong-GOOD and wrong-EMPHASIZED rates and the denominators.
+Its header names each run's model and story count, and it warns when the two
+runs did not score the same stories, since `newsletter_run` picks up newly
+graded stories by default and a delta then mixes the two changes.
 
 ### Newsletter shared cache & prompt separation
 
