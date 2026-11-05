@@ -804,15 +804,24 @@ async def main(args: argparse.Namespace) -> None:
 
     parallelism = args.parallelism if args.parallelism is not None else 1
 
-    # Load the curated golden set. A missing file is only fatal if nothing else
-    # can be scored: the story-label log is a grading golden set by itself.
+    # Load the curated golden set. Running without one is allowed (the
+    # story-label log is a grading golden set by itself) but has to be asked
+    # for with "--golden-set none": a missing file stays an error, so a
+    # mistyped path cannot quietly become a paid run over the label log alone.
+    no_curated_set = args.golden_set == "none"
     golden_path = Path(args.golden_set)
-    try:
-        golden_set, load_stats = load_golden_set(
-            golden_path, reviewed_only=not args.include_unreviewed
-        )
-    except FileNotFoundError:
+    if no_curated_set:
         golden_set, load_stats = [], None
+    else:
+        try:
+            golden_set, load_stats = load_golden_set(
+                golden_path, reviewed_only=not args.include_unreviewed
+            )
+        except FileNotFoundError:
+            print(f"Error: golden set file not found: {golden_path}\n"
+                  "(to score the story-label log alone, pass --golden-set none)",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # Stories graded in newsletter_grade (the story-label log) join the story
     # modes. Absent flag (older callers) or a missing file means none.
@@ -830,11 +839,16 @@ async def main(args: argparse.Namespace) -> None:
             print(f"Error: cannot read the story-label log: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    if load_stats is None:
-        if not extra_stories:
-            print(f"Error: golden set file not found: {golden_path}", file=sys.stderr)
+    if no_curated_set:
+        if args.mode == "extraction":
+            print("Error: extraction is scored against the curated golden set; "
+                  "it cannot run with --golden-set none.", file=sys.stderr)
             sys.exit(1)
-        print(f"No curated golden set at {golden_path}: scoring the story-label log only.",
+        if not extra_stories:
+            print("Error: nothing to score: --golden-set none and no graded stories "
+                  f"in the story-label log ({labels_path}).", file=sys.stderr)
+            sys.exit(1)
+        print("No curated golden set (--golden-set none): scoring the story-label log only.",
               file=sys.stderr)
     else:
         print(format_load_summary(len(golden_set), load_stats, golden_path), file=sys.stderr)
@@ -929,7 +943,8 @@ async def main(args: argparse.Namespace) -> None:
 def cli():
     parser = argparse.ArgumentParser(description="Run newsletter classification evaluation")
     parser.add_argument("--golden-set", default="evals/newsletter_golden_set.jsonl",
-                        help="Path to newsletter golden set JSONL")
+                        help="Path to newsletter golden set JSONL, or 'none' to score "
+                             "only the story-label log (quality/themes modes)")
     parser.add_argument("--story-labels", default="evals/newsletter_story_labels.jsonl",
                         help="Story-label log from newsletter_grade; its graded stories are "
                              "scored in the quality/themes modes (a missing file means none)")
