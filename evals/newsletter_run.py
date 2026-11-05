@@ -804,25 +804,20 @@ async def main(args: argparse.Namespace) -> None:
 
     parallelism = args.parallelism if args.parallelism is not None else 1
 
-    # Load golden set
+    # Load the curated golden set. A missing file is only fatal if nothing else
+    # can be scored: the story-label log is a grading golden set by itself.
     golden_path = Path(args.golden_set)
     try:
         golden_set, load_stats = load_golden_set(
             golden_path, reviewed_only=not args.include_unreviewed
         )
     except FileNotFoundError:
-        print(f"Error: golden set file not found: {golden_path}", file=sys.stderr)
-        sys.exit(1)
-    print(format_load_summary(len(golden_set), load_stats, golden_path), file=sys.stderr)
-    if not golden_set:
-        sys.exit(1)
-    unreviewed_note = format_unreviewed_note(golden_set, args.mode)
-    if unreviewed_note:
-        print(unreviewed_note, file=sys.stderr)
+        golden_set, load_stats = [], None
 
     # Stories graded in newsletter_grade (the story-label log) join the story
     # modes. Absent flag (older callers) or a missing file means none.
     extra_stories: list = []
+    label_stats: dict = {}
     labels_path = getattr(args, "story_labels", None)
     if labels_path and args.mode != "extraction":
         try:
@@ -832,8 +827,22 @@ async def main(args: argparse.Namespace) -> None:
         except ValueError as exc:
             print(f"Error: cannot read the story-label log: {exc}", file=sys.stderr)
             sys.exit(1)
-        if any(label_stats.values()):
-            print(format_story_label_summary(label_stats, labels_path), file=sys.stderr)
+
+    if load_stats is None:
+        if not extra_stories:
+            print(f"Error: golden set file not found: {golden_path}", file=sys.stderr)
+            sys.exit(1)
+        print(f"No curated golden set at {golden_path}: scoring the story-label log only.",
+              file=sys.stderr)
+    else:
+        print(format_load_summary(len(golden_set), load_stats, golden_path), file=sys.stderr)
+        if not golden_set and not extra_stories:
+            sys.exit(1)
+    if any(label_stats.values()):
+        print(format_story_label_summary(label_stats, labels_path), file=sys.stderr)
+    unreviewed_note = format_unreviewed_note(golden_set, args.mode)
+    if unreviewed_note:
+        print(unreviewed_note, file=sys.stderr)
 
     classifier, llm = build_classifier(config, args.no_cache)
 

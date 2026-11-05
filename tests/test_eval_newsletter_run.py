@@ -1442,3 +1442,64 @@ class TestMainStoryLabels:
         )))
         meta = _read_meta(out)
         assert (meta["story_count"], meta["story_label_count"]) == (1, 0)
+
+
+class TestMainLabelLogAlone:
+    """The label log is a grading golden set by itself: a machine that has only
+    graded ready-made stories, with no curated newsletters, can still be scored."""
+
+    def _patch(self, monkeypatch):
+        def fake_build(config, no_cache):
+            llm = FakeLLM([("story", "SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: OK\nDYNAMIC: OK", "q")])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+
+    def test_quality_runs_on_the_label_log_when_there_is_no_curated_set(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        self._patch(monkeypatch)
+        labels = tmp_path / "labels.jsonl"
+        append_label(labels, _label("labeled story one"))
+        out = tmp_path / "results"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(tmp_path / "absent.jsonl"), output_dir=str(out), mode="quality",
+            story_labels=str(labels),
+        )))
+        meta = _read_meta(out)
+        assert (meta["golden_set_count"], meta["story_count"], meta["story_label_count"]) == (0, 1, 1)
+        assert "scoring the story-label log only" in capsys.readouterr().err
+
+    def test_an_empty_curated_set_does_not_block_the_label_log(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter("nl1", reviewed=False)])
+        labels = tmp_path / "labels.jsonl"
+        append_label(labels, _label("labeled story one"))
+        out = tmp_path / "results"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="themes", story_labels=str(labels),
+        )))
+        assert _read_meta(out)["story_label_count"] == 1
+
+    def test_no_curated_set_and_no_graded_labels_still_exits_1(self, tmp_path, monkeypatch, capsys):
+        self._patch(monkeypatch)
+        labels = tmp_path / "labels.jsonl"
+        append_label(labels, _label("a miscut story", status="miscut"))
+        with pytest.raises(SystemExit) as exit_info:
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(tmp_path / "absent.jsonl"), output_dir=str(tmp_path / "r"),
+                mode="quality", story_labels=str(labels),
+            )))
+        assert exit_info.value.code == 1
+        assert "golden set file not found" in capsys.readouterr().err
+
+    def test_extraction_still_needs_the_curated_set(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+        labels = tmp_path / "labels.jsonl"
+        append_label(labels, _label("labeled story one"))
+        with pytest.raises(SystemExit) as exit_info:
+            asyncio.run(newsletter_run.main(_main_args(
+                golden_set=str(tmp_path / "absent.jsonl"), output_dir=str(tmp_path / "r"),
+                mode="extraction", story_labels=str(labels),
+            )))
+        assert exit_info.value.code == 1
