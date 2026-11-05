@@ -3826,36 +3826,23 @@ class TestLoadConfig:
         ("quality_assessment",
          "When torn between two grades, give the lower grade"
          " and say why inside your <think> reasoning, not in the answer lines."),
-        # Review finding F4: for themes the rule is scoped to the boundary the
-        # owner ruled on. ABSENT is stored by omission, so grading a torn
-        # ABSENT/PRESENT down would erase the "you touched it" coaching hook
-        # and leave no trace; that boundary stays with "Do not force a match".
         ("theme_classification",
          "When torn between PRESENT and EMPHASIZED, give PRESENT"
          " and say why inside your <think> reasoning, not in the answer lines."),
     ])
     def test_config_grading_prompts_carry_the_grade_down_rule(self, prompt, rule):
-        # docs/newsletter-rubric.md §1, Decided 2026-09-09: "When torn, grade
-        # down and say why." Over-grading is the costliest error (a GOOD or an
-        # EMPHASIZED the story has not earned mis-teaches), so both grading
-        # prompts state the rule. D23: the rubric is the spec and the prompt is
-        # what changes — this pins the prompt to the ruling.
+        # The rubric's grade-down rule: docs/newsletter-rubric.md §1, and its §8
+        # entry of 2026-11-05 for why each prompt words it the way it does.
         config = load_config()
         system = config["newsletter"]["prompts"][prompt]["system"]
         assert rule in system
-        # Review findings F1/F2/F8: parse_quality_scores takes the FIRST
-        # "DIM: GRADE" in the reply and parse_themes the LAST per theme, so an
-        # explanation written among the answer lines ("Torn on CHURCH:
-        # EMPHASIZED vs PRESENT") can be read as the grade. The rule therefore
-        # names where the why goes, and sits before the format instruction so
-        # the exact-format block stays the last thing the model is told.
+        # Stated once, before the format instruction. A second "torn" sentence
+        # (a wider rule, or a request to explain after the answers) changes the
+        # rule rather than rewording it, and must come with a rubric change.
+        assert system.lower().count("torn") == 1
         assert system.index(rule) < system.index("exact format")
-        # Review finding F7: the rubric's rationale ("coachable", "invisible as
-        # an error") is written for a human reader. The prompts never say the
-        # grades are for coaching, so the model has no referent for it and may
-        # read it as a general push toward low grades. The rule alone ships.
+        # The rubric's rationale sentence is for its human readers.
         assert "coachable" not in system
-        assert "invisible as an error" not in system
 
 
 class TestResolveIntEnv:
