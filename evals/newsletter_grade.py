@@ -30,6 +30,7 @@ from textual.widgets import Input, Static
 
 from config_utils import substitute_env_vars
 from daemon import load_config
+from evals.newsletter_report import THEMES as _REPORT_THEMES
 from evals.newsletter_schemas import MISCUT_REASONS, StoryLabel
 from newsletter import _DIMENSIONS, _VALID_THEMES
 from newsletter_review.tui import load_assessments
@@ -297,9 +298,11 @@ def miscut_bucket(labels: dict[str, StoryLabel]) -> list[StoryLabel]:
     return sorted(waiting, key=lambda label: (label.thread_id, label.labeled_at, label.story_key))
 
 
-# The nine judgments asked about a story, in order: the four dimensions, then
-# the five themes in the order the theme prompt lists them.
-THEMES = ("scripture", "christlikeness", "church", "vocation_family", "disciple_making")
+# The judgments asked about a story, in order: the four dimensions, then the
+# themes. The theme list is the report's (itself derived from
+# newsletter._VALID_THEMES, in the theme prompt's order), so a theme added
+# there is asked about here.
+THEMES = tuple(_REPORT_THEMES)
 QUESTIONS = tuple(_DIMENSIONS) + THEMES
 
 

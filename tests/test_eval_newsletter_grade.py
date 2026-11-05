@@ -457,6 +457,16 @@ class TestCard:
             "scripture", "christlikeness", "church", "vocation_family", "disciple_making",
         )
 
+    def test_the_themes_asked_are_the_report_s_themes(self):
+        # One theme list: a theme added to newsletter._VALID_THEMES must be
+        # asked about here, or every later label would store it as Absent by
+        # omission and the eval would score that as ground truth.
+        from evals import newsletter_grade, newsletter_report
+        from newsletter import _VALID_THEMES
+        assert newsletter_grade.THEMES == tuple(newsletter_report.THEMES)
+        assert set(newsletter_grade.THEMES) == {name.lower() for name in _VALID_THEMES}
+        assert QUESTIONS[4:] == newsletter_grade.THEMES
+
     def test_a_new_card_asks_the_first_dimension(self):
         assert current_question(_card()) == "simple"
 
