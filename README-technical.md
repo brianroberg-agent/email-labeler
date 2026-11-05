@@ -552,6 +552,7 @@ Conventions shared by every TUI:
 | `test_config_utils.py` | `config_utils.py` | Config loading, `{env.VAR}` substitution |
 | `test_env_var_docs.py` | env-var docs (meta-test) | Every env var referenced by daemon sources or `config.toml` `{env.VAR}` is documented in this file's Environment Variables table |
 | `test_env_example_docs.py` | `.env.example` (meta-test) | Every var the example declares is documented in the env table; every Required var has an active line in the example |
+| `test_gitignore_eval_data.py` | `.gitignore` (meta-test) | Each default eval/labeling data path that holds real email content (email and newsletter golden sets, results, LLM cache, assessments, story labels) is ignored, checked with `git check-ignore` |
 | `test_newsletter.py` | `newsletter.py` | Newsletter story extraction, quality scoring, theme classification, assessment record writing (incl. the `schema_version` stamp), sink persistence/writability diagnostics, and the Rule-1 raises that keep `no-stories` to a successful zero-story extraction (unparseable extraction reply; every story failing to grade — decisions D5/D20) |
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication and pre-fetch skip of known threads, Gmail query building (`--label`/`--gmail-label` resolution, quoting, ordering, validation), append-only writes, `main()` wiring |

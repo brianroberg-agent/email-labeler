@@ -27,5 +27,10 @@ evals/golden_set.jsonl
 evals/results/*.jsonl
 evals/cache/
 newsletter_assessments.jsonl
+# Newsletter eval data: golden records hold full newsletter bodies, results and
+# labels hold story texts (guarded by tests/test_gitignore_eval_data.py)
+evals/newsletter_golden_set.jsonl
+evals/newsletter_results/
+evals/newsletter_story_labels.jsonl
 email-labeler-2.log
 email-labeler.log
