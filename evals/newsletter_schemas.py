@@ -183,35 +183,73 @@ class StoryLabel:
 
     @classmethod
     def from_dict(cls, d: dict) -> "StoryLabel":
+        """Build a label from one decoded log line, validating all of it.
+
+        Every problem is a ValueError that names the field, so the reader can
+        report the file and line: the log is merged by hand, and a malformed
+        line must not surface later as a crash or as a silently wrong score.
+        """
+        if not isinstance(d, dict):
+            raise ValueError("a story-label line must be a JSON object")
+        missing = [name for name in ("story_key", "thread_id", "text", "status") if name not in d]
+        if missing:
+            raise ValueError(f"story label is missing {', '.join(missing)}")
         key = d["story_key"]
+
+        def text_field(name: str, default: str = "", required: bool = False) -> str:
+            value = d.get(name, default)
+            if not isinstance(value, str) or (required and not value.strip()):
+                kind = "a non-empty string" if required else "a string"
+                raise ValueError(f"story label {key!r}: {name} must be {kind}, got {value!r}")
+            return value
+
+        text_field("story_key", required=True)
+        thread_id = text_field("thread_id")
+        text = text_field("text", required=True)
         status = d["status"]
         if status not in STORY_LABEL_STATUSES:
             raise ValueError(
                 f"story label {key!r}: status {status!r} is not one of "
                 f"{', '.join(STORY_LABEL_STATUSES)}"
             )
-        scores = _coerce_scores(d.get("scores"), story_id=key, field_name="scores")
-        themes = _coerce_themes(d.get("themes"), story_id=key, field_name="themes")
+        raw_scores = d.get("scores")
+        if raw_scores is not None and not isinstance(raw_scores, dict):
+            raise ValueError(f"scores for story {key!r} must be a mapping, got {raw_scores!r}")
+        scores = _coerce_scores(raw_scores, story_id=key, field_name="scores")
+        raw_themes = d.get("themes")
+        if raw_themes is not None and not isinstance(raw_themes, (dict, list)):
+            raise ValueError(f"themes for story {key!r} must be a mapping, got {raw_themes!r}")
+        themes = _coerce_themes(raw_themes, story_id=key, field_name="themes")
         unknown = sorted(set(themes) - _THEME_NAMES)
         if unknown:
             raise ValueError(
                 f"themes for story {key!r}: unknown theme name(s) {', '.join(unknown)}; "
                 f"expected only {', '.join(sorted(_THEME_NAMES))}"
             )
-        torn = list(d.get("torn") or [])
-        stray = sorted(set(torn) - _THEME_NAMES - set(_DIMENSIONS))
+        torn = d.get("torn") or []
+        if not isinstance(torn, list):
+            raise ValueError(f"torn for story {key!r} must be a list, got {torn!r}")
+        stray = sorted({str(name) for name in torn} - _THEME_NAMES - set(_DIMENSIONS))
         if stray:
             raise ValueError(
                 f"torn for story {key!r}: {', '.join(stray)} is not a dimension or a theme"
             )
-        reason = d.get("miscut_reason", "")
+        seconds = d.get("seconds")
+        if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, (int, float))):
+            raise ValueError(f"story label {key!r}: seconds must be a number, got {seconds!r}")
+        reason = text_field("miscut_reason")
         if status == "graded":
             if scores is None:
                 raise ValueError(f"story label {key!r}: a graded label needs scores")
-            missing = [dim for dim in _DIMENSIONS if dim not in scores]
-            if missing:
+            missing_dims = [dim for dim in _DIMENSIONS if dim not in scores]
+            if missing_dims:
                 raise ValueError(
-                    f"scores for story {key!r}: missing dimension(s) {', '.join(missing)}"
+                    f"scores for story {key!r}: missing dimension(s) {', '.join(missing_dims)}"
+                )
+            extra = sorted(set(scores) - set(_DIMENSIONS))
+            if extra:
+                raise ValueError(
+                    f"scores for story {key!r}: {', '.join(extra)} is not a dimension"
                 )
         else:
             if reason not in MISCUT_REASONS:
@@ -225,18 +263,18 @@ class StoryLabel:
                 )
         return cls(
             story_key=key,
-            thread_id=d["thread_id"],
-            text=d["text"],
+            thread_id=thread_id,
+            text=text,
             status=status,
             scores=scores,
             themes=themes,
-            torn=torn,
-            note=d.get("note", ""),
+            torn=list(torn),
+            note=text_field("note"),
             miscut_reason=reason,
-            recut_of=d.get("recut_of", ""),
-            labeled_at=d.get("labeled_at", ""),
-            seconds=d.get("seconds"),
-            source_timestamp=d.get("source_timestamp", ""),
+            recut_of=text_field("recut_of"),
+            labeled_at=text_field("labeled_at"),
+            seconds=seconds,
+            source_timestamp=text_field("source_timestamp"),
         )
 
     def to_golden_story(self) -> "GoldenStory":

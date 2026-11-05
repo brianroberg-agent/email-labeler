@@ -583,3 +583,39 @@ class TestStoryLabel:
             status="miscut", scores=None, themes={}, torn=[], miscut_reason="not_a_story"))
         with pytest.raises(ValueError, match="miscut"):
             label.to_golden_story()
+
+
+class TestStoryLabelRejectsMalformedLines:
+    """The log is merged across machines by hand. A malformed line must fail
+    as a located ValueError at load, never later as a crash or a wrong score."""
+
+    @pytest.mark.parametrize("field, value", [
+        ("text", None), ("text", ""), ("text", 7),
+        ("story_key", ""), ("story_key", None),
+        ("thread_id", None), ("thread_id", 12),
+        ("labeled_at", 1730000000),
+        ("note", ["a"]), ("recut_of", 3), ("source_timestamp", 5),
+        ("seconds", "soon"), ("seconds", True),
+        ("torn", "concrete"),
+    ])
+    def test_a_field_of_the_wrong_type_names_itself(self, field, value):
+        with pytest.raises(ValueError, match=field):
+            StoryLabel.from_dict(_graded_label(**{field: value}))
+
+    def test_scores_must_be_a_mapping(self):
+        with pytest.raises(ValueError, match="scores"):
+            StoryLabel.from_dict(_graded_label(scores=[1, 2, 3, 2]))
+
+    def test_an_unknown_score_key_is_rejected(self):
+        # An extra key would shift the tier's mean without anyone noticing.
+        with pytest.raises(ValueError, match="overall"):
+            StoryLabel.from_dict(_graded_label(
+                scores={"simple": 3, "concrete": 2, "personal": 2, "dynamic": 1, "overall": 3}))
+
+    def test_themes_must_be_a_mapping(self):
+        with pytest.raises(ValueError, match="themes"):
+            StoryLabel.from_dict(_graded_label(themes="scripture"))
+
+    def test_a_line_that_is_not_an_object_is_rejected(self):
+        with pytest.raises(ValueError, match="object"):
+            StoryLabel.from_dict(["not", "an", "object"])

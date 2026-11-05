@@ -171,6 +171,18 @@ class TestLabelLog:
         with pytest.raises(ValueError, match=r"labels\.jsonl:2"):
             read_label_log(path)
 
+    @pytest.mark.parametrize("line", [
+        '["a", "list"]', '"a string"', '{"story_key": "k"}',
+        '{"story_key": "k", "thread_id": "t", "text": "x", "status": "graded", "scores": [1, 2, 3, 2]}',
+    ])
+    def test_any_malformed_line_names_the_file_and_line(self, tmp_path, line):
+        path = tmp_path / "labels.jsonl"
+        append_label(path, _graded(STORY_A))
+        with open(path, "a") as f:
+            f.write(line + "\n")
+        with pytest.raises(ValueError, match=r"labels\.jsonl:2"):
+            read_label_log(path)
+
     def test_invalid_label_names_the_file_and_line(self, tmp_path):
         path = tmp_path / "labels.jsonl"
         bad = _graded(STORY_A).to_dict()

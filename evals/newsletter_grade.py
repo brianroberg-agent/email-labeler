@@ -131,7 +131,7 @@ def read_label_log(path: Path) -> list[StoryLabel]:
                 continue
             try:
                 labels.append(StoryLabel.from_dict(json.loads(line)))
-            except (ValueError, KeyError, TypeError) as exc:
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
                 raise ValueError(f"{path}:{lineno}: {exc}") from exc
     return labels
 
@@ -153,14 +153,6 @@ def append_label(path: Path, label: StoryLabel) -> None:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
-
-
-def _labeled_at(label: StoryLabel) -> datetime | None:
-    try:
-        stamp = datetime.fromisoformat(label.labeled_at or "")
-    except ValueError:
-        return None
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
 def _parse_time(value) -> datetime | None:
@@ -190,7 +182,7 @@ def latest_labels(labels: list[StoryLabel]) -> dict[str, StoryLabel]:
     for label in labels:
         kept = latest.get(label.story_key)
         if kept is not None:
-            new_at, kept_at = _labeled_at(label), _labeled_at(kept)
+            new_at, kept_at = _parse_time(label.labeled_at), _parse_time(kept.labeled_at)
             if new_at is not None and kept_at is not None and new_at < kept_at:
                 continue
         latest[label.story_key] = label
@@ -477,7 +469,7 @@ def count_labeled_on(labels: dict[str, StoryLabel], day, tz=None) -> int:
     (the local timezone when None)."""
     count = 0
     for label in labels.values():
-        stamp = _labeled_at(label)
+        stamp = _parse_time(label.labeled_at)
         if stamp is not None and stamp.astimezone(tz).date() == day:
             count += 1
     return count
