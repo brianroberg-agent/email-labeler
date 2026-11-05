@@ -3,8 +3,8 @@
     python .claude/skills/tui-regression/run_all.py [--emit DIR]
 
 Writes the synthetic data files (optionally to --emit DIR, else a temp dir) so
-the real ``load_*`` paths are exercised, then drives all four TUIs via Pilot
-with the model mocked. Prints a combined PASS/FAIL report and exits non-zero if
+the real ``load_*`` paths are exercised, then drives all five TUIs via Pilot
+(none of them calls a model). Prints a combined PASS/FAIL report and exits non-zero if
 any scenario fails — suitable for CI or a pre-merge gate.
 """
 
@@ -16,6 +16,7 @@ import tempfile
 # _e2e puts repo root + this dir on sys.path.
 import _e2e  # noqa: F401
 import drive_edit_tui
+import drive_newsletter_grade
 import drive_newsletter_label
 import drive_newsletter_review
 import drive_review
@@ -24,6 +25,7 @@ from _e2e import report, run_scenarios
 
 DRIVERS = [
     ("newsletter_label", drive_newsletter_label),
+    ("newsletter_grade", drive_newsletter_grade),
     ("review", drive_review),
     ("edit_tui", drive_edit_tui),
     ("newsletter_review", drive_newsletter_review),

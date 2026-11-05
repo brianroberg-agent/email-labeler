@@ -6,15 +6,17 @@ appends them.
 """
 
 import json
-from datetime import date, timezone
+from datetime import date, datetime, timezone
 
 import pytest
+from textual.widgets import Input, Static
 
 from daemon import load_config
 from evals.newsletter_grade import (
     QUESTIONS,
     Candidate,
     Card,
+    GradeApp,
     Rubric,
     answer,
     answer_rest_absent,
@@ -23,6 +25,7 @@ from evals.newsletter_grade import (
     back,
     build_queue,
     card_from_label,
+    cli,
     count_labeled_on,
     current_question,
     graded_label,
@@ -226,7 +229,8 @@ class TestBuildQueue:
         # subject may ride along into the queue.
         queue = build_queue([_assessment("t_900001", [STORY_A])], set(), {})
         dumped = json.dumps([vars(c) for c in queue])
-        for leaked in ("SENTINEL", "excellent", "emphasized", "scores", "cot"):
+        for leaked in ("SENTINEL", "excellent", "emphasized", "scores", "cot",
+                       "Synthetic Sender", "example.org"):
             assert leaked not in dumped
 
     def test_threads_in_the_curated_golden_set_are_left_out(self):
@@ -585,3 +589,351 @@ class TestCountLabeledOn:
             _graded("A fourth synthetic story.", labeled_at=""),
         ])
         assert count_labeled_on(labels, date(2026, 11, 5), tz=timezone.utc) == 2
+
+
+SIZE = (100, 30)
+LONG_STORY = "\n\n".join(
+    f"Paragraph {n} of a long synthetic story about a semester on campus." for n in range(1, 60)
+)
+
+
+def _candidates(*texts):
+    return [
+        Candidate(story_key=story_key(text), thread_id="t_900001", text=text,
+                  source_timestamp="2026-10-30T12:00:00+00:00")
+        for text in texts
+    ]
+
+
+class _Clock:
+    """A clock the test moves by hand, so ``seconds`` is exact."""
+
+    def __init__(self):
+        self.value = 100.0
+
+    def __call__(self):
+        return self.value
+
+
+def _app(tmp_path, *texts, clock=None, **kwargs):
+    return GradeApp(
+        _candidates(*texts), RUBRIC, tmp_path / "labels.jsonl",
+        clock=clock or _Clock(),
+        now=lambda: datetime(2026, 11, 5, 21, 0, tzinfo=timezone.utc),
+        **kwargs,
+    )
+
+
+def _text(app, selector):
+    return str(app.query_one(selector, Static).render())
+
+
+def _screen_text(app):
+    return "\n".join(str(widget.render()) for widget in app.query(Static))
+
+
+def _written(tmp_path):
+    return read_label_log(tmp_path / "labels.jsonl")
+
+
+class TestGradeScreen:
+    async def test_opens_on_the_first_story_with_its_first_question(self, tmp_path):
+        app = _app(tmp_path, STORY_A, STORY_B)
+        async with app.run_test(size=SIZE):
+            assert STORY_A in _text(app, "#story-text")
+            assert STORY_B not in _screen_text(app)
+            question = _text(app, "#question")
+            assert "SIMPLE" in question and "Q-SIMPLE?" in question
+            assert "ANCHOR-GOOD" in question
+
+    async def test_nine_answers_write_one_label_and_show_the_next_story(self, tmp_path):
+        clock = _Clock()
+        app = _app(tmp_path, STORY_A, STORY_B, clock=clock)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "2", "2", "1", "1", "3", "1", "1")
+            assert _written(tmp_path) == []
+            clock.value = 174.5
+            await pilot.press("1")
+            (label,) = _written(tmp_path)
+            assert label.status == "graded"
+            assert label.text == STORY_A
+            assert label.scores == {"simple": 3, "concrete": 2, "personal": 2, "dynamic": 1}
+            assert label.themes == {"christlikeness": "emphasized"}
+            assert label.labeled_at == "2026-11-05T21:00:00+00:00"
+            assert label.seconds == 74.5
+            assert STORY_B in _text(app, "#story-text")
+            assert "SIMPLE" in _text(app, "#question")
+
+    async def test_the_question_panel_follows_the_answers(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3")
+            assert "Q-CONCRETE?" in _text(app, "#question")
+            await pilot.press("2", "2", "1")
+            question = _text(app, "#question")
+            assert "DEF-SCRIPTURE" in question and "ANCHOR-EMPHASIZED" in question
+            assert "simple Good" in _text(app, "#strip")
+
+    async def test_zero_answers_absent_for_the_remaining_themes(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("0")  # a dimension is being asked: nothing happens
+            assert "SIMPLE" in _text(app, "#question")
+            await pilot.press("3", "3", "3", "3", "2", "0")
+            (label,) = _written(tmp_path)
+            assert label.themes == {"scripture": "present"}
+
+    async def test_the_story_scrolls_while_it_is_being_graded(self, tmp_path):
+        # Issue #54: scrolling must neither be blocked nor cancel the answers.
+        app = _app(tmp_path, LONG_STORY)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "2")
+            story = app.query_one("#story")
+            assert story.scroll_y == 0
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert story.scroll_y > 0
+            assert "PERSONAL" in _text(app, "#question")
+            await pilot.press("2")
+            assert "DYNAMIC" in _text(app, "#question")
+
+    async def test_a_new_story_starts_scrolled_to_its_top(self, tmp_path):
+        app = _app(tmp_path, LONG_STORY, STORY_B)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("pagedown")
+            await pilot.press("3", "3", "3", "3", "0")
+            await pilot.pause()
+            assert app.query_one("#story").scroll_y == 0
+
+    async def test_a_torn_card_asks_why_before_it_is_written(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "t")
+            assert "grade down and say why" in _text(app, "#question")
+            await pilot.press("2", "2", "1", "0")
+            assert _written(tmp_path) == []
+            note = app.query_one("#note", Input)
+            assert note.display and note.has_focus
+            note.value = "one named moment, the rest is summary"
+            await pilot.press("enter")
+            (label,) = _written(tmp_path)
+            assert label.torn == ["concrete"]
+            assert label.note == "one named moment, the rest is summary"
+
+    async def test_escape_from_the_why_returns_to_the_last_question(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("t", "3", "2", "2", "1", "0")
+            await pilot.press("escape")
+            assert _written(tmp_path) == []
+            assert not app.query_one("#note", Input).display
+            assert "DISCIPLE_MAKING" in _text(app, "#question")
+
+    async def test_backspace_takes_back_the_last_answer(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "2", "backspace")
+            assert "CONCRETE" in _text(app, "#question")
+            await pilot.press("backspace", "backspace")  # second one has nothing to undo
+            assert "SIMPLE" in _text(app, "#question")
+            assert STORY_A in _text(app, "#story-text")
+
+    async def test_backspace_at_a_story_start_reopens_the_previous_story(self, tmp_path):
+        app = _app(tmp_path, STORY_A, STORY_B)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "3", "3", "3", "1", "1", "1", "1", "3")
+            assert STORY_B in _text(app, "#story-text")
+            await pilot.press("backspace")
+            assert STORY_A in _text(app, "#story-text")
+            assert "DISCIPLE_MAKING" in _text(app, "#question")
+            await pilot.press("1")
+            assert STORY_B in _text(app, "#story-text")
+        lines = _written(tmp_path)
+        assert [line.text for line in lines] == [STORY_A, STORY_A]
+        assert latest_labels(lines)[story_key(STORY_A)].themes == {}
+
+    async def test_miscut_sets_the_story_aside_with_a_reason_and_note(self, tmp_path):
+        app = _app(tmp_path, STORY_A, STORY_B)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "x")
+            reasons = _text(app, "#question")
+            for expected in ("cut short", "runs past", "several stories", "not a story"):
+                assert expected in reasons
+            await pilot.press("1")
+            note = app.query_one("#note", Input)
+            assert note.has_focus
+            note.value = "the ending is in the next paragraph"
+            await pilot.press("enter")
+            (label,) = _written(tmp_path)
+            assert label.status == "miscut"
+            assert label.miscut_reason == "cut_short"
+            assert label.note == "the ending is in the next paragraph"
+            assert label.scores is None
+            assert STORY_B in _text(app, "#story-text")
+
+    async def test_miscut_needs_no_note(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("x", "4", "enter")
+            (label,) = _written(tmp_path)
+            assert (label.miscut_reason, label.note) == ("not_a_story", "")
+
+    async def test_escape_cancels_miscut_and_keeps_the_answers(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "2", "x", "escape")
+            assert "PERSONAL" in _text(app, "#question")
+            await pilot.press("x", "2", "escape")  # cancel at the note step too
+            assert "PERSONAL" in _text(app, "#question")
+            assert _written(tmp_path) == []
+
+    async def test_skip_moves_the_story_to_the_end_of_the_queue(self, tmp_path):
+        app = _app(tmp_path, STORY_A, STORY_B)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "s")
+            assert STORY_B in _text(app, "#story-text")
+            assert "SIMPLE" in _text(app, "#question")
+            await pilot.press("s")
+            assert STORY_A in _text(app, "#story-text")
+            assert "SIMPLE" in _text(app, "#question")  # the earlier answer is not kept
+            assert _written(tmp_path) == []
+
+    async def test_a_note_can_be_added_at_any_point_and_typing_does_not_answer(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "n")
+            await pilot.press("1", "2", "space", "x", "t")
+            assert app.query_one("#note", Input).value == "12 xt"
+            await pilot.press("enter")
+            assert "CONCRETE" in _text(app, "#question")
+            await pilot.press("2", "2", "1", "0")
+            (label,) = _written(tmp_path)
+            assert label.note == "12 xt"
+            assert label.torn == []
+
+    async def test_progress_counts_today_and_what_is_left(self, tmp_path):
+        app = _app(tmp_path, STORY_A, STORY_B, labeled_today=4)
+        async with app.run_test(size=SIZE) as pilot:
+            assert "4 labeled today" in _text(app, "#progress")
+            assert "2 queued" in _text(app, "#progress")
+            await pilot.press("3", "3", "3", "3", "0")
+            assert "5 labeled today" in _text(app, "#progress")
+            assert "1 queued" in _text(app, "#progress")
+
+    async def test_an_empty_queue_says_so_and_ignores_grading_keys(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "3", "3", "3", "0")
+            assert "Nothing left to grade" in _screen_text(app)
+            await pilot.press("3", "t", "x", "s", "0", "n")
+            assert len(_written(tmp_path)) == 1
+
+    async def test_backspace_on_the_empty_queue_reopens_the_last_story(self, tmp_path):
+        app = _app(tmp_path, STORY_A)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "3", "3", "3", "0", "backspace")
+            assert STORY_A in _text(app, "#story-text")
+            assert "DISCIPLE_MAKING" in _text(app, "#question")
+
+    async def test_quitting_mid_story_writes_nothing(self, tmp_path):
+        app = _app(tmp_path, STORY_A, STORY_B)
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "3", "3", "3", "0")  # one story labeled
+            await pilot.press("3", "2", "q")            # second left half-answered
+        assert app.return_value == 1  # stories labeled this session
+        assert [label.text for label in _written(tmp_path)] == [STORY_A]
+
+    async def test_a_label_that_cannot_be_saved_keeps_the_story_on_screen(self, tmp_path):
+        # Nothing is dropped silently: the card stays, the queue does not
+        # advance, and the operator is told.
+        app = GradeApp(_candidates(STORY_A, STORY_B), RUBRIC,
+                       tmp_path / "no-such-directory" / "labels.jsonl")
+        async with app.run_test(size=SIZE) as pilot:
+            await pilot.press("3", "3", "3", "3", "0")
+            assert STORY_A in _text(app, "#story-text")
+            assert "Could not save" in _screen_text(app)
+            assert "2 queued" in _text(app, "#progress")
+            assert "DISCIPLE_MAKING" in _text(app, "#question")
+
+    async def test_nothing_the_model_said_reaches_the_screen(self, tmp_path):
+        queue = build_queue([_assessment("t_900001", [STORY_A])], set(), {})
+        app = GradeApp(queue, RUBRIC, tmp_path / "labels.jsonl")
+        async with app.run_test(size=SIZE) as pilot:
+            assert STORY_A in _screen_text(app)
+            for key in ("3", "3", "3", "3", "1"):
+                assert "SENTINEL" not in _screen_text(app)
+                assert "excellent" not in _screen_text(app).lower()
+                await pilot.press(key)
+
+
+def _write_jsonl(path, records):
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+class TestCli:
+    def _paths(self, tmp_path):
+        return [
+            "--assessments", str(tmp_path / "assessments.jsonl"),
+            "--labels", str(tmp_path / "labels.jsonl"),
+            "--golden-set", str(tmp_path / "golden.jsonl"),
+        ]
+
+    def test_a_missing_assessments_file_is_named_and_exits_1(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exit_info:
+            cli(self._paths(tmp_path))
+        assert exit_info.value.code == 1
+        assert "assessments.jsonl" in capsys.readouterr().err
+
+    def test_nothing_to_grade_exits_0_without_opening_the_screen(self, tmp_path, capsys, monkeypatch):
+        _write_jsonl(tmp_path / "assessments.jsonl", [_assessment("t_900001", [STORY_A])])
+        append_label(tmp_path / "labels.jsonl", _graded(STORY_A))
+        monkeypatch.setattr(GradeApp, "run", lambda self: pytest.fail("screen opened"))
+        with pytest.raises(SystemExit) as exit_info:
+            cli(self._paths(tmp_path))
+        assert exit_info.value.code == 0
+        assert "Nothing to grade" in capsys.readouterr().out
+
+    def test_the_screen_gets_the_queue_minus_curated_threads_and_labeled_stories(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_jsonl(tmp_path / "assessments.jsonl", [
+            _assessment("t_900001", [STORY_A, STORY_B]),
+            _assessment("t_900002", ["A story from a curated newsletter."]),
+        ])
+        _write_jsonl(tmp_path / "golden.jsonl", [{
+            "type": "golden_newsletter", "thread_id": "t_900002", "message_id": "m",
+            "sender": "s", "subject": "s", "body": "b", "stories": [],
+        }])
+        append_label(tmp_path / "labels.jsonl", _graded(STORY_B))
+        opened = {}
+        monkeypatch.setattr(GradeApp, "run", lambda self: opened.update(app=self))
+        cli(self._paths(tmp_path))
+        assert [candidate.text for candidate in opened["app"].queue] == [STORY_A]
+        assert opened["app"].label_path == tmp_path / "labels.jsonl"
+
+    def test_a_missing_curated_golden_set_is_not_an_error(self, tmp_path, monkeypatch):
+        _write_jsonl(tmp_path / "assessments.jsonl", [_assessment("t_900001", [STORY_A])])
+        opened = {}
+        monkeypatch.setattr(GradeApp, "run", lambda self: opened.update(app=self))
+        cli(self._paths(tmp_path))
+        assert len(opened["app"].queue) == 1
+
+    def test_miscut_lists_the_bucket_and_does_not_open_the_screen(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        _write_jsonl(tmp_path / "assessments.jsonl", [_assessment("t_900001", [STORY_A])])
+        append_label(tmp_path / "labels.jsonl",
+                     _miscut(STORY_A_CUT_SHORT, note="ending is in the next paragraph"))
+        monkeypatch.setattr(GradeApp, "run", lambda self: pytest.fail("screen opened"))
+        cli(self._paths(tmp_path) + ["--miscut"])
+        out = capsys.readouterr().out
+        assert "1 miscut" in out
+        assert "t_900001" in out
+        assert "cut short" in out
+        assert "ending is in the next paragraph" in out
+        assert "Dana had never led" in out
+
+    def test_an_empty_miscut_bucket_says_so(self, tmp_path, capsys):
+        _write_jsonl(tmp_path / "assessments.jsonl", [])
+        cli(self._paths(tmp_path) + ["--miscut"])
+        assert "No miscut stories" in capsys.readouterr().out

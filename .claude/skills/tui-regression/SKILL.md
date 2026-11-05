@@ -1,8 +1,9 @@
 ---
 name: tui-regression
 description: >-
-  Feature- and regression-test the four Textual TUIs (evals.newsletter_label,
-  evals.review, evals.edit_tui, newsletter_review) by driving each end-to-end
+  Feature- and regression-test the five Textual TUIs (evals.newsletter_label,
+  evals.newsletter_grade, evals.review, evals.edit_tui, newsletter_review) by
+  driving each end-to-end
   through its full workflow with Pilot over diverse synthetic data.
   Use this after changing any TUI, tui_common, the newsletter/thread
   golden-set schemas, or the extraction/parse path — or when asked to "drive the
@@ -15,7 +16,7 @@ description: >-
 
 # TUI regression harness
 
-Four Textual TUIs, driven end-to-end via the framework's own **Pilot** driver
+Five Textual TUIs, driven end-to-end via the framework's own **Pilot** driver
 (`app.run_test()` → real key events) over **diverse synthetic data** — fully
 offline; no TUI calls a model. This is the deterministic, headless, CI-friendly way to
 exercise a Textual app's full workflow — complementary to the unit-level Pilot
@@ -29,6 +30,7 @@ multi-step workflows over the full data-state matrix and assert outcomes).
 | `synth_data.py` | Diverse `GoldenNewsletter` / `GoldenThread` / assessment-record builders + `write_all(dir)`. Spans empty, typical, and stress-edge (emoji/CJK, CRLF, unlocatable story, >9 stories, every tier/theme/label, excluded/reviewed/labeled mixes). |
 | `_e2e.py` | Shared harness: `SIZE`, `drain`, `Check`, `run_scenarios` (per-scenario timeout), `report`. Puts repo root + this dir on `sys.path`. |
 | `drive_newsletter_label.py` | Curate+label workflow: browse, span add/edit/delete, clear, unlocatable text-edit fallback, Phase-B scoring+themes, exclude, notes, undo, accept, skip. Manual-only since issue #59 removed LLM seeding — **no TUI calls a model**, so there is no model seam to mock. |
+| `drive_newsletter_grade.py` | Grading ready-made stories: queue built from the synthetic assessments as the CLI does, every story opened and shown verbatim, nine-answer cards, rest-absent, torn + why, miscut with reason + bucket, skip, back into the previous story, scroll while grading and while noting, unsaveable label, relaunch queues only what is unlabeled. Asserts on the append-only label log. |
 | `drive_review.py` | Golden-thread review: confirm/sender/label/notes/skip/exclude/undo, normal + blind modes, stage 1/2, scroll, quit, last-thread double-key. |
 | `drive_edit_tui.py` | Golden-thread editor: nav/paging, drill-in/back, sender+label edits (+ l/l collision, cancel-no-save), unexclude, scroll, filtered-save-all, quit. |
 | `drive_newsletter_review.py` | Read-only browser: nav/paging, drill+scroll, full filter matrix (tier/theme/sender), CANCEL-vs-clear, literal-"cancel" value, init filters, empty result. |
@@ -67,7 +69,7 @@ so a schema break shows up here too.
    / record to `synth_data.py` that puts the app in the new state (or the edge
    case you're guarding). Keep it diverse — cover the degenerate and the
    stress-edge, not just the happy path.
-2. **No model to mock.** None of the four TUIs calls an LLM (issue #59 removed
+2. **No model to mock.** None of the five TUIs calls an LLM (issue #59 removed
    `newsletter_label`'s seeding). A scenario that needs a story-ful newsletter
    pre-populates `nl.stories` directly (`_populate_from_paragraphs` in
    `drive_newsletter_label.py`) or uses a `synth_data` record that ships with
@@ -100,7 +102,8 @@ so a schema break shows up here too.
   after `pause()` works because Pilot pauses between presses.
 - **`newsletter_label` cursor starts on the metadata header** (row 0 is a
   header, not a body line). Use `_goto_body(pilot, app, idx)` before span keys.
-- **Screen-stack guards.** All four apps guard re-entrant `push_screen` with
+- **Screen-stack guards.** `newsletter_grade` pushes no screens (its note line
+  and miscut menu are inline, so the story stays scrollable). The other four apps guard re-entrant `push_screen` with
   `len(self.screen_stack) > 1` (review.py uses `self.screen is not
   screen_stack[0]`). To simulate key auto-repeat, `app.post_message(events.Key(
   k, None))` twice then `pause()`; assert `app.is_running` / a single pushed
@@ -115,8 +118,8 @@ so a schema break shows up here too.
 
 ## Coverage today
 
-70 scenarios across the four drivers (newsletter_label 15, review 19, edit_tui
-14, newsletter_review 22) exercise every binding/action in each module — browse
+78 scenarios across the five drivers (newsletter_label 15, newsletter_grade 8,
+review 19, edit_tui 14, newsletter_review 22) exercise every binding/action in each module — browse
 + span sub-mode (with **exact committed-slice** assertions), blind + stage
 variants, the full filter matrix (incl. the newsletter_review **date filter** —
 past-N-days window, since-prompt boundary, CANCEL-vs-clear, and the

@@ -6,20 +6,34 @@ stories for the operator to grade by the rubric, blind to what the model said,
 and records each judgment as one self-contained line in a label log.
 
 Cutting and rating are separate jobs: a story whose boundaries are wrong is
-marked *miscut* and set aside for recutting, never graded and never discarded.
+marked *miscut* and set aside for recutting: it is not graded, and it stays in
+the log with its text so it is not lost.
 """
 
+import argparse
 import hashlib
 import json
 import os
+import sys
+import time
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from evals.newsletter_schemas import StoryLabel
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import VerticalScroll
+from textual.widgets import Input, Static
+
+from config_utils import substitute_env_vars
+from daemon import load_config
+from evals.newsletter_schemas import MISCUT_REASONS, StoryLabel
 from newsletter import _DIMENSIONS, _VALID_THEMES
+from newsletter_review.tui import load_assessments
+from tui_common import truncate
 
 # Two texts from one thread count as the same story at or above this overlap.
 # Same value the report uses to match extracted stories to golden ones.
@@ -440,3 +454,386 @@ def count_labeled_on(labels: dict[str, StoryLabel], day, tz=None) -> int:
         if stamp is not None and stamp.astimezone(tz).date() == day:
             count += 1
     return count
+
+
+# What the operator can say is wrong with a cut, in key order (1-4).
+MISCUT_REASON_TEXT = {
+    "cut_short": "cut short: the story continues past where this ends",
+    "runs_long": "runs past its end: it takes in text that is not this story",
+    "several_stories": "several stories in one",
+    "not_a_story": "not a story",
+}
+
+_KEYS = {
+    "grade": "1/2/3 answer   0 rest absent   t torn   backspace back   n note   "
+             "x miscut   s skip   q quit",
+    "reason": "1-4 choose   esc cancel",
+    "note": "enter save   esc cancel",
+    "done": "backspace reopen the last story   q quit",
+}
+
+_NOTE_PROMPTS = {
+    "note": "Note for this story:",
+    "torn": "Why (you were torn: grade down and say why):",
+    "miscut": "What is wrong with the cut (optional):",
+}
+
+
+def miscut_menu() -> list[str]:
+    """The lines shown in place of the question while a miscut reason is chosen."""
+    lines = ["MISCUT   What is wrong with this cut? It will be set aside for recutting.", ""]
+    lines += [
+        f"  {key}  {MISCUT_REASON_TEXT[reason]}"
+        for key, reason in enumerate(MISCUT_REASONS, 1)
+    ]
+    return lines
+
+
+class GradeApp(App):
+    """One story at a time: the text, the question being asked with the rubric's
+    wording for it, and nine single-key answers.
+
+    Nothing here is modal over the story. It scrolls at any moment, including
+    while a note is being typed, and scrolling never touches the answers.
+    Every finished card is appended to the label log before the next story is
+    shown; a card that cannot be saved stays on screen.
+    """
+
+    ENABLE_COMMAND_PALETTE = False
+
+    BINDINGS = [
+        Binding("1", "digit(1)", show=False),
+        Binding("2", "digit(2)", show=False),
+        Binding("3", "digit(3)", show=False),
+        Binding("4", "digit(4)", show=False),
+        Binding("0", "rest_absent", show=False),
+        Binding("t", "torn", show=False),
+        Binding("backspace", "back", show=False),
+        Binding("n", "note", show=False),
+        Binding("x", "miscut", show=False),
+        Binding("s", "skip", show=False),
+        Binding("q", "quit_app", show=False),
+        Binding("escape", "cancel", show=False),
+        Binding("up", "scroll_story('up')", show=False),
+        Binding("down", "scroll_story('down')", show=False),
+        Binding("pageup,ctrl+b", "scroll_story('page_up')", show=False),
+        Binding("pagedown,ctrl+f", "scroll_story('page_down')", show=False),
+        Binding("home", "scroll_story('home')", show=False),
+        Binding("end", "scroll_story('end')", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    GradeApp #progress { text-style: bold; }
+    GradeApp #story { height: 1fr; border-top: solid $accent; border-bottom: solid $accent; }
+    GradeApp #story-text { max-width: 88; padding: 0 1; }
+    GradeApp #question { height: auto; padding: 0 1; }
+    GradeApp #strip { padding: 0 1; color: $text-muted; }
+    GradeApp #status { padding: 0 1; }
+    GradeApp #note-prompt { display: none; padding: 0 1; }
+    GradeApp #note { display: none; }
+    """
+
+    def __init__(self, queue, rubric: Rubric, label_path, *, labeled_today: int = 0,
+                 clock=time.monotonic, now=None):
+        super().__init__()
+        self.queue: list[Candidate] = list(queue)
+        self.rubric = rubric
+        self.label_path = Path(label_path)
+        self.labeled_today = labeled_today
+        self.session_labeled = 0
+        self._clock = clock
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._done: list[StoryLabel] = []  # labels written this session, oldest first
+        self._card: Card | None = None
+        self._opened_at = 0.0
+        self._mode = "done"  # grade | reason | note | done
+        self._note_purpose = "note"
+        self._miscut_reason = ""
+        self._status = ""
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="progress", markup=False)
+        yield VerticalScroll(Static(id="story-text", markup=False), id="story")
+        yield Static(id="question", markup=False)
+        yield Static(id="strip", markup=False)
+        yield Static(id="status", markup=False)
+        yield Static(id="note-prompt", markup=False)
+        yield Input(id="note")
+
+    def on_mount(self) -> None:
+        self._open_next()
+
+    # -- state ---------------------------------------------------------------
+
+    def _open_next(self) -> None:
+        if self.queue:
+            self._open(Card(self.queue[0]))
+        else:
+            self._card = None
+            self._mode = "done"
+            self._refresh()
+
+    def _open(self, card: Card) -> None:
+        self._card = card
+        self._mode = "grade"
+        self._opened_at = self._clock()
+        self.query_one("#story-text", Static).update(card.candidate.text)
+        self.query_one("#story", VerticalScroll).scroll_home(animate=False)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        card = self._card
+        progress = f"{self.labeled_today} labeled today · {len(self.queue)} queued"
+        if card is not None and card.candidate.recut_of:
+            progress += " · a recut of a story you marked miscut"
+        self.query_one("#progress", Static).update(progress)
+        if self._mode == "done":
+            self.query_one("#story-text", Static).update("")
+            question = [f"Nothing left to grade. {self.session_labeled} labeled this session."]
+            strip = ""
+        elif self._mode == "reason":
+            question, strip = miscut_menu(), answers_strip(card)
+        else:
+            question, strip = question_panel(card, self.rubric), answers_strip(card)
+        self.query_one("#question", Static).update("\n".join(question))
+        self.query_one("#strip", Static).update(strip)
+        status = _KEYS[self._mode]
+        if self._status:
+            status = f"{self._status}\n{status}"
+        self.query_one("#status", Static).update(status)
+        editing = self._mode == "note"
+        prompt = self.query_one("#note-prompt", Static)
+        prompt.update(_NOTE_PROMPTS[self._note_purpose])
+        prompt.display = editing
+        self.query_one("#note", Input).display = editing
+
+    def _seconds(self) -> float:
+        return round(self._clock() - self._opened_at, 1)
+
+    def _stamp(self) -> str:
+        return self._now().isoformat()
+
+    def _commit(self, label: StoryLabel) -> None:
+        """Append *label*; only then leave the story. A failed write keeps it."""
+        try:
+            append_label(self.label_path, label)
+        except OSError as exc:
+            self._status = f"Could not save: {exc}. Nothing was written; the story stays here."
+            if current_question(self._card) is None:
+                self._card = back(self._card)
+            self._mode = "grade"
+            self._refresh()
+            return
+        self._status = ""
+        self._done.append(label)
+        self.queue.pop(0)
+        self.labeled_today += 1
+        self.session_labeled += 1
+        self._open_next()
+
+    def _finish(self) -> None:
+        """All nine answered: write the label, asking why first if torn."""
+        if self._card.torn and not self._card.note:
+            self._ask_note("torn")
+        else:
+            self._commit(graded_label(
+                self._card, labeled_at=self._stamp(), seconds=self._seconds()))
+
+    def _ask_note(self, purpose: str) -> None:
+        self._note_purpose = purpose
+        self._mode = "note"
+        note = self.query_one("#note", Input)
+        note.value = "" if purpose == "miscut" else self._card.note
+        self._refresh()
+        note.focus()
+
+    # -- keys ----------------------------------------------------------------
+
+    def action_digit(self, value: int) -> None:
+        if self._mode == "grade" and value in (1, 2, 3):
+            self._status = ""
+            self._card = answer(self._card, value)
+            if current_question(self._card) is None:
+                self._finish()
+            else:
+                self._refresh()
+        elif self._mode == "reason":
+            self._miscut_reason = MISCUT_REASONS[value - 1]
+            self._ask_note("miscut")
+
+    def action_rest_absent(self) -> None:
+        if self._mode != "grade":
+            return
+        filled = answer_rest_absent(self._card)
+        if filled != self._card:
+            self._card = filled
+            self._finish()
+
+    def action_torn(self) -> None:
+        if self._mode == "grade":
+            self._card = toggle_torn(self._card)
+            self._refresh()
+
+    def action_back(self) -> None:
+        if self._mode == "grade" and self._card.answers:
+            self._card = back(self._card)
+            self._refresh()
+        elif self._mode in ("grade", "done") and self._done:
+            # Step back into the story labeled just before. Its earlier label
+            # stays in the log; finishing it again appends one that supersedes.
+            card = card_from_label(self._done.pop())
+            self.queue.insert(0, card.candidate)
+            self.labeled_today -= 1
+            self.session_labeled -= 1
+            self._open(card)
+
+    def action_note(self) -> None:
+        if self._mode == "grade":
+            self._ask_note("note")
+
+    def action_miscut(self) -> None:
+        if self._mode == "grade":
+            self._mode = "reason"
+            self._refresh()
+
+    def action_skip(self) -> None:
+        if self._mode == "grade":
+            self.queue.append(self.queue.pop(0))
+            self._open_next()
+
+    def action_cancel(self) -> None:
+        if self._mode == "note":
+            if self._note_purpose == "torn":
+                self._card = back(self._card)  # back to the last question
+            self._mode = "grade"
+            self.set_focus(None)
+            self._refresh()
+        elif self._mode == "reason":
+            self._mode = "grade"
+            self._refresh()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self._mode != "note":
+            return
+        text = "".join(ch for ch in event.value if ch.isprintable()).strip()
+        self.set_focus(None)
+        if self._note_purpose == "miscut":
+            self._commit(miscut_label(
+                self._card, self._miscut_reason, text,
+                labeled_at=self._stamp(), seconds=self._seconds()))
+            return
+        self._card = replace(self._card, note=text)
+        if self._note_purpose == "torn":
+            self._commit(graded_label(
+                self._card, labeled_at=self._stamp(), seconds=self._seconds()))
+        else:
+            self._mode = "grade"
+            self._refresh()
+
+    def action_scroll_story(self, how: str) -> None:
+        story = self.query_one("#story", VerticalScroll)
+        getattr(story, f"scroll_{how}")(animate=False)
+
+    def action_quit_app(self) -> None:
+        self.exit(self.session_labeled)
+
+
+def _fail(message: str) -> None:
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+def _curated_thread_ids(path: Path) -> set[str]:
+    """Thread ids in the hand-curated golden set; none if the file is absent."""
+    if not path.exists():
+        return set()
+    ids = set()
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                ids.add(json.loads(line).get("thread_id", ""))
+    return ids
+
+
+def format_miscut_bucket(bucket: list[StoryLabel]) -> str:
+    """The miscut bucket as text: each thread, then its stories with the reason,
+    the opening words and the operator's note."""
+    if not bucket:
+        return "No miscut stories."
+    count = len(bucket)
+    lines = [f"{count} miscut {'story' if count == 1 else 'stories'} waiting for a recut."]
+    thread = None
+    for label in bucket:
+        if label.thread_id != thread:
+            thread = label.thread_id
+            lines += ["", thread]
+        reason = MISCUT_REASON_TEXT[label.miscut_reason].split(":")[0]
+        opening = truncate(" ".join(label.text.split()), 70)
+        lines.append(f"  {reason}: {opening}")
+        if label.note:
+            lines.append(f"    note: {label.note}")
+    return "\n".join(lines)
+
+
+def cli(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Grade ready-made newsletter stories, blind, into the story-label log")
+    parser.add_argument("--assessments",
+                        help="Production assessments JSONL to draw stories from "
+                             "(default: [newsletter] output_file in the config)")
+    parser.add_argument("--labels", default="evals/newsletter_story_labels.jsonl",
+                        help="Story-label log to append to")
+    parser.add_argument("--golden-set", default="evals/newsletter_golden_set.jsonl",
+                        help="Hand-curated golden set whose newsletters are left out of "
+                             "the queue (a missing file means none)")
+    parser.add_argument("--config",
+                        help="Path to config.toml (default: the repo-root config.toml, "
+                             "regardless of CWD)")
+    parser.add_argument("--miscut", action="store_true",
+                        help="List the stories set aside as miscut, then exit")
+    args = parser.parse_args(argv)
+
+    labels_path = Path(args.labels)
+    try:
+        labels = latest_labels(read_label_log(labels_path))
+    except ValueError as exc:
+        _fail(f"Cannot read the story-label log: {exc}")
+    if args.miscut:
+        print(format_miscut_bucket(miscut_bucket(labels)))
+        return
+
+    try:
+        if args.config:
+            with open(args.config, "rb") as f:
+                config = substitute_env_vars(tomllib.load(f))
+        else:
+            config = load_config()
+        rubric = load_rubric(config)
+    except (OSError, ValueError) as exc:
+        _fail(f"Cannot load the config: {exc}")
+
+    assessments_path = Path(args.assessments or config["newsletter"]["output_file"])
+    if not assessments_path.exists():
+        _fail(f"No assessments file at {assessments_path}. Pass --assessments PATH, "
+              "or run this where the daemon writes its newsletter assessments.")
+    try:
+        assessments = load_assessments(assessments_path)
+        curated = _curated_thread_ids(Path(args.golden_set))
+    except ValueError as exc:
+        _fail(f"Cannot read the stories to grade: {exc}")
+
+    queue = build_queue(assessments, curated, labels)
+    if not queue:
+        print(f"Nothing to grade: every story in {assessments_path} is already labeled "
+              "or belongs to a curated newsletter.")
+        sys.exit(0)
+
+    app = GradeApp(queue, rubric, labels_path,
+                   labeled_today=count_labeled_on(labels, date.today()))
+    labeled = app.run()
+    if labeled is not None:
+        print(f"{labeled} labeled this session. Labels are in {labels_path}.")
+
+
+if __name__ == "__main__":
+    cli()

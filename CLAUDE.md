@@ -141,7 +141,9 @@ production assessments), the newsletter eval harness under `evals/` *measures* t
 grading pipeline against hand-labeled ground truth so the prompts can be iterated.
 It mirrors the email eval's 4 stages with `newsletter_`-prefixed modules:
 `newsletter_harvest → newsletter_label → newsletter_run → newsletter_report`
-(schemas in `evals/newsletter_schemas.py`). Quality/theme scoring uses **fixed
+(schemas in `evals/newsletter_schemas.py`), plus `newsletter_grade`, which grades
+the daemon's already-extracted stories blind into an append-only label log
+(a miscut story is set aside for recutting, not graded). Quality/theme scoring uses **fixed
 golden stories** so it is decoupled from extraction variability; the shared cache
 (`evals/cache/llm_cache.jsonl`) and each run's `prompt_hash` make prompt A/Bs
 cheap and self-identifying. See `evals/README.md` (workflows) and
