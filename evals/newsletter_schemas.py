@@ -322,6 +322,9 @@ class StoryPrediction:
     themes_raw: str | None = None
     duration_seconds: float = 0.0
     error: str | None = None
+    # Where the ground truth came from: "curated" (the hand-curated golden set)
+    # or "story_labels" (the story-label log written by newsletter_grade).
+    source: str = "curated"
 
     def to_dict(self) -> dict:
         return {
@@ -338,6 +341,7 @@ class StoryPrediction:
             "themes_raw": self.themes_raw,
             "duration_seconds": self.duration_seconds,
             "error": self.error,
+            "source": self.source,
         }
 
     @classmethod
@@ -364,6 +368,7 @@ class StoryPrediction:
             themes_raw=d.get("themes_raw"),
             duration_seconds=d.get("duration_seconds", 0.0),
             error=d.get("error"),
+            source=d.get("source", "curated"),
         )
 
 
@@ -460,6 +465,10 @@ class NewsletterRunMeta:
     extraction_system_prompt: str = ""
     quality_system_prompt: str = ""
     theme_system_prompt: str = ""
+    # Stories taken from the story-label log (newsletter_grade); they are part
+    # of story_count. Zero and "" for runs that used none.
+    story_labels_path: str = ""
+    story_label_count: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -482,6 +491,8 @@ class NewsletterRunMeta:
             "extraction_system_prompt": self.extraction_system_prompt,
             "quality_system_prompt": self.quality_system_prompt,
             "theme_system_prompt": self.theme_system_prompt,
+            "story_labels_path": self.story_labels_path,
+            "story_label_count": self.story_label_count,
         }
 
     @classmethod
@@ -505,4 +516,6 @@ class NewsletterRunMeta:
             extraction_system_prompt=d.get("extraction_system_prompt", ""),
             quality_system_prompt=d.get("quality_system_prompt", ""),
             theme_system_prompt=d.get("theme_system_prompt", ""),
+            story_labels_path=d.get("story_labels_path", ""),
+            story_label_count=d.get("story_label_count", 0),
         )

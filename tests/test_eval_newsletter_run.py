@@ -13,6 +13,7 @@ import pytest
 
 from evals import newsletter_run
 from evals.llm_cache import CachedLLMClient
+from evals.newsletter_grade import append_label, story_key
 from evals.newsletter_run import (
     build_meta,
     build_output_path,
@@ -20,12 +21,13 @@ from evals.newsletter_run import (
     evaluate_extraction,
     evaluate_story,
     load_golden_set,
+    load_story_labels,
     merge_prompts_override,
     run_evaluation,
     write_results,
     write_thinking_sidecar,
 )
-from evals.newsletter_schemas import GoldenNewsletter, GoldenStory
+from evals.newsletter_schemas import GoldenNewsletter, GoldenStory, StoryLabel
 from newsletter import NewsletterClassifier
 
 
@@ -1288,3 +1290,155 @@ class TestCliQuietsHttpLogging:
         newsletter_run.cli()
         assert logging.getLogger("httpx").level == logging.WARNING
         assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+def _label(text, thread_id="t_900010", status="graded", labeled_at="2026-11-05T21:00:00+00:00",
+           **extra):
+    fields = {
+        "story_key": story_key(text), "thread_id": thread_id, "text": text,
+        "status": status, "labeled_at": labeled_at,
+    }
+    if status == "graded":
+        fields["scores"] = {"simple": 3, "concrete": 3, "personal": 2, "dynamic": 2}
+        fields["themes"] = {"scripture": "emphasized"}
+    else:
+        fields["miscut_reason"] = "cut_short"
+    fields.update(extra)
+    return StoryLabel.from_dict(fields)
+
+
+class TestLoadStoryLabels:
+    def test_a_missing_log_is_no_stories(self, tmp_path):
+        pairs, stats = load_story_labels(tmp_path / "labels.jsonl", set())
+        assert pairs == []
+        assert stats == {"graded": 0, "miscut": 0, "in_curated_threads": 0}
+
+    def test_graded_labels_become_ground_truth_stories(self, tmp_path):
+        path = tmp_path / "labels.jsonl"
+        append_label(path, _label("A synthetic labeled story."))
+        pairs, stats = load_story_labels(path, set())
+        ((story, thread_id),) = pairs
+        assert thread_id == "t_900010"
+        assert story.story_id == story_key("A synthetic labeled story.")
+        assert story.text == "A synthetic labeled story."
+        assert story.expected_scores == {"simple": 3, "concrete": 3, "personal": 2, "dynamic": 2}
+        assert story.expected_themes == {"scripture": "emphasized"}
+        assert story.expected_tier == "good"
+        assert story.reviewed and not story.excluded
+        assert stats["graded"] == 1
+
+    def test_miscut_stories_are_not_ground_truth(self, tmp_path):
+        path = tmp_path / "labels.jsonl"
+        append_label(path, _label("A synthetic miscut story.", status="miscut"))
+        pairs, stats = load_story_labels(path, set())
+        assert pairs == []
+        assert stats["miscut"] == 1
+
+    def test_only_the_newest_label_per_story_counts(self, tmp_path):
+        path = tmp_path / "labels.jsonl"
+        append_label(path, _label("A story.", labeled_at="2026-11-01T10:00:00+00:00"))
+        append_label(path, _label("A story.", status="miscut",
+                                  labeled_at="2026-11-02T10:00:00+00:00"))
+        pairs, stats = load_story_labels(path, set())
+        assert pairs == []
+        assert stats == {"graded": 0, "miscut": 1, "in_curated_threads": 0}
+
+    def test_stories_from_curated_threads_are_left_to_the_curated_set(self, tmp_path):
+        # A thread curated after one of its stories was graded here would
+        # otherwise be scored twice.
+        path = tmp_path / "labels.jsonl"
+        append_label(path, _label("A story.", thread_id="nl1"))
+        append_label(path, _label("Another story.", thread_id="t_900011"))
+        pairs, stats = load_story_labels(path, {"nl1"})
+        assert [thread_id for _story_, thread_id in pairs] == ["t_900011"]
+        assert stats["in_curated_threads"] == 1
+
+
+class TestStoryLabelsInTheEvaluation:
+    def _golden(self):
+        return [_newsletter("nl1", reviewed=True, stories=[_story("nl1:0", text="body")])]
+
+    def _extra(self):
+        return [(_label("LABELED story text").to_golden_story(), "t_900010")]
+
+    def test_label_log_stories_are_scored_alongside_curated_ones(self):
+        rows, _thinking = _run(run_evaluation(
+            self._golden(), _classifier(_full_llm()), mode="quality", parallelism=1,
+            extra_stories=self._extra(),
+        ))
+        by_id = {row.story_id: row for row in rows}
+        assert set(by_id) == {"nl1:0", story_key("LABELED story text")}
+        assert by_id["nl1:0"].source == "curated"
+        labeled = by_id[story_key("LABELED story text")]
+        assert labeled.source == "story_labels"
+        assert labeled.thread_id == "t_900010"
+        assert labeled.expected_scores == {"simple": 3, "concrete": 3, "personal": 2, "dynamic": 2}
+        assert labeled.predicted_scores is not None
+
+    def test_label_log_stories_are_never_extraction_truth(self):
+        # Their boundaries were drawn by the extractor; scoring the extractor
+        # against them would be circular.
+        from evals.newsletter_schemas import ExtractionPrediction
+        rows, _thinking = _run(run_evaluation(
+            self._golden(), _classifier(_full_llm()), mode="extraction", parallelism=1,
+            extra_stories=self._extra(),
+        ))
+        assert [type(row) for row in rows] == [ExtractionPrediction]
+        assert rows[0].thread_id == "nl1"
+
+    def test_source_defaults_to_curated_for_result_files_written_before_it_existed(self):
+        from evals.newsletter_schemas import StoryPrediction
+        row = StoryPrediction.from_dict({"story_id": "nl1:0", "thread_id": "nl1"})
+        assert row.source == "curated"
+        assert StoryPrediction.from_dict(row.to_dict()).source == "curated"
+
+
+class TestMainStoryLabels:
+    def _patch(self, monkeypatch):
+        def fake_build(config, no_cache):
+            llm = FakeLLM([("story", "SIMPLE: GOOD\nCONCRETE: GOOD\nPERSONAL: OK\nDYNAMIC: OK", "q")])
+            return NewsletterClassifier(cloud_llm=llm, config=config), llm
+        monkeypatch.setattr(newsletter_run, "build_classifier", fake_build)
+
+    def _rows(self, output_dir):
+        files = [f for f in sorted(Path(output_dir).glob("*.jsonl"))
+                 if not f.name.endswith(".cot.jsonl")]
+        return [json.loads(line) for line in files[-1].read_text().splitlines()[1:]]
+
+    def test_a_run_scores_the_label_log_and_records_where_stories_came_from(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        self._patch(monkeypatch)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter(
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="curated story")],
+        )])
+        labels = tmp_path / "labels.jsonl"
+        append_label(labels, _label("labeled story one"))
+        append_label(labels, _label("labeled story two", status="miscut"))
+        out = tmp_path / "results"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="quality",
+            story_labels=str(labels),
+        )))
+        meta = _read_meta(out)
+        assert meta["story_count"] == 2
+        assert meta["story_label_count"] == 1
+        assert meta["story_labels_path"] == str(labels)
+        rows = self._rows(out)
+        assert sorted(row["source"] for row in rows) == ["curated", "story_labels"]
+        assert "1 graded story from the story-label log" in capsys.readouterr().err
+
+    def test_without_a_label_log_the_run_is_as_before(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch)
+        golden = tmp_path / "g.jsonl"
+        _write_golden(golden, [_newsletter(
+            "nl1", reviewed=True, stories=[_story("nl1:0", text="curated story")],
+        )])
+        out = tmp_path / "results"
+        asyncio.run(newsletter_run.main(_main_args(
+            golden_set=str(golden), output_dir=str(out), mode="quality",
+            story_labels=str(tmp_path / "absent.jsonl"),
+        )))
+        meta = _read_meta(out)
+        assert (meta["story_count"], meta["story_label_count"]) == (1, 0)

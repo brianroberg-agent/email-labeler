@@ -30,6 +30,7 @@ from config_utils import substitute_env_vars
 from daemon import quiet_http_logging, resolve_newsletter_llm_endpoint
 from evals import format_network_error, plural
 from evals.llm_cache import CachedLLMClient
+from evals.newsletter_grade import latest_labels, read_label_log
 from evals.newsletter_schemas import (
     ExtractionPrediction,
     GoldenNewsletter,
@@ -223,7 +224,7 @@ async def evaluate_extraction(
 
 async def evaluate_story(
     story: GoldenStory, thread_id: str, classifier: NewsletterClassifier,
-    do_quality: bool = True, do_themes: bool = True,
+    do_quality: bool = True, do_themes: bool = True, source: str = "curated",
 ) -> tuple[StoryPrediction, NewsletterThinkingEntry]:
     """Score one fixed golden story on quality and/or themes; derive tier from scores.
 
@@ -240,6 +241,7 @@ async def evaluate_story(
         expected_scores=story.expected_scores,
         expected_tier=story.expected_tier,
         expected_themes=dict(story.expected_themes),
+        source=source,
     )
     thinking = NewsletterThinkingEntry(story_id=story.story_id)
 
@@ -279,6 +281,31 @@ async def evaluate_story(
     return pred, thinking
 
 
+def load_story_labels(
+    path: Path, curated_thread_ids: set[str],
+) -> tuple[list[tuple[GoldenStory, str]], dict]:
+    """Ground-truth stories from the story-label log written by newsletter_grade.
+
+    Returns ((story, thread_id) pairs, stats). Only the newest label per story
+    counts, and only graded ones are ground truth: a miscut story has none. A
+    graded story whose thread is in the curated golden set is left to that set,
+    so a thread curated after one of its stories was graded is not scored twice.
+    A missing file is an empty log. stats counts {"graded", "miscut",
+    "in_curated_threads"} so the CLI can say what it used.
+    """
+    stats = {"graded": 0, "miscut": 0, "in_curated_threads": 0}
+    pairs: list[tuple[GoldenStory, str]] = []
+    for label in latest_labels(read_label_log(path)).values():
+        if label.status != "graded":
+            stats["miscut"] += 1
+        elif label.thread_id in curated_thread_ids:
+            stats["in_curated_threads"] += 1
+        else:
+            stats["graded"] += 1
+            pairs.append((label.to_golden_story(), label.thread_id))
+    return pairs, stats
+
+
 VALID_MODES = ("extraction", "quality", "themes", "all")
 
 
@@ -312,8 +339,13 @@ async def run_evaluation(
     mode: str,
     parallelism: int = 1,
     progress: bool = False,
+    extra_stories: list[tuple[GoldenStory, str]] | tuple = (),
 ) -> tuple[list, list[NewsletterThinkingEntry]]:
     """Replay the golden set through the classifier under *mode*.
+
+    *extra_stories* are (story, thread_id) pairs from the story-label log
+    (``load_story_labels``). They are scored in the story modes only, never as
+    extraction truth: their boundaries were drawn by the extractor itself.
 
     Returns (rows, thinking_entries). ``rows`` mixes ExtractionPrediction (one per
     reviewed newsletter, extraction/all modes) and StoryPrediction (one per
@@ -340,11 +372,11 @@ async def run_evaluation(
         _tick(f"extraction {nl.thread_id}")
         return result  # (ExtractionPrediction, NewsletterThinkingEntry)
 
-    async def run_story(story: GoldenStory, thread_id: str):
+    async def run_story(story: GoldenStory, thread_id: str, source: str = "curated"):
         async with semaphore:
             result = await evaluate_story(
                 story, thread_id, classifier,
-                do_quality=do_quality, do_themes=do_themes,
+                do_quality=do_quality, do_themes=do_themes, source=source,
             )
         _tick(f"story {story.story_id}")
         return result
@@ -357,6 +389,9 @@ async def run_evaluation(
     if do_quality or do_themes:
         story_pairs_in, _n_excluded, _n_unlabeled = select_stories(golden_set)
         story_tasks = [run_story(story, tid) for story, tid in story_pairs_in]
+        story_tasks += [
+            run_story(story, tid, source="story_labels") for story, tid in extra_stories
+        ]
 
     ticker["total"] = len(extraction_tasks) + len(story_tasks)
 
@@ -383,6 +418,19 @@ def _deep_merge(base: dict, override: dict) -> None:
             base[key] = value
 
 
+def format_story_label_summary(stats: dict, path) -> str:
+    """One line on what the story-label log contributed to this run."""
+    parts = [
+        f"{plural(stats['graded'], 'graded story', 'graded stories')} "
+        f"from the story-label log {path}"
+    ]
+    if stats["miscut"]:
+        parts.append(f"{stats['miscut']} miscut left out")
+    if stats["in_curated_threads"]:
+        parts.append(f"{stats['in_curated_threads']} left to the curated golden set")
+    return "; ".join(parts)
+
+
 def build_meta(
     config: dict,
     config_path: str,
@@ -391,6 +439,8 @@ def build_meta(
     mode: str,
     tag: str,
     parallelism: int,
+    story_labels_path: str = "",
+    story_label_count: int = 0,
 ) -> "NewsletterRunMeta":
     """Assemble the NewsletterRunMeta first-line record for a results file.
 
@@ -402,15 +452,18 @@ def build_meta(
     Phase-B-labeled, non-excluded stories (the metric denominators), while an
     extraction-only run counts every golden story — evaluate_extraction matches
     predictions against the full story list, so an --include-unreviewed
-    extraction run must not record 0.
+    extraction run must not record 0. Stories from the story-label log
+    (*story_label_count*) are scored in the story modes only and are counted
+    there, not in an extraction-only run.
     """
     llm_cfg = config["newsletter"]["llm"]
     prompts = config["newsletter"]["prompts"]
     config_bytes = json.dumps(config, sort_keys=True).encode()
     if mode == "extraction":
         story_count = sum(len(nl.stories) for nl in golden_set)
+        story_label_count = 0
     else:
-        story_count = len(select_stories(golden_set)[0])
+        story_count = len(select_stories(golden_set)[0]) + story_label_count
     return NewsletterRunMeta(
         run_id=uuid.uuid4().hex,
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -430,6 +483,8 @@ def build_meta(
         extraction_system_prompt=prompts["story_extraction"]["system"],
         quality_system_prompt=prompts["quality_assessment"]["system"],
         theme_system_prompt=prompts["theme_classification"]["system"],
+        story_labels_path=story_labels_path if story_label_count else "",
+        story_label_count=story_label_count,
     )
 
 
@@ -765,6 +820,21 @@ async def main(args: argparse.Namespace) -> None:
     if unreviewed_note:
         print(unreviewed_note, file=sys.stderr)
 
+    # Stories graded in newsletter_grade (the story-label log) join the story
+    # modes. Absent flag (older callers) or a missing file means none.
+    extra_stories: list = []
+    labels_path = getattr(args, "story_labels", None)
+    if labels_path and args.mode != "extraction":
+        try:
+            extra_stories, label_stats = load_story_labels(
+                Path(labels_path), {nl.thread_id for nl in golden_set}
+            )
+        except ValueError as exc:
+            print(f"Error: cannot read the story-label log: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if any(label_stats.values()):
+            print(format_story_label_summary(label_stats, labels_path), file=sys.stderr)
+
     classifier, llm = build_classifier(config, args.no_cache)
 
     # Preflight: probe the newsletter endpoint once and fail fast on an
@@ -805,6 +875,7 @@ async def main(args: argparse.Namespace) -> None:
             mode=args.mode,
             parallelism=parallelism,
             progress=True,
+            extra_stories=extra_stories,
         )
 
         meta = build_meta(
@@ -815,6 +886,8 @@ async def main(args: argparse.Namespace) -> None:
             mode=args.mode,
             tag=args.tag or "",
             parallelism=parallelism,
+            story_labels_path=str(labels_path or ""),
+            story_label_count=len(extra_stories),
         )
 
         output_dir = Path(args.output_dir)
@@ -846,6 +919,9 @@ def cli():
     parser = argparse.ArgumentParser(description="Run newsletter classification evaluation")
     parser.add_argument("--golden-set", default="evals/newsletter_golden_set.jsonl",
                         help="Path to newsletter golden set JSONL")
+    parser.add_argument("--story-labels", default="evals/newsletter_story_labels.jsonl",
+                        help="Story-label log from newsletter_grade; its graded stories are "
+                             "scored in the quality/themes modes (a missing file means none)")
     parser.add_argument("--config",
                         help="Path to config.toml (default: the repo-root config.toml, "
                              "regardless of CWD)")

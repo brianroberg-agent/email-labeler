@@ -306,6 +306,9 @@ appends a line and two machines' logs are combined by concatenating them. A
 label that cannot be written leaves the story on screen. The file holds story
 text and is gitignored.
 
+`newsletter_run` reads this log by default (`--story-labels`): graded stories
+become ground truth for the quality and theme metrics.
+
 **Miscut stories** stay in the log with their text, reason and note, and are left
 out of the queue under that key. When a later assessment of the same thread
 contains a story that shares most of its words with a miscut one, that story is
@@ -318,6 +321,7 @@ the `--miscut` list when its recut has been graded or it is graded itself.
 | Flag | Description |
 |---|---|
 | `--golden-set` | Path to newsletter golden set JSONL (default: `evals/newsletter_golden_set.jsonl`) |
+| `--story-labels` | Story-label log written by `newsletter_grade` (default: `evals/newsletter_story_labels.jsonl`; a missing file means none). Its graded stories are scored in the `quality`, `themes` and `all` modes alongside the curated golden stories, and not in extraction: their boundaries came from the extractor. Miscut stories, and stories whose thread is in the curated golden set, are left out. Each result row records its `source` (`curated` or `story_labels`) and the run metadata records `story_label_count` |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`, regardless of CWD) |
 | `--output-dir` | Output directory for results (default: `evals/newsletter_results/`) |
 | `--mode` | Which outputs to evaluate: `extraction`, `quality`, `themes`, or `all` (default: `all`). `quality` and `themes` fire **only their own** LLM calls; the skipped side's fields are `null` in the results rows |

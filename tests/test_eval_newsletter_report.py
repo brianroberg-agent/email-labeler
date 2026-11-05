@@ -1213,3 +1213,25 @@ class TestComparisonDeltaSign:
         assert m["themes"]["micro_f1"] == 1.0
         assert m["dimension_mae"]["simple"] == 0.0
         assert m["extraction"]["micro_f1"] == 1.0
+
+
+class TestStoryLabelCountInHeader:
+    def test_header_splits_the_story_count_by_source(self, capsys):
+        metrics = compute_all_metrics([_pred()], [])
+        print_report(_meta(mode="quality", story_count=7, story_label_count=5), metrics,
+                     story_results=[_pred()])
+        assert "Stories:      7 (2 curated, 5 from the story-label log)" in capsys.readouterr().out
+
+    def test_header_is_unchanged_without_label_log_stories(self, capsys):
+        metrics = compute_all_metrics([_pred()], [])
+        print_report(_meta(mode="quality", story_count=7), metrics, story_results=[_pred()])
+        out = capsys.readouterr().out
+        assert "Stories:      7\n" in out
+        assert "story-label log" not in out
+
+    def test_meta_written_before_the_field_existed_loads_with_zero(self):
+        old = _meta().to_dict()
+        del old["story_label_count"]
+        del old["story_labels_path"]
+        restored = NewsletterRunMeta.from_dict(old)
+        assert (restored.story_label_count, restored.story_labels_path) == (0, "")

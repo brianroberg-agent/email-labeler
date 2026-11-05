@@ -213,7 +213,9 @@ newsletter_harvest → newsletter_label → newsletter_run → newsletter_report
   `evals/newsletter_story_labels.jsonl`; nothing else is saved or accepted. No
   LLM endpoint is needed.
 - **run** — Replay the golden set through the real classifier (LLM-cached) and
-  write timestamped results.
+  write timestamped results. Stories graded with **grade** are scored too, in
+  the quality and theme metrics only; the report's header says how many stories
+  came from each source.
 - **report** — Compute tier/dimension/theme/extraction metrics, compare two runs,
   or show a trend across runs.
 

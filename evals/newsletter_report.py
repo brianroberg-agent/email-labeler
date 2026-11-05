@@ -650,7 +650,13 @@ def print_report(
         print(f"  Tag:          {meta.tag}")
     print(f"  Golden set:   {meta.golden_set_path}")
     print(f"  Newsletters:  {meta.golden_set_count}")
-    print(f"  Stories:      {meta.story_count}")
+    stories_line = f"  Stories:      {meta.story_count}"
+    if meta.story_label_count:
+        curated = meta.story_count - meta.story_label_count
+        stories_line += (
+            f" ({curated} curated, {meta.story_label_count} from the story-label log)"
+        )
+    print(stories_line)
 
     # Sections with zero underlying predictions are omitted (mirroring the tier
     # section) instead of rendering as a fake 0.0%.
