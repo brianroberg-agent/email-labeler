@@ -228,6 +228,11 @@ class TestTextOverlap:
     def test_empty_text_overlaps_nothing(self):
         assert text_overlap("", STORY_A) == 0.0
 
+    def test_against_the_longer_text_a_contained_cut_overlaps_only_in_part(self):
+        partial = text_overlap(STORY_A_CUT_SHORT, STORY_A, against="longer")
+        assert 0.2 < partial < 0.5
+        assert text_overlap(STORY_A, STORY_A, against="longer") == pytest.approx(1.0)
+
 
 class TestBuildQueue:
     def test_every_story_becomes_a_candidate(self):
@@ -289,10 +294,28 @@ class TestBuildQueue:
         other = next(c for c in queue if c.text == STORY_B)
         assert other.recut_of == ""
 
-    def test_a_new_cut_overlapping_a_graded_story_is_not_queued_again(self):
-        labels = latest_labels([_graded(STORY_A_CUT_SHORT, source_timestamp=OLDER)])
-        queue = build_queue([_assessment("t_900001", [STORY_A, STORY_B])], set(), labels)
+    def test_a_later_copy_of_a_graded_story_is_not_queued_again(self):
+        # The thread was graded again and the story came back nearly unchanged.
+        nearly_same = STORY_A + " She plans to keep hosting."
+        labels = latest_labels([_graded(STORY_A, source_timestamp=OLDER)])
+        queue = build_queue([_assessment("t_900001", [nearly_same, STORY_B])], set(), labels)
         assert [c.text for c in queue] == [STORY_B]
+
+    def test_a_later_story_that_only_shares_a_passage_with_a_graded_one_is_queued(self):
+        # A short, distinct story that ends on the same sign-off as a graded
+        # story is a different story. Dropping it would lose it without a trace.
+        sign_off = "Thank you for your prayers and your faithful support of our ministry."
+        graded_story = STORY_A + " " + sign_off
+        short_story = "Lena was baptized on Sunday. " + sign_off
+        labels = latest_labels([_graded(graded_story, source_timestamp=OLDER)])
+        queue = build_queue([_assessment("t_900001", [short_story])], set(), labels)
+        assert [c.text for c in queue] == [short_story]
+
+    def test_a_much_longer_later_cut_of_a_graded_story_is_queued(self):
+        # It contains the graded text but is mostly new: the operator decides.
+        labels = latest_labels([_graded(STORY_A_CUT_SHORT, source_timestamp=OLDER)])
+        queue = build_queue([_assessment("t_900001", [STORY_A])], set(), labels)
+        assert [c.text for c in queue] == [STORY_A]
 
     def test_overlap_is_judged_within_the_thread_only(self):
         labels = latest_labels([_graded(STORY_A_CUT_SHORT, thread_id="t_900009",
@@ -362,6 +385,36 @@ class TestMiscutBucket:
             _graded(STORY_A, labeled_at="2026-11-02T10:00:00+00:00"),
         ])
         assert miscut_bucket(labels) == []
+
+    def test_a_chain_of_miscuts_drains_once_a_later_cut_is_graded(self):
+        # M was miscut; its recut R was miscut too; the third cut is graded.
+        # It names only M, but it is a later cut of the same passage as R.
+        middle = STORY_A_CUT_SHORT + " host four freshmen"
+        labels = latest_labels([
+            _miscut(STORY_A_CUT_SHORT, source_timestamp=OLDER),
+            _miscut(middle, source_timestamp="2026-10-01T12:00:00+00:00",
+                    recut_of=story_key(STORY_A_CUT_SHORT)),
+            _graded(STORY_A, source_timestamp=SAME, recut_of=story_key(STORY_A_CUT_SHORT)),
+        ])
+        assert miscut_bucket(labels) == []
+
+    def test_a_graded_neighbor_from_the_same_extraction_does_not_drain_the_bucket(self):
+        swallowed = STORY_A + " " + STORY_B
+        labels = latest_labels([
+            _miscut(swallowed, reason="runs_long", source_timestamp=SAME),
+            _graded(STORY_B, source_timestamp=SAME),
+        ])
+        assert [m.text for m in miscut_bucket(labels)] == [swallowed]
+
+    def test_not_a_story_is_final_and_not_waiting_for_a_recut(self):
+        labels = latest_labels([
+            _miscut("A synthetic calendar listing.", reason="not_a_story"),
+            _miscut(STORY_A_CUT_SHORT),
+        ])
+        assert [m.text for m in miscut_bucket(labels)] == [STORY_A_CUT_SHORT]
+        out = format_miscut_bucket(miscut_bucket(labels), not_a_story=1)
+        assert "1 miscut story waiting for a recut" in out
+        assert "1 marked not a story" in out
 
     def test_bucket_is_grouped_by_thread(self):
         labels = latest_labels([

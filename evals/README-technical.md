@@ -312,14 +312,23 @@ text and is gitignored.
 become ground truth for the quality and theme metrics.
 
 **Miscut stories** stay in the log with their text, reason and note, and are left
-out of the queue under that key. When a later assessment of the same thread
-contains a story that shares most of its words with a miscut one, that story is
-queued as its recut (`recut_of`); one that shares most of its words with an
-already graded story of the thread is not queued again. "Later" is by the
-assessment record's timestamp against the label's `source_timestamp`: stories
-from the same extraction as a labeled story are its neighbors, queued plainly,
-even when a cut that ran long contains them. A miscut story leaves the
-`--miscut` list when its recut has been graded or it is graded itself.
+out of the queue under that key. Two rules bring later cuts of the same thread
+back, where "later" is by the assessment record's timestamp against the
+label's `source_timestamp` (stories from the same extraction as a labeled story
+are its neighbors and are queued plainly, even when a cut that ran long
+contains them):
+
+- A later story that contains a miscut story, or is contained in it, is queued
+  as its recut (`recut_of`).
+- A later story that is mostly the same text as an already graded story is not
+  queued again. One that only shares a passage with it (a sign-off, say), or is
+  a much longer cut of it, is queued.
+
+A miscut story leaves the `--miscut` list when it is graded itself, when a
+graded story names it in `recut_of`, or when a story graded from a later
+extraction contains it or is contained in it (so a chain of miscut recuts
+drains once one cut is graded). Texts marked "not a story" are final: they are
+counted in the listing, not listed as waiting.
 
 ### newsletter_run
 

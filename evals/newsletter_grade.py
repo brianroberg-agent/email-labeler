@@ -189,16 +189,22 @@ def latest_labels(labels: list[StoryLabel]) -> dict[str, StoryLabel]:
     return latest
 
 
-def text_overlap(a: str, b: str) -> float:
-    """How much of the shorter text also appears in the other, from 0.0 to 1.0.
+def text_overlap(a: str, b: str, against: str = "shorter") -> float:
+    """How much text two stories share, from 0.0 to 1.0, counted in words over
+    shared runs of at least ``_MIN_SHARED_WORDS``.
 
-    Counted in words over shared runs of at least ``_MIN_SHARED_WORDS``, and
-    measured against the SHORTER text: a cut that stops early is wholly inside
-    its repaired version, so the two overlap fully even though one is several
-    times the other's length.
+    *against* picks what the shared words are measured against:
+
+    - ``"shorter"`` asks "is one of these inside the other?". A cut that stops
+      early is wholly inside its repaired version, so the two overlap fully
+      even though one is several times the other's length. Used to recognize a
+      recut of a miscut story.
+    - ``"longer"`` asks "are these the same story?". Two different stories
+      that end on the same sign-off share little of the longer one. Used
+      before leaving a story out as a copy of one already graded.
     """
     words_a, words_b = a.split(), b.split()
-    shorter = min(len(words_a), len(words_b))
+    shorter, longer = sorted((len(words_a), len(words_b)))
     if shorter == 0:
         return 0.0
     matcher = SequenceMatcher(None, words_a, words_b, autojunk=False)
@@ -206,7 +212,7 @@ def text_overlap(a: str, b: str) -> float:
         block.size for block in matcher.get_matching_blocks()
         if block.size >= min(_MIN_SHARED_WORDS, shorter)
     )
-    return shared / shorter
+    return shared / (longer if against == "longer" else shorter)
 
 
 def build_queue(
@@ -224,9 +230,10 @@ def build_queue(
     Left out: threads in the hand-curated golden set (their stories are already
     ground truth), stories already labeled under their key, blank texts, and a
     text already queued. When the thread has been extracted again since a story
-    was labeled, a story of the newer extraction that overlaps one already
-    *graded* is left out as a near-duplicate, and one that overlaps a *miscut*
-    story is that story's recut and comes back linked to it. Stories from the
+    was labeled, a story of the newer extraction that is mostly the same text
+    as one already *graded* is left out as a copy, and one that contains or is
+    contained in a *miscut* story is that story's recut and comes back linked
+    to it. Stories from the
     same extraction as a labeled one are its neighbors and are queued plainly.
 
     Sorted by story key, which is a hash: the order survives restarts and one
@@ -256,12 +263,15 @@ def build_queue(
                 # text the two share (a cut that ran long contains the next one).
                 if not _later(record.get("timestamp"), label.source_timestamp):
                     continue
-                if text_overlap(text, label.text) < OVERLAP_THRESHOLD:
-                    continue
                 if label.status == "graded":
-                    already_graded = True
-                    break
-                recut_of = recut_of or label.story_key
+                    # Left out only as a copy: mostly the same text. A story
+                    # that merely shares a passage with a graded one, or is a
+                    # much longer cut of it, is shown and the operator decides.
+                    if text_overlap(text, label.text, against="longer") >= OVERLAP_THRESHOLD:
+                        already_graded = True
+                        break
+                elif text_overlap(text, label.text) >= OVERLAP_THRESHOLD:
+                    recut_of = recut_of or label.story_key
             if already_graded:
                 continue
             queued[key] = Candidate(
@@ -277,18 +287,42 @@ def build_queue(
 def miscut_bucket(labels: dict[str, StoryLabel]) -> list[StoryLabel]:
     """Miscut stories still waiting for a usable recut, grouped by thread.
 
-    A miscut story leaves the bucket when a story recorded as its recut has
-    been graded, or when it is itself graded later (the newest label wins).
+    A miscut story leaves the bucket when it is itself graded later (the newest
+    label wins), when a graded story names it as the story it recut, or when a
+    story graded from a later extraction of its thread contains it or is
+    contained in it. The last rule is what drains a chain: if a recut was
+    itself miscut, the cut that is finally graded names only one of them.
+
+    Stories marked "not a story" are not here. No recut can fix them, so they
+    are final rather than waiting (see ``not_a_story_labels``).
     """
-    redressed = {
-        label.recut_of for label in labels.values()
-        if label.status == "graded" and label.recut_of
-    }
+    graded = [label for label in labels.values() if label.status == "graded"]
+    named = {label.recut_of for label in graded if label.recut_of}
+
+    def redressed(miscut: StoryLabel) -> bool:
+        if miscut.story_key in named:
+            return True
+        return any(
+            label.thread_id == miscut.thread_id
+            and _later(label.source_timestamp, miscut.source_timestamp)
+            and text_overlap(label.text, miscut.text) >= OVERLAP_THRESHOLD
+            for label in graded
+        )
+
     waiting = [
         label for label in labels.values()
-        if label.status == "miscut" and label.story_key not in redressed
+        if label.status == "miscut" and label.miscut_reason != "not_a_story"
+        and not redressed(label)
     ]
     return sorted(waiting, key=lambda label: (label.thread_id, label.labeled_at, label.story_key))
+
+
+def not_a_story_labels(labels: dict[str, StoryLabel]) -> list[StoryLabel]:
+    """Texts the operator ruled not a story at all: set aside for good."""
+    return [
+        label for label in labels.values()
+        if label.status == "miscut" and label.miscut_reason == "not_a_story"
+    ]
 
 
 # The judgments asked about a story, in order: the four dimensions, then the
@@ -793,13 +827,19 @@ def _curated_thread_ids(path: Path) -> set[str]:
     return ids
 
 
-def format_miscut_bucket(bucket: list[StoryLabel]) -> str:
+def format_miscut_bucket(bucket: list[StoryLabel], not_a_story: int = 0) -> str:
     """The miscut bucket as text: each thread, then its stories with the reason,
-    the opening words and the operator's note."""
+    the opening words and the operator's note. *not_a_story* is how many texts
+    were ruled not a story; they are counted, not listed, since nothing is
+    waiting to be done about them."""
+    final = (f"{not_a_story} marked not a story (final; no recut is expected)."
+             if not_a_story else "")
     if not bucket:
-        return "No miscut stories."
+        return "No miscut stories waiting for a recut." + (f"\n{final}" if final else "")
     count = len(bucket)
     lines = [f"{count} miscut {'story' if count == 1 else 'stories'} waiting for a recut."]
+    if final:
+        lines.append(final)
     thread = None
     for label in bucket:
         if label.thread_id != thread:
@@ -837,7 +877,8 @@ def cli(argv=None):
     except ValueError as exc:
         _fail(f"Cannot read the story-label log: {exc}")
     if args.miscut:
-        print(format_miscut_bucket(miscut_bucket(labels)))
+        print(format_miscut_bucket(
+            miscut_bucket(labels), not_a_story=len(not_a_story_labels(labels))))
         return
 
     try:
