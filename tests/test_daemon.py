@@ -3822,6 +3822,20 @@ class TestLoadConfig:
             assert "system" in prompts[key]
             assert "user_template" in prompts[key]
 
+    @pytest.mark.parametrize("prompt", ["quality_assessment", "theme_classification"])
+    def test_config_grading_prompts_carry_the_grade_down_rule(self, prompt):
+        # docs/newsletter-rubric.md §1, Decided 2026-09-09: "When torn, grade
+        # down and say why." Over-grading is the costliest error (a GOOD or an
+        # EMPHASIZED the story has not earned mis-teaches), so both grading
+        # prompts state the rule. D23: the rubric is the spec and the prompt is
+        # what changes — this pins the prompt to the ruling.
+        config = load_config()
+        system = config["newsletter"]["prompts"][prompt]["system"]
+        assert (
+            "When torn between two grades, give the lower grade and say why"
+            in system
+        )
+
 
 class TestResolveIntEnv:
     def test_returns_default_when_unset(self, monkeypatch):

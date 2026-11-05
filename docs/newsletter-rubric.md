@@ -57,7 +57,9 @@ output is ever shown to staff directly.
   lands in good/excellent, and the shortlist is read by a person.
 - **When torn, grade down and say why — Decided 2026-09-09.** A lower grade with a stated reason is
   coachable; an inflated grade is invisible as an error. Themes already resolve every undecidable path to
-  no label (D14), which is the same rule.
+  no label (D14), which is the same rule. In both grading prompts since 2026-11-05 (quality and themes;
+  pinned by `test_config_grading_prompts_carry_the_grade_down_rule`). Its effect is not yet measured: the
+  golden set is too small (§7).
 
 ## 2. Extraction — what is a story
 
@@ -207,3 +209,7 @@ peer trainer reading cold (§1 audience).
   shortlist filter, rationale, example/test instruments, scarcity ruling, golden-set procedure (Brian's
   rulings of 2026-09-09); §2–§5 transcribed from the prompts, D14/D15/D20 and commit history with
   provenance.
+- **2026-11-05** — the grade-down rule (§1) is written into the quality and theme prompts, on Brian's
+  ruling of the same day that it ships before it can be measured. `prompt_hash` changes with it, so eval
+  runs from before and after are not prompt-comparable. The `config.toml` line references in §2–§5 stay
+  as recorded at `f7245f9`.
