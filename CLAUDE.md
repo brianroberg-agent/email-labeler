@@ -29,6 +29,7 @@ recipient) is configuration, not something to abstract away.
 - `evals/README.md` — Human-oriented eval suite guide: pipeline stages, common workflows, key commands
 - `evals/README-technical.md` — Agent/reference: complete CLI flags for all eval tools, LLM cache internals, chain-of-thought capture format
 - `docs/decisions.md` — Decisions registry: adjudicated tradeoffs reviews must not re-litigate (see Review Charter)
+- `REVIEW.md` — Reviewer guide: what a change here can break, what counts as an interface, what reviews of this repo tend to miss
 - `docs/labeling-rubric.md` — Labeling rubric: what each label means, golden-set labeling and exclusion procedure, decided vs proposed rules; the prompts in `config.toml` implement it (D21)
 - `docs/newsletter-rubric.md` — Newsletter grading rubric: purpose (coaching first, shortlisting a slice), what each dimension/theme grade means, golden-set labeling and exclusion procedure, decided vs proposed rules; the `[newsletter.prompts.*]` implement it (D23)
 - `docs/plans/` — Frozen history: every file carries a status header; superseded plans are records, not instructions
