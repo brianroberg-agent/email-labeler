@@ -3835,6 +3835,12 @@ class TestLoadConfig:
             "When torn between two grades, give the lower grade and say why"
             in system
         )
+        # Review finding F7: the rubric's rationale ("coachable", "invisible as
+        # an error") is written for a human reader. The prompts never say the
+        # grades are for coaching, so the model has no referent for it and may
+        # read it as a general push toward low grades. The rule alone ships.
+        assert "coachable" not in system
+        assert "invisible as an error" not in system
 
 
 class TestResolveIntEnv:
