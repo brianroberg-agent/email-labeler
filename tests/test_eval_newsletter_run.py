@@ -1548,3 +1548,19 @@ class TestMainLabelLogAlone:
             )))
         assert exit_info.value.code == 1
         assert "extraction" in capsys.readouterr().err
+
+
+def test_the_headless_runner_does_not_load_the_terminal_ui():
+    # newsletter_run is a batch tool. Reading the story-label log must not pull
+    # in Textual or the grading screen with it.
+    import subprocess
+    probe = (
+        "import sys, evals.newsletter_run; "
+        "loaded = [m for m in ('textual', 'evals.newsletter_grade') if m in sys.modules]; "
+        "print(loaded); sys.exit(1 if loaded else 0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True,
+        cwd=Path(__file__).parent.parent,
+    )
+    assert result.returncode == 0, f"loaded at import: {result.stdout.strip()} {result.stderr[-300:]}"

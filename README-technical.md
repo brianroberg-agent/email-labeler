@@ -28,7 +28,7 @@ email-labeler/
 │   ├── review.py       Interactive CLI for label review and correction
 │   ├── run_eval.py     Replay golden set through real classifier
 │   ├── report.py       Metrics: accuracy, confusion matrix, P/R/F1, privacy
-│   ├── newsletter_schemas.py  Newsletter golden-set and result dataclasses
+│   ├── newsletter_schemas.py  Newsletter golden-set and result dataclasses; the story-label record and its log file
 │   ├── newsletter_harvest.py  Pull candidate newsletters → golden set (unlabeled)
 │   ├── newsletter_label.py    Hand-label story quality scores and themes
 │   ├── newsletter_grade.py    Grade ready-made stories into the append-only story-label log

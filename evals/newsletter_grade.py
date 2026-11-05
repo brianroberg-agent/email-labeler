@@ -11,9 +11,7 @@ the log with its text so it is not lost.
 """
 
 import argparse
-import hashlib
 import json
-import os
 import sys
 import time
 import tomllib
@@ -32,7 +30,15 @@ from config_utils import substitute_env_vars
 from daemon import load_config
 from evals import clean_for_display
 from evals.newsletter_report import THEMES as _REPORT_THEMES
-from evals.newsletter_schemas import MISCUT_REASONS, StoryLabel
+from evals.newsletter_schemas import (
+    MISCUT_REASONS,
+    StoryLabel,
+    append_label,
+    latest_labels,
+    parse_time,
+    read_label_log,
+    story_key,
+)
 from newsletter import _DIMENSIONS, _VALID_THEMES
 from newsletter_review.tui import load_assessments
 from tui_common import truncate
@@ -104,89 +110,12 @@ def load_rubric(config: dict) -> Rubric:
     )
 
 
-def story_key(text: str) -> str:
-    """A story's identity: a hash of its text with whitespace normalized.
-
-    Text-only on purpose. A recut of the same newsletter is different text and
-    so a different story; the same text arriving in two threads is one story.
-    """
-    normalized = " ".join(text.split())
-    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
-
-
-def read_label_log(path: Path) -> list[StoryLabel]:
-    """Every label line in *path*, in file order. A missing file is an empty log.
-
-    Blank lines are skipped. A line that is not JSON, or not a valid label,
-    raises ValueError naming the file and line, so a bad hand-merge is located
-    rather than silently dropped.
-    """
-    path = Path(path)
-    if not path.exists():
-        return []
-    labels = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            try:
-                labels.append(StoryLabel.from_dict(json.loads(line)))
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                raise ValueError(f"{path}:{lineno}: {exc}") from exc
-    return labels
-
-
-def append_label(path: Path, label: StoryLabel) -> None:
-    """Append one label line to *path* and sync it to disk.
-
-    Earlier lines are never rewritten. If the file does not end in a newline
-    (a hand-merge, an interrupted write), one is added first so the new label
-    lands on its own line.
-    """
-    line = (json.dumps(label.to_dict()) + "\n").encode()
-    with open(path, "a+b") as f:
-        f.seek(0, os.SEEK_END)
-        if f.tell() > 0:
-            f.seek(-1, os.SEEK_END)
-            if f.read(1) != b"\n":
-                f.write(b"\n")
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def _parse_time(value) -> datetime | None:
-    try:
-        stamp = datetime.fromisoformat(value or "")
-    except (TypeError, ValueError):
-        return None
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
-
-
 def _later(record_timestamp, label_source_timestamp) -> bool:
     """Whether an assessment record is a later extraction than the one a label's
     story came from. False when either time is unknown: without knowing, no
     story is treated as another's recut or duplicate."""
-    record_at, source_at = _parse_time(record_timestamp), _parse_time(label_source_timestamp)
+    record_at, source_at = parse_time(record_timestamp), parse_time(label_source_timestamp)
     return record_at is not None and source_at is not None and record_at > source_at
-
-
-def latest_labels(labels: list[StoryLabel]) -> dict[str, StoryLabel]:
-    """The label in force for each story: the newest by ``labeled_at``.
-
-    File order is only the tie-break (a later line wins) when two lines carry
-    equal or unreadable times, because two machines' logs are merged by
-    concatenation and file order is then not time order.
-    """
-    latest: dict[str, StoryLabel] = {}
-    for label in labels:
-        kept = latest.get(label.story_key)
-        if kept is not None:
-            new_at, kept_at = _parse_time(label.labeled_at), _parse_time(kept.labeled_at)
-            if new_at is not None and kept_at is not None and new_at < kept_at:
-                continue
-        latest[label.story_key] = label
-    return latest
 
 
 def text_overlap(a: str, b: str, against: str = "shorter") -> float:
@@ -503,7 +432,7 @@ def count_labeled_on(labels: dict[str, StoryLabel], day, tz=None) -> int:
     (the local timezone when None)."""
     count = 0
     for label in labels.values():
-        stamp = _parse_time(label.labeled_at)
+        stamp = parse_time(label.labeled_at)
         if stamp is not None and stamp.astimezone(tz).date() == day:
             count += 1
     return count

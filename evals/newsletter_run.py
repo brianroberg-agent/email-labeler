@@ -30,7 +30,6 @@ from config_utils import substitute_env_vars
 from daemon import quiet_http_logging, resolve_newsletter_llm_endpoint
 from evals import format_network_error, plural
 from evals.llm_cache import CachedLLMClient
-from evals.newsletter_grade import latest_labels, read_label_log
 from evals.newsletter_schemas import (
     ExtractionPrediction,
     GoldenNewsletter,
@@ -38,6 +37,8 @@ from evals.newsletter_schemas import (
     NewsletterRunMeta,
     NewsletterThinkingEntry,
     StoryPrediction,
+    latest_labels,
+    read_label_log,
 )
 from llm_client import LLMClient
 from newsletter import NewsletterClassifier, classify_theme_line, compute_tier
