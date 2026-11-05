@@ -6,21 +6,35 @@ appends them.
 """
 
 import json
+from datetime import date, timezone
 
 import pytest
 
 from daemon import load_config
 from evals.newsletter_grade import (
+    QUESTIONS,
     Candidate,
+    Card,
     Rubric,
+    answer,
+    answer_rest_absent,
+    answers_strip,
     append_label,
+    back,
     build_queue,
+    card_from_label,
+    count_labeled_on,
+    current_question,
+    graded_label,
     latest_labels,
     load_rubric,
     miscut_bucket,
+    miscut_label,
+    question_panel,
     read_label_log,
     story_key,
     text_overlap,
+    toggle_torn,
 )
 from evals.newsletter_schemas import StoryLabel
 
@@ -389,3 +403,185 @@ class TestShippedRubricMatchesThePrompts:
     def test_theme_definition_is_in_the_theme_prompt(self, config, rubric, theme):
         prompt = config["newsletter"]["prompts"]["theme_classification"]["system"]
         assert f"{theme.upper()}: {rubric.themes[theme]}" in prompt
+
+
+def _card(text=STORY_A, thread_id="t_900001", recut_of=""):
+    return Card(Candidate(story_key=story_key(text), thread_id=thread_id, text=text,
+                          source_timestamp="2026-10-30T12:00:00+00:00", recut_of=recut_of))
+
+
+def _answered(card, *values):
+    for value in values:
+        card = answer(card, value)
+    return card
+
+
+class TestCard:
+    def test_questions_are_the_four_dimensions_then_the_five_themes(self):
+        assert QUESTIONS == (
+            "simple", "concrete", "personal", "dynamic",
+            "scripture", "christlikeness", "church", "vocation_family", "disciple_making",
+        )
+
+    def test_a_new_card_asks_the_first_dimension(self):
+        assert current_question(_card()) == "simple"
+
+    def test_each_answer_moves_to_the_next_question(self):
+        card = _answered(_card(), 3, 2)
+        assert card.answers == (3, 2)
+        assert current_question(card) == "personal"
+
+    def test_after_nine_answers_nothing_is_left_to_ask(self):
+        card = _answered(_card(), 3, 2, 2, 1, 1, 1, 1, 1, 1)
+        assert current_question(card) is None
+        assert answer(card, 3) == card
+
+    @pytest.mark.parametrize("value", [0, 4, -1])
+    def test_only_one_two_three_are_answers(self, value):
+        assert answer(_card(), value) == _card()
+
+    def test_back_removes_the_last_answer(self):
+        card = back(_answered(_card(), 3, 2))
+        assert card.answers == (3,)
+        assert current_question(card) == "concrete"
+
+    def test_back_on_an_untouched_card_changes_nothing(self):
+        assert back(_card()) == _card()
+
+    def test_rest_absent_fills_the_remaining_themes(self):
+        card = answer_rest_absent(_answered(_card(), 3, 2, 2, 1, 2))
+        assert card.answers == (3, 2, 2, 1, 2, 1, 1, 1, 1)
+
+    def test_rest_absent_does_nothing_while_a_dimension_is_being_asked(self):
+        card = _answered(_card(), 3, 2)
+        assert answer_rest_absent(card) == card
+
+    def test_torn_toggles_on_the_question_being_asked(self):
+        card = toggle_torn(_answered(_card(), 3))
+        assert card.torn == frozenset({"concrete"})
+        assert toggle_torn(card).torn == frozenset()
+
+    def test_torn_survives_answering_and_stepping_back(self):
+        card = answer(toggle_torn(_answered(_card(), 3)), 2)
+        assert card.torn == frozenset({"concrete"})
+        assert back(card).torn == frozenset({"concrete"})
+
+    def test_torn_on_a_finished_card_changes_nothing(self):
+        card = _answered(_card(), 3, 2, 2, 1, 1, 1, 1, 1, 1)
+        assert toggle_torn(card) == card
+
+
+class TestLabelsFromCards:
+    def test_graded_label_carries_scores_themes_torn_and_note(self):
+        card = toggle_torn(_answered(_card(recut_of="feedfacefeedface"), 3))
+        card = _answered(card, 2, 2, 1, 1, 3, 2, 1, 1)
+        card = Card(card.candidate, card.answers, card.torn, note="one named moment only")
+        label = graded_label(card, labeled_at="2026-11-05T21:00:00+00:00", seconds=61.0)
+        assert label.status == "graded"
+        assert label.story_key == story_key(STORY_A)
+        assert label.thread_id == "t_900001"
+        assert label.text == STORY_A
+        assert label.scores == {"simple": 3, "concrete": 2, "personal": 2, "dynamic": 1}
+        assert label.themes == {"christlikeness": "emphasized", "church": "present"}
+        assert label.torn == ["concrete"]
+        assert label.note == "one named moment only"
+        assert label.recut_of == "feedfacefeedface"
+        assert label.labeled_at == "2026-11-05T21:00:00+00:00"
+        assert label.seconds == 61.0
+        assert label.source_timestamp == "2026-10-30T12:00:00+00:00"
+        # What is written is what loads back.
+        assert StoryLabel.from_dict(json.loads(json.dumps(label.to_dict()))) == label
+
+    def test_an_unfinished_card_cannot_become_a_label(self):
+        with pytest.raises(ValueError, match="unanswered"):
+            graded_label(_answered(_card(), 3, 2), labeled_at="x", seconds=1.0)
+
+    def test_miscut_label_keeps_the_text_and_carries_no_grades(self):
+        card = _answered(_card(), 3, 2)
+        label = miscut_label(card, "cut_short", "ending is in the next paragraph",
+                             labeled_at="2026-11-05T21:00:00+00:00", seconds=12.5)
+        assert label.status == "miscut"
+        assert label.miscut_reason == "cut_short"
+        assert label.note == "ending is in the next paragraph"
+        assert label.text == STORY_A
+        assert label.scores is None
+        assert label.themes == {}
+        assert StoryLabel.from_dict(json.loads(json.dumps(label.to_dict()))) == label
+
+    def test_a_graded_label_reopens_at_its_last_question(self):
+        card = toggle_torn(_answered(_card(), 3))
+        card = _answered(card, 2, 2, 1, 1, 3, 2, 1, 1)
+        label = graded_label(Card(card.candidate, card.answers, card.torn, note="why"),
+                             labeled_at="x", seconds=1.0)
+        reopened = card_from_label(label)
+        assert reopened.answers == (3, 2, 2, 1, 1, 3, 2, 1)
+        assert current_question(reopened) == "disciple_making"
+        assert reopened.torn == frozenset({"concrete"})
+        assert reopened.note == "why"
+        assert reopened.candidate == card.candidate
+
+    def test_a_miscut_label_reopens_as_a_fresh_card(self):
+        label = miscut_label(_card(), "runs_long", "", labeled_at="x", seconds=1.0)
+        reopened = card_from_label(label)
+        assert reopened.answers == ()
+        assert reopened.candidate.text == STORY_A
+
+
+RUBRIC = Rubric(
+    grades={"poor": "ANCHOR-POOR", "ok": "ANCHOR-OK", "good": "ANCHOR-GOOD"},
+    dimensions={"simple": "Q-SIMPLE?", "concrete": "Q-CONCRETE?",
+                "personal": "Q-PERSONAL?", "dynamic": "Q-DYNAMIC?"},
+    theme_grades={"absent": "ANCHOR-ABSENT", "present": "ANCHOR-PRESENT",
+                  "emphasized": "ANCHOR-EMPHASIZED"},
+    themes={"scripture": "DEF-SCRIPTURE", "christlikeness": "DEF-CHRISTLIKENESS",
+            "church": "DEF-CHURCH", "vocation_family": "DEF-VOCATION",
+            "disciple_making": "DEF-DISCIPLE"},
+)
+
+
+class TestWhatTheOperatorSees:
+    def test_a_dimension_shows_its_question_and_the_three_grade_anchors(self):
+        text = "\n".join(question_panel(_answered(_card(), 3), RUBRIC))
+        assert "CONCRETE" in text and "Q-CONCRETE?" in text
+        for expected in ("1  Poor", "ANCHOR-POOR", "2  OK", "ANCHOR-OK", "3  Good", "ANCHOR-GOOD"):
+            assert expected in text
+        assert "Q-SIMPLE?" not in text and "DEF-CHURCH" not in text
+
+    def test_a_theme_shows_its_definition_and_the_three_theme_anchors(self):
+        text = "\n".join(question_panel(_answered(_card(), 3, 2, 2, 1, 1, 1), RUBRIC))
+        assert "CHURCH" in text and "DEF-CHURCH" in text
+        for expected in ("1  Absent", "ANCHOR-ABSENT", "2  Present", "ANCHOR-PRESENT",
+                         "3  Emphasized", "ANCHOR-EMPHASIZED"):
+            assert expected in text
+        assert "ANCHOR-GOOD" not in text
+
+    def test_a_torn_question_shows_the_grade_down_rule(self):
+        plain = "\n".join(question_panel(_card(), RUBRIC))
+        torn = "\n".join(question_panel(toggle_torn(_card()), RUBRIC))
+        assert "grade down" not in plain
+        assert "grade down and say why" in torn
+
+    def test_the_strip_names_answers_given_and_marks_the_current_question(self):
+        strip = answers_strip(toggle_torn(_answered(_card(), 3, 1)))
+        assert "simple Good" in strip
+        assert "concrete Poor" in strip
+        assert "personal ?" in strip
+        assert "torn" in strip
+
+    def test_the_strip_names_theme_grades(self):
+        strip = answers_strip(_answered(_card(), 3, 2, 2, 1, 1, 3, 2))
+        assert "scripture Absent" in strip
+        assert "christlikeness Emphasized" in strip
+        assert "church Present" in strip
+        assert "vocation_family ?" in strip
+
+
+class TestCountLabeledOn:
+    def test_counts_the_stories_labeled_that_day(self):
+        labels = latest_labels([
+            _graded(STORY_A, labeled_at="2026-11-05T15:00:00+00:00"),
+            _miscut(STORY_B, labeled_at="2026-11-05T16:00:00+00:00"),
+            _graded("A third synthetic story.", labeled_at="2026-11-04T16:00:00+00:00"),
+            _graded("A fourth synthetic story.", labeled_at=""),
+        ])
+        assert count_labeled_on(labels, date(2026, 11, 5), tz=timezone.utc) == 2
