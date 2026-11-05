@@ -3822,8 +3822,17 @@ class TestLoadConfig:
             assert "system" in prompts[key]
             assert "user_template" in prompts[key]
 
-    @pytest.mark.parametrize("prompt", ["quality_assessment", "theme_classification"])
-    def test_config_grading_prompts_carry_the_grade_down_rule(self, prompt):
+    @pytest.mark.parametrize("prompt, rule", [
+        ("quality_assessment",
+         "When torn between two grades, give the lower grade"),
+        # Review finding F4: for themes the rule is scoped to the boundary the
+        # owner ruled on. ABSENT is stored by omission, so grading a torn
+        # ABSENT/PRESENT down would erase the "you touched it" coaching hook
+        # and leave no trace; that boundary stays with "Do not force a match".
+        ("theme_classification",
+         "When torn between PRESENT and EMPHASIZED, give PRESENT"),
+    ])
+    def test_config_grading_prompts_carry_the_grade_down_rule(self, prompt, rule):
         # docs/newsletter-rubric.md §1, Decided 2026-09-09: "When torn, grade
         # down and say why." Over-grading is the costliest error (a GOOD or an
         # EMPHASIZED the story has not earned mis-teaches), so both grading
@@ -3831,10 +3840,7 @@ class TestLoadConfig:
         # what changes — this pins the prompt to the ruling.
         config = load_config()
         system = config["newsletter"]["prompts"][prompt]["system"]
-        assert (
-            "When torn between two grades, give the lower grade and say why"
-            in system
-        )
+        assert rule in system
         # Review finding F7: the rubric's rationale ("coachable", "invisible as
         # an error") is written for a human reader. The prompts never say the
         # grades are for coaching, so the model has no referent for it and may
