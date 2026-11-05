@@ -12,6 +12,7 @@ import pytest
 from textual.widgets import Input, Static
 
 from daemon import load_config
+from evals import clean_for_display
 from evals.newsletter_grade import (
     QUESTIONS,
     Candidate,
@@ -1089,3 +1090,31 @@ class TestFormatMiscutBucket:
         out = format_miscut_bucket([label])
         assert "Dr. Lee met her." in out
         assert "see above" in out
+
+
+class TestCleanForDisplay:
+    """Email text is shown on a terminal: it must not be able to steer it, and it
+    must still read as what was written."""
+
+    @pytest.mark.parametrize("hidden", [
+        "\x1b", "\x07", "\x00",        # control characters
+        "\u202e", "\u2066", "\u2069",  # bidi override / isolates: reorder what is displayed
+        "\U000e0041",                    # tag character
+        "\ud800",                        # lone surrogate: cannot be encoded for a terminal
+        "\ue000",                        # private use
+    ])
+    def test_invisible_steering_characters_are_dropped(self, hidden):
+        assert clean_for_display(f"safe{hidden}text") == "safetext"
+        assert clean_for_display(f"safe{hidden}text", keep_newlines=True) == "safetext"
+
+    def test_every_kind_of_space_stays_a_space(self):
+        assert clean_for_display("a\xa0b\u2009c\u202fd\u3000e") == "a b c d e"
+
+    def test_line_breaks_are_kept_only_on_request(self):
+        text = "one\ntwo\u2028three\r\nfour"
+        assert clean_for_display(text, keep_newlines=True) == "one\ntwo\nthree\nfour"
+        assert clean_for_display(text) == "one two three four"
+
+    def test_emoji_joined_sequences_and_accents_survive(self):
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        assert clean_for_display(f"José {family} 你好") == f"José {family} 你好"
