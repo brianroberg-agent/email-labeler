@@ -3,8 +3,8 @@
 Arm A is the local leg as ``run_eval --local-only`` runs it: Stage 2 on the
 golden set's person threads, through the ``[llm.local]`` endpoint. Arm B runs the
 same threads through the same ``EmailClassifier`` with a Claude model in the
-local slot, so both arms see the identical prompt. Usage and the run order are
-in evals/README.md.
+local slot, so both arms see the identical prompt. Usage: evals/README.md;
+flags, the order of a run and the outputs: evals/README-technical.md.
 """
 
 import argparse
@@ -58,6 +58,7 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # by the timeout, which matches [llm.local]'s 180 s request budget.
 ANTHROPIC_MAX_RETRIES = 4
 ANTHROPIC_TIMEOUT_SECONDS = 180.0
+
 
 class ApiKeyError(Exception):
     """The Anthropic key could not be taken from the source Brian named."""
