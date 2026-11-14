@@ -142,8 +142,12 @@ the one in `config.toml`, unchanged. Arm A is the `[llm.local]` client built as
 mail goes — decision D4). Arm B puts `AnthropicLLMClient` in the local slot. The
 cloud slot holds a stand-in that fails the row if it is called
 (`test_full_run_compares_both_arms_on_person_threads` sees no such error).
-Arm A runs at `local_parallel`, not `run_eval`'s `cloud_parallel`, so its
-latency is the latency production sees. Neither arm uses the response
+Arm A runs at the daemon's local concurrency, `LOCAL_PARALLEL` or else
+`[daemon] local_parallel`, read as `daemon.py` reads it
+(`test_arm_a_runs_at_the_daemons_local_concurrency_env_override_included`),
+not at `run_eval`'s `cloud_parallel`. Its latency is still not production's:
+the eval queues every thread at once, while production sees person mail a
+few at a time. Neither arm uses the response
 cache: a hit has no latency and no usage, and arm A may already be cached from
 earlier runs.
 

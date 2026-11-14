@@ -27,6 +27,7 @@ import anthropic
 
 from classifier import EmailClassifier
 from config_utils import substitute_env_vars
+from daemon import resolve_int_env
 from evals import report
 from evals.run_eval import (
     build_output_path,
@@ -408,7 +409,7 @@ def build_report(
     lines += [f"| {row} | {cells_a[row]} | {cells_b[row]} |" for row in _ROW_ORDER]
     lines += [
         "",
-        f"- Concurrency: arm A {arm_a.parallelism} at a time (`local_parallel`), arm B "
+        f"- Concurrency: arm A {arm_a.parallelism} at a time (`LOCAL_PARALLEL` or `local_parallel`), arm B "
         f"{arm_b.parallelism} at a time. Latency is wall time per message, retries included.",
         f"- Arm B: effort {ANTHROPIC_EFFORT}, max_tokens {ANTHROPIC_MAX_TOKENS}, no temperature, no "
         "fallback model; a refusal or a reply cut at max_tokens counts as an error.",
@@ -575,7 +576,8 @@ async def run_comparison(
         return 1
 
     output_dir = Path(args.output_dir)
-    local_parallel = config.get("daemon", {}).get("local_parallel", 1)
+    # The daemon's local concurrency, read as daemon.py reads it.
+    local_parallel = resolve_int_env("LOCAL_PARALLEL", config.get("daemon", {}).get("local_parallel", 1))
     classifier_a = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=local_llm, config=config)
     print(f"\nArm A: {local_llm.model}, {len(threads)} threads, {local_parallel} at a time...")
     results_a, _ = await run_evaluation(threads, classifier_a, STAGES, max_chars, parallelism=local_parallel)

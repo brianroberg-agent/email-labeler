@@ -688,6 +688,22 @@ class TestRunComparison:
         for path in written:
             assert SENTINEL_KEY not in path.read_text()
 
+    async def test_arm_a_runs_at_the_daemons_local_concurrency_env_override_included(
+        self, golden_file, tmp_path, capsys, monkeypatch,
+    ):
+        # The daemon reads LOCAL_PARALLEL over [daemon] local_parallel
+        # (README-technical documents it), so arm A must too.
+        monkeypatch.setenv("LOCAL_PARALLEL", "3")
+
+        await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(_Router(), []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        [path_a] = (tmp_path / "results").glob("*compare-A-*.jsonl")
+        assert report.load_results(path_a)[0].parallelism == 3
+        assert "3 at a time" in capsys.readouterr().out
+
     async def test_max_threads_caps_what_is_sent(self, golden_file, tmp_path):
         router, local = _Router(), _FakeLocal()
 
