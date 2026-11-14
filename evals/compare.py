@@ -20,6 +20,7 @@ import statistics
 import tomllib
 import uuid
 import warnings
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -353,10 +354,13 @@ COST_ORDER = [
 ]
 
 
-def _paired(arm_a: ArmRun, arm_b: ArmRun) -> tuple[list[PredictionResult], list[PredictionResult]]:
-    """Each arm's rows for the threads that both arms answered without error."""
-    ok_b = {r.thread_id for r in arm_b.results if r.error is None}
-    both = {r.thread_id for r in arm_a.results if r.error is None} & ok_b
+def _scored(arm_a: ArmRun, arm_b: ArmRun) -> tuple[list[PredictionResult], list[PredictionResult]]:
+    """Each arm's rows for the threads both arms were sent, errors included.
+
+    An error stays in its arm's figures as a miss: in production a failed thread
+    is deferred, so its action is late (rubric cost class 2 for needs_response).
+    """
+    both = {r.thread_id for r in arm_a.results} & {r.thread_id for r in arm_b.results}
     return ([r for r in arm_a.results if r.thread_id in both],
             [r for r in arm_b.results if r.thread_id in both])
 
@@ -372,13 +376,18 @@ def _arm_cells(rows: list[PredictionResult], arm: ArmRun) -> dict[str, str]:
     cells = {}
     for cls in report.LABEL_CLASSES:
         tp = matrix[cls][cls]
-        cells[f"{cls} recall"] = _ratio(tp, sum(matrix[cls].values()))
+        # Over every row expected as cls: an error has no predicted label, so it
+        # is a miss here and is not counted by precision or the error classes.
+        cells[f"{cls} recall"] = _ratio(tp, sum(1 for r in rows if r.expected_label == cls))
         cells[f"{cls} precision"] = _ratio(tp, sum(matrix[other][cls] for other in report.LABEL_CLASSES))
     for label, pairs in COST_ORDER:
         cells[label] = str(sum(matrix[expected][predicted] for expected, predicted in pairs))
-    errors = sum(1 for r in arm.results if r.error is not None)
-    cells["Errors (no usable answer)"] = f"{errors}/{len(arm.results)}"
-    seconds = [r.duration_seconds for r in rows]
+    errored = Counter(r.expected_label for r in rows if r.error is not None)
+    by_label = ", ".join(f"{cls} {errored[cls]}" for cls in report.LABEL_CLASSES if errored[cls])
+    cells["Errors (no usable answer)"] = (
+        f"{errored.total()}/{len(rows)}" + (f" ({by_label})" if by_label else "")
+    )
+    seconds = [r.duration_seconds for r in rows if r.error is None]
     cells["Latency per message, median"] = f"{statistics.median(seconds):.1f} s" if seconds else "N/A"
     cells["Latency per message, p90"] = f"{percentile(seconds, 90):.1f} s" if seconds else "N/A"
     if arm.priced_model is None:
@@ -413,7 +422,7 @@ def build_report(
 ) -> str:
     """The side-by-side Markdown report. It holds counts and figures only: no
     subject, sender, body or thread id."""
-    rows_a, rows_b = _paired(arm_a, arm_b)
+    rows_a, rows_b = _scored(arm_a, arm_b)
     cells_a, cells_b = _arm_cells(rows_a, arm_a), _arm_cells(rows_b, arm_b)
     lines = [
         f"# Claude comparison: {arm_a.name} vs {arm_b.name}",
@@ -421,8 +430,9 @@ def build_report(
         f"- Run: {timestamp}",
         f"- Golden set: `{golden_set_path}`, {reviewed_threads} reviewed threads; both arms ran "
         f"Stage 2 on its {len(arm_a.results)} person threads (the `run_eval --local-only` population).",
-        f"- Scored on the {len(rows_a)} threads both arms answered; each arm's errors are counted "
-        "in their own row.",
+        f"- Scored on the {len(rows_a)} threads both arms were sent. An arm's error counts as a miss "
+        "for the thread's expected label, lowering that arm's recall; it has no predicted label, so "
+        "precision and the error classes do not count it.",
         "- Error classes follow the cost order of `docs/labeling-rubric.md` section 3 (decision D21), "
         "worst first.",
         "",
@@ -433,7 +443,7 @@ def build_report(
     lines += [
         "",
         f"- Concurrency: arm A {arm_a.parallelism} at a time (`LOCAL_PARALLEL` or `local_parallel`), arm B "
-        f"{arm_b.parallelism} at a time. Latency is wall time per message, retries included.",
+        f"{arm_b.parallelism} at a time. Latency is wall time per answered message, retries included.",
         f"- Arm B: effort {ANTHROPIC_EFFORT}, max_tokens {ANTHROPIC_MAX_TOKENS}, no temperature, no "
         "fallback model; a refusal or a reply cut at max_tokens counts as an error.",
         "- Neither arm used the eval response cache, so latency and cost are measured, not replayed.",

@@ -181,10 +181,13 @@ counted. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
 The API's token counter is itself an API call, so it is not used.
 
 **Outputs.** `<timestamp>_compare_<local>_vs_<model>.md`: one Markdown table,
-scored on the threads both arms answered. It leads with needs_response recall,
-then the error classes in the cost order of `docs/labeling-rubric.md` §3 (D21),
-then per-category precision/recall, errors per arm, median and p90 latency per
-message, and cost. The report holds counts only, no subject, sender, body or
+scored on the threads both arms were sent. An arm's error stays in its figures
+as a miss for the thread's expected label, so it lowers that arm's recall
+(`test_an_arms_error_counts_as_a_miss_for_its_expected_label`). It leads with
+needs_response recall, then the error classes in the cost order of
+`docs/labeling-rubric.md` §3 (D21), then per-category precision/recall, errors
+per arm by expected label, median and p90 latency per answered message, and
+cost. The report holds counts only, no subject, sender, body or
 thread id (`test_report_holds_no_message_content`,
 `test_holds_counts_only_no_thread_ids`). Next to it are two ordinary results
 files, `*_stage2_only_compare-A-*.jsonl` and `*_stage2_only_compare-B-*.jsonl`,

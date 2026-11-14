@@ -476,13 +476,14 @@ def _rows(report):
 
 
 class TestReport:
-    def test_scores_both_arms_on_the_threads_both_answered(self):
+    def test_scores_both_arms_on_the_threads_both_were_sent(self):
         rows, _ = _rows(_report())
 
-        # 900007 failed in arm A and 900008 in arm B, so six threads are scored.
-        assert rows["needs_response recall"] == ["33.3% (1/3)", "100.0% (3/3)"]
-        assert rows["Errors (no usable answer)"] == ["1/8", "1/8"]
-        assert "Scored on the 6 threads both arms answered" in _report()
+        # 900007 failed in arm A and 900008 in arm B; each stays in its arm's
+        # figures as a miss, so all eight threads are scored for both arms.
+        assert rows["needs_response recall"] == ["25.0% (1/4)", "100.0% (4/4)"]
+        assert rows["Errors (no usable answer)"] == ["1/8 (needs_response 1)", "1/8 (fyi 1)"]
+        assert "Scored on the 8 threads both arms were sent" in _report()
 
     def test_needs_response_recall_leads_and_error_classes_follow_the_cost_order(self):
         rows, order = _rows(_report())
@@ -501,17 +502,19 @@ class TestReport:
     def test_per_category_precision_and_recall(self):
         rows, _ = _rows(_report())
 
-        assert rows["needs_response precision"] == ["50.0% (1/2)", "100.0% (3/3)"]
-        assert rows["fyi recall"] == ["0.0% (0/2)", "100.0% (2/2)"]
-        assert rows["fyi precision"] == ["0.0% (0/2)", "100.0% (2/2)"]
+        assert rows["needs_response precision"] == ["50.0% (1/2)", "100.0% (4/4)"]
+        assert rows["fyi recall"] == ["33.3% (1/3)", "66.7% (2/3)"]
+        assert rows["fyi precision"] == ["33.3% (1/3)", "100.0% (2/2)"]
         assert rows["low_priority recall"] == ["0.0% (0/1)", "100.0% (1/1)"]
         assert rows["low_priority precision"] == ["0.0% (0/2)", "100.0% (1/1)"]
 
-    def test_latency_median_and_p90_per_message(self):
+    def test_latency_median_and_p90_per_answered_message(self):
         rows, _ = _rows(_report())
 
-        assert rows["Latency per message, median"] == ["3.5 s", "0.5 s"]
-        assert rows["Latency per message, p90"] == ["6.0 s", "0.5 s"]
+        # Arm A answered seven threads in 1..7 s; its failed 900007 (9 s) is
+        # not an answer, so it does not count toward latency.
+        assert rows["Latency per message, median"] == ["4.0 s", "0.5 s"]
+        assert rows["Latency per message, p90"] == ["7.0 s", "0.5 s"]
 
     def test_cost_per_message_and_total(self):
         rows, _ = _rows(_report())
@@ -521,6 +524,25 @@ class TestReport:
         assert rows["Cost, total"][0] == "$0 (local)"
         assert rows["Cost, total"][1].startswith("$0.08")
         assert "2026-11-03" in rows["Cost, total"][1]
+
+    def test_an_arms_error_counts_as_a_miss_for_its_expected_label(self):
+        # In production a failed thread is deferred, so its action is late: an
+        # error on a needs_response thread must lower that arm's recall, not
+        # drop the thread from both arms' figures.
+        nr, fyi = "needs_response", "fyi"
+        arm_a = compare.ArmRun(name="Arm A", parallelism=1, results=[
+            _pred("900401", nr, nr), _pred("900402", nr, nr), _pred("900403", fyi, fyi)])
+        arm_b = compare.ArmRun(name="Arm B", parallelism=4, priced_model="claude-opus-5-5", results=[
+            _pred("900401", nr, nr), _pred("900402", nr, None, error="synthetic failure"),
+            _pred("900403", fyi, fyi)])
+
+        text = compare.build_report(arm_a, arm_b, golden_set_path="evals/golden_set.jsonl",
+                                    reviewed_threads=3, timestamp="2026-11-13T12:00:00+00:00")
+
+        rows, _ = _rows(text)
+        assert rows["needs_response recall"] == ["100.0% (2/2)", "50.0% (1/2)"]
+        assert rows["Errors (no usable answer)"] == ["0/3", "1/3 (needs_response 1)"]
+        assert "Scored on the 3 threads both arms were sent" in text
 
     def test_holds_counts_only_no_thread_ids(self):
         report = _report()
