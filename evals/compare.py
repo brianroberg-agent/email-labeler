@@ -65,9 +65,11 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # Each attempt is bounded by the timeout: 600 s, the SDK's own read timeout for a
 # non-streaming request, which covers its expected time for a reply that runs to
 # max_tokens (3600 s x 16000 / 128000 = 450 s). A shorter bound would cut slow
-# replies and retry them with no usage counted for the cut attempts.
+# replies and retry them with no usage counted for the cut attempts. Connecting
+# keeps the SDK's own 5 s, so an unreachable endpoint fails fast.
 ANTHROPIC_MAX_RETRIES = 4
 ANTHROPIC_TIMEOUT_SECONDS = 600.0
+ANTHROPIC_TIMEOUT = anthropic.Timeout(ANTHROPIC_TIMEOUT_SECONDS, connect=anthropic.DEFAULT_TIMEOUT.connect)
 
 
 class ApiKeyError(Exception):
@@ -139,7 +141,7 @@ def build_anthropic_client(api_key: str, *, http_client=None) -> anthropic.Async
     with _without_anthropic_environment():
         return anthropic.AsyncAnthropic(
             api_key=api_key, base_url=ANTHROPIC_BASE_URL, http_client=http_client,
-            max_retries=ANTHROPIC_MAX_RETRIES, timeout=ANTHROPIC_TIMEOUT_SECONDS,
+            max_retries=ANTHROPIC_MAX_RETRIES, timeout=ANTHROPIC_TIMEOUT,
         )
 
 

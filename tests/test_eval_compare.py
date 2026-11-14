@@ -282,16 +282,23 @@ class TestBuildAnthropicClient:
         assert await llm.complete("S", "U") == "FYI"
         assert len(transport.requests) == 4
 
-    def test_retry_budget_and_per_request_timeout_are_set(self):
-        client = compare.build_anthropic_client(SENTINEL_KEY)
+    async def test_retry_budget_and_per_request_timeout_are_set(self):
+        transport = _Transport((200, _message(), None))
+        client = _sdk_client(transport)
+
+        await compare.AnthropicLLMClient(client, model="claude-opus-5-5").complete("S", "U")
 
         assert client.max_retries == compare.ANTHROPIC_MAX_RETRIES
+        sent = transport.requests[0].extensions["timeout"]
         # Each attempt gets the SDK's own non-streaming read timeout, which covers
         # the SDK's expected time for a reply that runs to max_tokens (3600 s x
         # max_tokens / 128,000). A shorter one cuts a slow reply and retries it,
         # and no usage is counted for the attempts it cut.
-        assert client.timeout == anthropic.DEFAULT_TIMEOUT.read
-        assert client.timeout >= 3600 * compare.ANTHROPIC_MAX_TOKENS / 128_000
+        assert sent["read"] == anthropic.DEFAULT_TIMEOUT.read == 600
+        assert sent["read"] >= 3600 * compare.ANTHROPIC_MAX_TOKENS / 128_000
+        # Connecting keeps the SDK's own 5 s: a blackholed endpoint must not
+        # hold each attempt for the read budget.
+        assert sent["connect"] == anthropic.DEFAULT_TIMEOUT.connect == 5.0
 
 
 class TestUsageAndCost:
