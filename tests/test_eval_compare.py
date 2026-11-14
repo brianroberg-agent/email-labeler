@@ -680,6 +680,20 @@ class TestReport:
         # $0.08 over the two messages sent, not over three threads.
         assert rows["Cost per message"][1] == "$0.0400"
 
+    def test_the_header_says_arm_b_ran_only_the_threads_it_was_sent(self):
+        nr, fyi = "needs_response", "fyi"
+        arm_a = compare.ArmRun(name="Arm A", parallelism=1, results=[
+            _pred("900511", nr, nr), _pred("900512", fyi, fyi), _pred("900513", nr, nr)])
+        arm_b = compare.ArmRun(name="Arm B", parallelism=4, priced_model="claude-opus-5-5", results=[
+            _pred("900511", nr, nr), _pred("900512", fyi, fyi),
+            _pred("900513", nr, None, error=compare.NOT_SENT_REFUSALS)])
+
+        text = compare.build_report(arm_a, arm_b, golden_set_path="evals/golden_set.jsonl",
+                                    reviewed_threads=3, timestamp="2026-11-13T12:00:00+00:00")
+
+        assert "arm A ran Stage 2 on all 3 of them and arm B on the 2 it was sent" in text
+        assert "both arms ran" not in text
+
     def test_errors_are_counted_by_kind_and_the_kinds_sum_to_the_errors(self):
         nr, fyi = "needs_response", "fyi"
         unparseable = "No email label keyword in LLM output: synthetic"

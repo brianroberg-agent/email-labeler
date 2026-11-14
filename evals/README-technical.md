@@ -137,7 +137,9 @@ The Claude comparison (issue #92); usage and where it runs are in
 
 **Population and arms.** Both arms run Stage 2 on the same person threads, the
 `--local-only` population, through the real `EmailClassifier`, so the prompt is
-the one in `config.toml`, unchanged. Arm A is the `[llm.local]` client built as
+the one in `config.toml`, unchanged. Arm B is not sent the threads arm A lost to
+an outage of the local model, nor any once refusals dominate (see "Order of a
+run" and "Refusals"); the report's header gives how many it was sent. Arm A is the `[llm.local]` client built as
 `run_eval` builds it (`MLX_URL`, so where `MLX_URL` points decides where arm A's
 mail goes — decision D4). Arm B puts `AnthropicLLMClient` in the local slot. The
 cloud slot holds a stand-in that fails the row if it is called

@@ -3,7 +3,8 @@
 Arm A is the local leg as ``run_eval --local-only`` runs it: Stage 2 on the
 golden set's person threads, through the ``[llm.local]`` endpoint. Arm B runs the
 same threads through the same ``EmailClassifier`` with a Claude model in the
-local slot, so both arms see the identical prompt. Usage: evals/README.md;
+local slot, so both arms see the identical prompt; it is not sent the threads arm
+A lost to an outage, nor any once refusals dominate. Usage: evals/README.md;
 flags, the order of a run and the outputs: evals/README-technical.md.
 """
 
@@ -553,8 +554,9 @@ def build_report(
         ]
     lines += [
         f"- Run: {timestamp}",
-        f"- Golden set: `{golden_set_path}`, {reviewed_threads} reviewed threads; both arms ran "
-        f"Stage 2 on its {len(arm_a.results)} person threads (the `run_eval --local-only` population).",
+        f"- Golden set: `{golden_set_path}`, {reviewed_threads} reviewed threads, of which "
+        f"{len(arm_a.results)} are person threads (the `run_eval --local-only` population); arm A ran "
+        f"Stage 2 on all {len(arm_a.results)} of them and arm B on the {len(_sent(arm_b))} it was sent.",
         f"- Scored on the {len(rows_a)} threads both arms were sent. An arm's error counts as a miss "
         "for the thread's expected label, lowering that arm's recall; it has no predicted label, so "
         "precision and the error classes do not count it. A thread not sent to an arm is counted in "
