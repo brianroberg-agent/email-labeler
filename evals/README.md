@@ -199,7 +199,10 @@ API stand-in (decision D4) when `MLX_API_KEY` is set. If the local model does no
 stops at the plan, before the yes, the key, or anything sent to Anthropic
 (`test_unreachable_local_model_refuses_before_anything_is_sent`). After "yes"
 and the key, it runs the local arm, then the Claude arm, and writes
-`evals/results/<timestamp>_compare_<local>_vs_<model>.md` (git-ignored).
+`evals/results/<timestamp>_compare_<local>_vs_<model>.md` (git-ignored). A
+thread the local model was unavailable for during its arm (the MacBook fell
+asleep partway) is not sent to Anthropic; a thread it answered unusably is
+(`test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is`).
 `--model` picks another Claude model; flags and details are in
 [README-technical.md](README-technical.md#compare).
 

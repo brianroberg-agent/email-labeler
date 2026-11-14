@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import stat
 import statistics
 import tomllib
@@ -44,7 +45,7 @@ from evals.run_eval import (
     write_results,
 )
 from evals.schemas import GoldenThread, PredictionResult, RunMeta
-from llm_client import LLMClient, LLMContentError
+from llm_client import LLMClient, LLMContentError, LLMUnavailableError
 
 # The population both arms see: Stage 2 on reviewed person threads, i.e.
 # `run_eval --local-only`. The local model serves person bodies, so this is
@@ -139,6 +140,29 @@ def build_anthropic_client(api_key: str, *, http_client=None) -> anthropic.Async
             api_key=api_key, base_url=ANTHROPIC_BASE_URL, http_client=http_client,
             max_retries=ANTHROPIC_MAX_RETRIES, timeout=ANTHROPIC_TIMEOUT_SECONDS,
         )
+
+
+# A results row keeps only str(exc) (run_eval.evaluate_single). Where this module
+# knows by type why a call failed, it puts that kind in brackets at the front of
+# the message, and error_kind() reads it back for the report. An untagged error
+# (an unparseable reply, say) is "other".
+UNAVAILABLE = "unavailable"
+NOT_SENT = "not sent"
+NOT_SENT_LOCAL_UNAVAILABLE = f"[{NOT_SENT}] local model unavailable"
+_KIND_TAG = re.compile(r"\[([^\]]+)\] ")
+
+
+def tag(kind: str, message: str) -> str:
+    """*message* marked with its error kind, as error_kind() reads it."""
+    return f"[{kind}] {message}"
+
+
+def error_kind(error: str | None) -> str | None:
+    """A row's error kind: its tag, "other" when untagged, None without an error."""
+    if error is None:
+        return None
+    match = _KIND_TAG.match(error)
+    return match.group(1) if match else "other"
 
 
 class AnthropicLLMClient:
@@ -282,8 +306,9 @@ def format_plan(plan: Plan) -> str:
         f"{local_state}.",
         f"Arm B:       {plan.model} through the Anthropic API, effort {ANTHROPIC_EFFORT}, "
         f"max_tokens {ANTHROPIC_MAX_TOKENS}, no fallback model.",
-        f"API calls:   {est.calls:,} message requests to Anthropic (one per thread; a rate-limit "
-        "or overload reply is retried) and 1 model lookup that sends no mail.",
+        f"API calls:   up to {est.calls:,} message requests to Anthropic (one per thread; a thread "
+        "the local model was unavailable for in arm A is not sent; a rate-limit or overload reply "
+        "is retried) and 1 model lookup that sends no mail.",
         f"Tokens:      about {est.input_tokens:,} input tokens ({est.input_chars:,} prompt "
         f"characters at {CHARS_PER_TOKEN} per token) and {est.output_tokens:,} output tokens "
         f"({ASSUMED_OUTPUT_TOKENS_PER_CALL:,} per reply assumed, thinking included).",
@@ -294,7 +319,7 @@ def format_plan(plan: Plan) -> str:
         f"{plan.model}, as of {PRICES_AS_OF}.",
         "",
         "Privacy:     The golden sets are real mail, and arm B sends them to Anthropic: "
-        f"{plan.person_threads} threads, each with its senders, subject and transcript "
+        f"up to {plan.person_threads} threads, each with its senders, subject and transcript "
         f"(up to {plan.max_thread_chars:,} characters).",
         "             Anthropic publishes its API retention: inputs are deleted within 30 days, "
         "and zero retention is available under an agreement (as issue #92 records it).",
@@ -354,13 +379,18 @@ COST_ORDER = [
 ]
 
 
+def _sent(arm: ArmRun) -> set[str]:
+    return {r.thread_id for r in arm.results if error_kind(r.error) != NOT_SENT}
+
+
 def _scored(arm_a: ArmRun, arm_b: ArmRun) -> tuple[list[PredictionResult], list[PredictionResult]]:
     """Each arm's rows for the threads both arms were sent, errors included.
 
     An error stays in its arm's figures as a miss: in production a failed thread
     is deferred, so its action is late (rubric cost class 2 for needs_response).
+    A thread one arm was not sent is scored for neither.
     """
-    both = {r.thread_id for r in arm_a.results} & {r.thread_id for r in arm_b.results}
+    both = _sent(arm_a) & _sent(arm_b)
     return ([r for r in arm_a.results if r.thread_id in both],
             [r for r in arm_b.results if r.thread_id in both])
 
@@ -387,6 +417,9 @@ def _arm_cells(rows: list[PredictionResult], arm: ArmRun) -> dict[str, str]:
     cells["Errors (no usable answer)"] = (
         f"{errored.total()}/{len(rows)}" + (f" ({by_label})" if by_label else "")
     )
+    not_sent = Counter(r.error.split("] ", 1)[1] for r in arm.results if error_kind(r.error) == NOT_SENT)
+    reasons = ", ".join(f"{reason} {n}" for reason, n in not_sent.items())
+    cells["Threads not sent"] = f"{not_sent.total()}" + (f" ({reasons})" if reasons else "")
     seconds = [r.duration_seconds for r in rows if r.error is None]
     cells["Latency per message, median"] = f"{statistics.median(seconds):.1f} s" if seconds else "N/A"
     cells["Latency per message, p90"] = f"{percentile(seconds, 90):.1f} s" if seconds else "N/A"
@@ -394,7 +427,7 @@ def _arm_cells(rows: list[PredictionResult], arm: ArmRun) -> dict[str, str]:
         cells["Cost per message"] = cells["Cost, total"] = "$0 (local)"
     else:
         price_in, price_out = PRICES_PER_MTOK[arm.priced_model]
-        sent = len(arm.results)
+        sent = len(_sent(arm))
         cells["Cost per message"] = f"${arm.cost / sent:.4f}" if sent else "N/A"
         cells["Cost, total"] = (
             f"${arm.cost:.2f} ({arm.input_tokens:,} input / {arm.output_tokens:,} output tokens "
@@ -411,7 +444,7 @@ _ROW_ORDER = (
     + [label for label, _ in COST_ORDER]
     + ["needs_response precision", "fyi recall", "fyi precision",
        "low_priority recall", "low_priority precision",
-       "Errors (no usable answer)",
+       "Errors (no usable answer)", "Threads not sent",
        "Latency per message, median", "Latency per message, p90",
        "Cost per message", "Cost, total"]
 )
@@ -432,7 +465,8 @@ def build_report(
         f"Stage 2 on its {len(arm_a.results)} person threads (the `run_eval --local-only` population).",
         f"- Scored on the {len(rows_a)} threads both arms were sent. An arm's error counts as a miss "
         "for the thread's expected label, lowering that arm's recall; it has no predicted label, so "
-        "precision and the error classes do not count it.",
+        "precision and the error classes do not count it. A thread not sent to an arm is counted in "
+        "its own row and scored for neither arm.",
         "- Error classes follow the cost order of `docs/labeling-rubric.md` section 3 (decision D21), "
         "worst first.",
         "",
@@ -496,6 +530,31 @@ def load_config(path: str | None) -> tuple[dict, Path]:
     config_path = Path(path) if path else DEFAULT_CONFIG
     with open(config_path, "rb") as f:
         return substitute_env_vars(tomllib.load(f)), config_path
+
+
+class _LocalArm:
+    """Arm A's client as its classifier calls it. An outage of the local model
+    (LLMUnavailableError: unreachable, a dropped connection, an exhausted 429, a
+    5xx) is re-raised tagged "unavailable", so the row records the cause by type
+    and arm B is not sent that thread."""
+
+    def __init__(self, llm):
+        self._llm = llm
+        self.model = llm.model
+
+    async def complete(self, system_prompt, user_content, include_thinking=False):
+        try:
+            return await self._llm.complete(system_prompt, user_content, include_thinking=include_thinking)
+        except LLMUnavailableError as exc:
+            raise LLMUnavailableError(tag(UNAVAILABLE, str(exc)), tier=exc.tier) from exc
+
+
+def _not_sent(thread: GoldenThread, error: str) -> PredictionResult:
+    """Arm B's row for a thread it did not send: no request, no answer, no cost."""
+    return PredictionResult(
+        thread_id=thread.thread_id, expected_sender_type=thread.expected_sender_type,
+        expected_label=thread.expected_label, expected_assistant=thread.expected_assistant, error=error,
+    )
 
 
 def build_local_llm(config: dict) -> LLMClient:
@@ -592,7 +651,7 @@ async def run_comparison(
         print("\nDry run: no mail was sent; the local model received one probe.")
         return 0
 
-    answer = input_fn(f"\nType yes to send these {len(threads)} threads to Anthropic and run both arms: ")
+    answer = input_fn(f"\nType yes to run both arms and send up to {len(threads)} threads to Anthropic: ")
     if not confirmed(answer):
         print("Stopped. Nothing was sent to Anthropic.")
         return 1
@@ -612,7 +671,7 @@ async def run_comparison(
     output_dir = Path(args.output_dir)
     # The daemon's local concurrency, read as daemon.py reads it.
     local_parallel = resolve_int_env("LOCAL_PARALLEL", config.get("daemon", {}).get("local_parallel", 1))
-    classifier_a = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=local_llm, config=config)
+    classifier_a = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=_LocalArm(local_llm), config=config)
     print(f"\nArm A: {local_llm.model}, {len(threads)} threads, {local_parallel} at a time...")
     results_a, _ = await run_evaluation(threads, classifier_a, STAGES, max_chars, parallelism=local_parallel)
     path_a = _write_arm_results(
@@ -626,12 +685,23 @@ async def run_comparison(
               "was sent to Anthropic.")
         return 1
 
+    # Decided per thread, by cause. A thread arm A lost to an outage of the local
+    # model buys no comparison, so its mail is not sent to Anthropic. A thread
+    # arm A failed on content (an unusable reply, a read timeout) is a measured
+    # outcome of the local leg, so it is sent.
+    withheld = {r.thread_id for r in results_a if error_kind(r.error) == UNAVAILABLE}
+    to_send = [t for t in threads if t.thread_id not in withheld]
     claude = AnthropicLLMClient(client, args.model)
     classifier_b = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=claude, config=config)
-    print(f"\nArm B: {args.model}, {len(threads)} threads, {ANTHROPIC_PARALLELISM} at a time...")
-    results_b, _ = await run_evaluation(
-        threads, classifier_b, STAGES, max_chars, parallelism=ANTHROPIC_PARALLELISM,
+    print(f"\nArm B: {args.model}, {len(to_send)} threads, {ANTHROPIC_PARALLELISM} at a time"
+          + (f" ({len(withheld)} not sent: the local model was unavailable for them)" if withheld else "")
+          + "...")
+    sent_b, _ = await run_evaluation(
+        to_send, classifier_b, STAGES, max_chars, parallelism=ANTHROPIC_PARALLELISM,
     )
+    rows_b = {r.thread_id: r for r in sent_b}
+    results_b = [rows_b[t.thread_id] if t.thread_id in rows_b else _not_sent(t, NOT_SENT_LOCAL_UNAVAILABLE)
+                 for t in threads]
     path_b = _write_arm_results(
         output_dir, f"compare-B-{args.model}", results_b, config=config,
         config_path=config_path, golden_path=golden_path, classifier=classifier_b,

@@ -168,7 +168,13 @@ SDK log each request body, the mail included, so the entry point holds the
 
 **Order of a run.** Plan → stop if the local model did not answer → typed
 `yes` → key → a model lookup that sends no mail (checks the key and the model
-id) → arm A → stop if arm A produced no result → arm B → report.
+id) → arm A → stop if arm A produced no result → arm B on the threads arm A
+did not lose to an outage of the local model → report. Arm A's client is
+wrapped so an `LLMUnavailableError` is tagged in its row; arm B is not sent
+those threads, and its results file records them as `[not sent] local model
+unavailable`. A thread arm A failed on content is sent. The report counts the
+threads not sent in their own row and scores them for neither arm, and arm
+B's cost per message is over the threads it sent.
 
 **Estimate.** `capture_prompts()` runs the threads through the classifier with
 a recorder in the local slot, so the estimate counts the exact Stage 2 prompts.

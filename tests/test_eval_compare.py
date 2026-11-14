@@ -544,6 +544,26 @@ class TestReport:
         assert rows["Errors (no usable answer)"] == ["0/3", "1/3 (needs_response 1)"]
         assert "Scored on the 3 threads both arms were sent" in text
 
+    def test_threads_not_sent_are_neither_errors_nor_billed_messages(self):
+        nr, fyi = "needs_response", "fyi"
+        arm_a = compare.ArmRun(name="Arm A", parallelism=1, results=[
+            _pred("900501", nr, nr), _pred("900502", fyi, fyi), _pred("900503", nr, nr)])
+        arm_b = compare.ArmRun(
+            name="Arm B", parallelism=4, priced_model="claude-opus-5-5",
+            input_tokens=10_000, output_tokens=2_000, results=[
+                _pred("900501", nr, nr), _pred("900502", fyi, fyi),
+                _pred("900503", nr, None, error=compare.NOT_SENT_LOCAL_UNAVAILABLE)])
+
+        rows, _ = _rows(compare.build_report(
+            arm_a, arm_b, golden_set_path="evals/golden_set.jsonl", reviewed_threads=3,
+            timestamp="2026-11-13T12:00:00+00:00"))
+
+        assert rows["Errors (no usable answer)"] == ["0/2", "0/2"]
+        assert rows["needs_response recall"] == ["100.0% (1/1)", "100.0% (1/1)"]
+        assert rows["Threads not sent"] == ["0", "1 (local model unavailable 1)"]
+        # $0.08 over the two messages sent, not over three threads.
+        assert rows["Cost per message"][1] == "$0.0400"
+
     def test_holds_counts_only_no_thread_ids(self):
         report = _report()
 
@@ -568,9 +588,13 @@ class _FakeLocal:
     model = "qwen-synthetic:8b"
     base_url = "http://ollama.example.test:11434/v1/chat/completions"
 
-    def __init__(self, *, reachable=True, fail=False):
+    def __init__(self, *, reachable=True, fail=False, outage_on=None, content_failure_on=None):
         self.reachable = reachable
         self.fail = fail
+        # Fail only the thread whose prompt holds this text: an outage
+        # (LLMUnavailableError) or an unusable reply (LLMContentError).
+        self.outage_on = outage_on
+        self.content_failure_on = content_failure_on
         self.calls = 0
         self.probes = 0
 
@@ -582,8 +606,11 @@ class _FakeLocal:
 
     async def complete(self, system_prompt, user_content, include_thinking=False):
         self.calls += 1
-        if self.fail:
+        if self.fail or (self.outage_on and self.outage_on in user_content):
             raise LLMUnavailableError("synthetic outage", tier="local")
+        if self.content_failure_on and self.content_failure_on in user_content:
+            # Worded to catch a rule that matches on text instead of type.
+            raise LLMContentError("synthetic unusable reply; endpoint unavailable wording")
         return ("FYI", "") if include_thinking else "FYI"
 
 
@@ -730,6 +757,34 @@ class TestRunComparison:
         out = capsys.readouterr().out
         # The model lookup did reach Anthropic; what was not sent is mail.
         assert "arm B was not run and no mail was sent to Anthropic" in out
+
+    async def test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is(
+        self, golden_file, tmp_path,
+    ):
+        # The MacBook sleeps partway through arm A: the thread it lost to the
+        # outage buys no comparison, so its mail must not go to Anthropic. A
+        # thread arm A answered unusably is a measured outcome and is sent.
+        router = _Router()
+        local = _FakeLocal(outage_on="Synthetic subject alpha", content_failure_on="Synthetic subject beta")
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=local, client_factory=_factory(router, []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        sent = [json.loads(r.content)["messages"][0]["content"] for r in router.message_requests()]
+        assert len(sent) == 2
+        assert not any("Synthetic subject alpha" in content for content in sent)
+        assert any("Synthetic subject beta" in content for content in sent)
+        assert code == 0
+        [path_b] = (tmp_path / "results").glob("*compare-B-*.jsonl")
+        rows_b = {r.thread_id: r for r in report.load_results(path_b)[1]}
+        assert rows_b["900101"].error == compare.NOT_SENT_LOCAL_UNAVAILABLE
+        [report_file] = (tmp_path / "results").glob("*.md")
+        text = report_file.read_text()
+        rows, _ = _rows(text)
+        assert rows["Threads not sent"] == ["0", "1 (local model unavailable 1)"]
+        assert "Scored on the 2 threads both arms were sent" in text
 
     async def test_full_run_compares_both_arms_on_person_threads(self, golden_file, tmp_path):
         router, keys, local = _Router(), [], _FakeLocal()
