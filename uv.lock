@@ -102,8 +102,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", marker = "extra == 'compare'", specifier = ">=1.0.0" },
-    { name = "anthropic", marker = "extra == 'dev'", specifier = ">=1.0.0" },
+    { name = "anthropic", marker = "extra == 'compare'", specifier = ">=2.8.0" },
+    { name = "anthropic", marker = "extra == 'dev'", specifier = ">=2.8.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
