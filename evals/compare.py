@@ -10,11 +10,21 @@ in evals/README.md.
 import os
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import anthropic
 
+from classifier import EmailClassifier
+from evals.run_eval import evaluate_single, resolve_max_thread_chars
+from evals.schemas import GoldenThread
 from llm_client import LLMClient, LLMContentError
+
+# The population both arms see: Stage 2 on reviewed person threads, i.e.
+# `run_eval --local-only`. Person bodies are the only traffic the local model
+# serves, so this is the leg issue #92 would move.
+STAGES = "stage2_only"
+SENDER_TYPE = "person"
 
 # Request shape for arm B. Effort is sent explicitly because the default differs
 # by model; max_tokens covers adaptive thinking (billed as output) plus the
@@ -45,6 +55,139 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     """Dollar cost of the given token counts at *model*'s published price."""
     price_in, price_out = PRICES_PER_MTOK[model]
     return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+
+# Token estimate for the dry run. The API's token counter is itself an API
+# call, so the estimate is offline: prompt characters over a ratio. 3.5
+# characters per token is deliberately below the common rule of thumb of 4,
+# because current Claude tokenizers produce up to ~1.35x more tokens than older
+# ones. Output is an assumption per call (adaptive thinking is billed as
+# output and cannot be predicted), so the plan also prints the ceiling: every
+# reply running to max_tokens.
+CHARS_PER_TOKEN = 3.5
+ASSUMED_OUTPUT_TOKENS_PER_CALL = 1000
+
+
+@dataclass(frozen=True)
+class Estimate:
+    calls: int
+    input_chars: int
+    input_tokens: int
+    output_tokens: int
+    cost: float
+    ceiling: float
+
+
+def estimate(model: str, prompts: list[tuple[str, str]]) -> Estimate:
+    """Estimated tokens and cost of sending *prompts* (system, user) to *model*."""
+    calls = len(prompts)
+    input_chars = sum(len(system) + len(user) for system, user in prompts)
+    input_tokens = round(input_chars / CHARS_PER_TOKEN)
+    output_tokens = calls * ASSUMED_OUTPUT_TOKENS_PER_CALL
+    return Estimate(
+        calls=calls,
+        input_chars=input_chars,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost=cost_usd(model, input_tokens, output_tokens),
+        ceiling=cost_usd(model, input_tokens, calls * ANTHROPIC_MAX_TOKENS),
+    )
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What a run would do, as the dry run states it."""
+
+    golden_set_path: str
+    reviewed_threads: int
+    person_threads: int
+    max_thread_chars: int
+    local_model: str
+    local_url: str
+    local_error: str | None  # None when the local endpoint answered its probe
+    model: str
+    estimate: Estimate
+
+
+def format_plan(plan: Plan) -> str:
+    """The dry-run text: sets, models, calls, estimated tokens and cost, and
+    what leaves the house. It holds counts only, never a subject or sender."""
+    est = plan.estimate
+    price_in, price_out = PRICES_PER_MTOK[plan.model]
+    if plan.local_error is None:
+        local_state = "reachable"
+    else:
+        local_state = f"NOT reachable ({plan.local_error})"
+    lines = [
+        "Claude comparison eval: plan",
+        "",
+        f"Golden set:  {plan.golden_set_path}: {plan.reviewed_threads} reviewed threads, of which "
+        f"{plan.person_threads} person threads are used (Stage 2, the local model's traffic).",
+        f"Arm A:       local model {plan.local_model} at {plan.local_url or '<unset MLX_URL>'}: "
+        f"{local_state}.",
+        f"Arm B:       {plan.model} through the Anthropic API, effort {ANTHROPIC_EFFORT}, "
+        f"max_tokens {ANTHROPIC_MAX_TOKENS}, no fallback model.",
+        f"API calls:   {est.calls:,} message requests to Anthropic (one per thread; a rate-limit "
+        "or overload reply is retried) and 1 model lookup that sends no mail.",
+        f"Tokens:      about {est.input_tokens:,} input tokens ({est.input_chars:,} prompt "
+        f"characters at {CHARS_PER_TOKEN} per token) and {est.output_tokens:,} output tokens "
+        f"({ASSUMED_OUTPUT_TOKENS_PER_CALL:,} per reply assumed, thinking included).",
+        f"Cost:        about ${est.cost:,.2f}, and at most ${est.ceiling:,.2f} if every reply "
+        f"ran to max_tokens. Prices: ${price_in:.2f} / ${price_out:.2f} per million input / "
+        f"output tokens for {plan.model}, as of {PRICES_AS_OF}. This is an estimate, not a quote.",
+        "",
+        "Privacy:     The golden sets are real mail, and arm B sends them to Anthropic: "
+        f"{plan.person_threads} threads, each with its senders, subject and transcript "
+        f"(up to {plan.max_thread_chars:,} characters).",
+        "             Anthropic publishes its API retention: inputs are deleted within 30 days, "
+        "and zero retention is available under an agreement (as issue #92 records it).",
+    ]
+    if plan.local_error is not None:
+        lines += [
+            "",
+            "The local model is not reachable (is the MacBook asleep?). The run will not start, "
+            "so nothing is sent to Anthropic.",
+        ]
+    return "\n".join(lines)
+
+
+def confirmed(answer: str) -> bool:
+    """True only for a typed "yes": the one approval the run asks for."""
+    return answer.strip().lower() == "yes"
+
+
+class CloudNotUsed:
+    """Stands in the cloud slot: the comparison runs Stage 2 on person threads,
+    which only the local slot serves, so a call here is a bug and fails the row."""
+
+    model = "(cloud tier not used)"
+
+    async def complete(self, system_prompt, user_content, include_thinking=False):
+        raise RuntimeError("the comparison never calls the cloud tier")
+
+
+class _PromptRecorder:
+    """Local-slot stand-in that records each prompt and answers FYI."""
+
+    model = "(prompt recorder)"
+
+    def __init__(self):
+        self.prompts: list[tuple[str, str]] = []
+
+    async def complete(self, system_prompt, user_content, include_thinking=False):
+        self.prompts.append((system_prompt, user_content))
+        return ("FYI", "") if include_thinking else "FYI"
+
+
+async def capture_prompts(threads: list[GoldenThread], config: dict) -> list[tuple[str, str]]:
+    """The (system, user) prompt each thread sends in Stage 2, built by the
+    classifier itself through the same path the arms run, without any call."""
+    recorder = _PromptRecorder()
+    classifier = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=recorder, config=config)
+    max_chars = resolve_max_thread_chars(config)
+    for thread in threads:
+        await evaluate_single(thread, classifier, STAGES, max_chars)
+    return recorder.prompts
 
 
 class ApiKeyError(Exception):

@@ -6,13 +6,17 @@ SDK's own; the local arm and the cloud tier are plain fake classes. Every
 fixture is synthetic mail (``example.test`` addresses, invented names).
 """
 
+import base64
 import json
 
 import anthropic
 import httpx2
 import pytest
 
+from classifier import EmailClassifier
+from daemon import load_config
 from evals import compare
+from evals.schemas import GoldenThread
 from llm_client import LLMContentError
 
 SENTINEL_KEY = "sk-ant-test-SENTINEL-0000"
@@ -232,3 +236,121 @@ class TestObtainKey:
 
 def _no_prompt(prompt):
     raise AssertionError("getpass must not be called when a key file is given")
+
+
+def _gmail_message(sender, subject, body, internal_date="1700000000000"):
+    data = base64.urlsafe_b64encode(body.encode()).decode()
+    return {
+        "id": "m" + internal_date, "threadId": "t", "internalDate": internal_date,
+        "snippet": body[:40],
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "From", "value": sender},
+                {"name": "Subject", "value": subject},
+                {"name": "Date", "value": "Mon, 6 Nov 2023 12:00:00 +0000"},
+            ],
+            "body": {"data": data, "size": len(body)},
+        },
+    }
+
+
+def _thread(thread_id, sender_type="person", label="fyi", *, subject=None, body=None,
+            sender="Pat Example <pat@example.test>", reviewed=True):
+    subject = subject or f"Synthetic subject {thread_id}"
+    body = body or f"Synthetic body text for {thread_id}."
+    return GoldenThread(
+        thread_id=thread_id, messages=[_gmail_message(sender, subject, body)],
+        senders=[sender], subject=subject, snippet=body[:40],
+        expected_sender_type=sender_type, expected_label=label, reviewed=reviewed,
+    )
+
+
+class TestCapturePrompts:
+    async def test_captures_the_classifier_prompt_for_each_thread(self):
+        config = load_config()
+        threads = [
+            _thread("900001", subject="Lunch on Thursday?", body="Could you join us Thursday?"),
+            _thread("900002", subject="Minutes attached", body="Notes from the meeting."),
+        ]
+
+        prompts = await compare.capture_prompts(threads, config)
+
+        categories = list(config["prompts"]["email_classification"]["categories"])
+        expected_system = EmailClassifier(None, None, config)._build_email_prompt(categories)
+        assert [system for system, _ in prompts] == [expected_system, expected_system]
+        assert "Lunch on Thursday?" in prompts[0][1]
+        assert "Could you join us Thursday?" in prompts[0][1]
+        assert "pat@example.test" in prompts[0][1]
+        assert "Notes from the meeting." in prompts[1][1]
+
+
+class TestEstimate:
+    def test_estimate_from_prompt_characters_and_assumed_output(self):
+        prompts = [("s" * 1000, "u" * 750), ("s" * 1000, "u" * 750)]  # 3500 chars
+
+        est = compare.estimate("claude-opus-5-5", prompts)
+
+        assert est.calls == 2
+        assert est.input_chars == 3500
+        assert est.input_tokens == round(3500 / compare.CHARS_PER_TOKEN)
+        assert est.output_tokens == 2 * compare.ASSUMED_OUTPUT_TOKENS_PER_CALL
+        assert est.cost == pytest.approx(
+            compare.cost_usd("claude-opus-5-5", est.input_tokens, est.output_tokens))
+        assert est.ceiling == pytest.approx(
+            compare.cost_usd("claude-opus-5-5", est.input_tokens, 2 * compare.ANTHROPIC_MAX_TOKENS))
+
+
+def _plan(**kw):
+    prompts = [("s" * 2000, "u" * 1500)] * 5
+    base = dict(
+        golden_set_path="evals/golden_set.jsonl", reviewed_threads=12, person_threads=5,
+        max_thread_chars=16000, local_model="qwen-synthetic:8b",
+        local_url="http://ollama.example.test:11434/v1/chat/completions", local_error=None,
+        model="claude-opus-5-5", estimate=compare.estimate("claude-opus-5-5", prompts),
+    )
+    base.update(kw)
+    return compare.Plan(**base)
+
+
+class TestPlan:
+    def test_states_sets_models_calls_tokens_and_cost(self):
+        text = compare.format_plan(_plan())
+
+        assert "evals/golden_set.jsonl" in text
+        assert "12 reviewed threads" in text and "5 person threads" in text
+        assert "qwen-synthetic:8b" in text and "ollama.example.test" in text
+        assert "reachable" in text
+        assert "claude-opus-5-5" in text
+        assert f"effort {compare.ANTHROPIC_EFFORT}" in text
+        assert "5 message requests" in text
+        assert "1 model lookup that sends no mail" in text
+        assert "5,000 input tokens" in text  # 17,500 chars at 3.5 chars/token
+        assert "5,000 output tokens" in text  # 1,000 assumed per call
+        assert "$0.12" in text  # 5,000 x $4 + 5,000 x $20 per million
+        assert "$4.00 / $20.00 per million" in text and "2026-11-03" in text
+        assert "estimate" in text.lower()
+
+    def test_says_plainly_that_real_mail_goes_to_anthropic(self):
+        text = compare.format_plan(_plan())
+
+        assert "The golden sets are real mail, and arm B sends them to Anthropic" in text
+        assert ("inputs are deleted within 30 days, and zero retention is available "
+                "under an agreement") in text
+
+    def test_an_unreachable_local_model_is_stated_and_the_run_refused(self):
+        text = compare.format_plan(_plan(local_error="ConnectError: connection refused"))
+
+        assert "NOT reachable" in text
+        assert "ConnectError: connection refused" in text
+        assert "will not start" in text
+
+
+class TestConfirmation:
+    @pytest.mark.parametrize("answer", ["yes", "YES", "  yes\n"])
+    def test_yes_proceeds(self, answer):
+        assert compare.confirmed(answer)
+
+    @pytest.mark.parametrize("answer", ["", "y", "no", "yes please", "sure"])
+    def test_anything_else_stops(self, answer):
+        assert not compare.confirmed(answer)
