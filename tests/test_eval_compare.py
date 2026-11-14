@@ -161,7 +161,12 @@ class TestBuildAnthropicClient:
         client = compare.build_anthropic_client(SENTINEL_KEY)
 
         assert client.max_retries == compare.ANTHROPIC_MAX_RETRIES
-        assert client.timeout == compare.ANTHROPIC_TIMEOUT_SECONDS
+        # Each attempt gets the SDK's own non-streaming read timeout, which covers
+        # the SDK's expected time for a reply that runs to max_tokens (3600 s x
+        # max_tokens / 128,000). A shorter one cuts a slow reply and retries it,
+        # and no usage is counted for the attempts it cut.
+        assert client.timeout == anthropic.DEFAULT_TIMEOUT.read
+        assert client.timeout >= 3600 * compare.ANTHROPIC_MAX_TOKENS / 128_000
 
 
 class TestUsageAndCost:

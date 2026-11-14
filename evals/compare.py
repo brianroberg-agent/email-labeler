@@ -54,10 +54,13 @@ ANTHROPIC_MAX_TOKENS = 16000
 ANTHROPIC_EFFORT = "medium"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # The SDK retries 408/409/429/5xx (529 "overloaded" included) and connection
-# errors with exponential backoff, honouring retry-after. Each attempt is bounded
-# by the timeout, which matches [llm.local]'s 180 s request budget.
+# errors, timeouts among them, with exponential backoff, honouring retry-after.
+# Each attempt is bounded by the timeout: 600 s, the SDK's own read timeout for a
+# non-streaming request, which covers its expected time for a reply that runs to
+# max_tokens (3600 s x 16000 / 128000 = 450 s). A shorter bound would cut slow
+# replies and retry them with no usage counted for the cut attempts.
 ANTHROPIC_MAX_RETRIES = 4
-ANTHROPIC_TIMEOUT_SECONDS = 180.0
+ANTHROPIC_TIMEOUT_SECONDS = 600.0
 
 
 class ApiKeyError(Exception):
