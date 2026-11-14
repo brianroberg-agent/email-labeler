@@ -130,7 +130,7 @@ The Claude comparison (issue #92); usage and where it runs are in
 | `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`). Its reviewed, non-excluded **person** threads are used |
 | `--config` | Path to config.toml (default: the repo-root `config.toml`) |
 | `--output-dir` | Where the report and the two per-arm results files are written (default: `evals/results/`, git-ignored) |
-| `--model` | Claude model for arm B, one of the priced models in `PRICES_PER_MTOK` (`evals/compare.py`); default `claude-opus-5-5`. Any other value is an argparse error, so every run can be costed |
+| `--model` | Claude model for arm B, one of the priced models in `PRICES_PER_MTOK` (`evals/compare.py`); default `claude-opus-5-5`. Any other value is an argparse error, so each run can be costed (`test_model_defaults_to_opus_and_accepts_only_priced_models`) |
 | `--anthropic-key-file` | Read the API key from this file instead of the hidden prompt. The file must be owner-only (`chmod 600`); a wider mode, an empty file or an unreadable path stops the run with a one-line reason |
 | `--dry-run` | Print the plan and stop. Exits 1 when the local model did not answer its probe, as a real run would |
 | `--max-threads` | Use at most this many person threads (a cheap first run) |
@@ -140,21 +140,24 @@ The Claude comparison (issue #92); usage and where it runs are in
 the one in `config.toml`, unchanged. Arm A is the `[llm.local]` client built as
 `run_eval` builds it (`MLX_URL`, so where `MLX_URL` points decides where arm A's
 mail goes — decision D4). Arm B puts `AnthropicLLMClient` in the local slot. The
-cloud slot holds a stand-in that fails any call, so neither arm reaches the
-cloud tier. Arm A runs at `local_parallel`, not `run_eval`'s `cloud_parallel`,
-so its latency is the latency production sees. Neither arm uses the response
+cloud slot holds a stand-in that fails the row if it is called
+(`test_full_run_compares_both_arms_on_person_threads` sees no such error).
+Arm A runs at `local_parallel`, not `run_eval`'s `cloud_parallel`, so its
+latency is the latency production sees. Neither arm uses the response
 cache: a hit has no latency and no usage, and arm A may already be cached from
 earlier runs.
 
 **Arm B's request.** Model, effort, `max_tokens`, retry budget, per-request
 timeout and concurrency are module constants in `evals/compare.py`, each with
-its reason. No `temperature` is sent (current models reject it), thinking is
-left at its adaptive default (it cannot be turned off on them), and no
-`fallbacks` model is set: a fallback would change which model answered. A reply
+its reason. No `temperature` is sent and thinking is left at its adaptive
+default: the claude-api skill's model notes (2026-11) list a temperature as
+rejected by the current models and disabled thinking as rejected by Opus 5.5.
+No `fallbacks` model is set: a fallback would change which model answered. A reply
 stopped at `max_tokens` or by a refusal, or one with no answer outside its
 reasoning, raises `LLMContentError` and counts as that arm's error. The SDK
-client is built from the given key and the fixed base URL with every
-`ANTHROPIC_*` variable hidden, because `daemon.py` loads `.env` at import.
+client is built from the given key and the fixed base URL with the
+`ANTHROPIC_*` variables hidden, because `daemon.py` loads `.env` at import
+(`test_uses_only_the_given_key_whatever_the_environment_holds`).
 
 **Order of a run.** Plan → stop if the local model did not answer → typed
 `yes` → key → a model lookup that sends no mail (checks the key and the model
@@ -164,7 +167,7 @@ id) → arm A → stop if arm A produced no result → arm B → report.
 a recorder in the local slot, so the estimate counts the exact Stage 2 prompts.
 Input tokens are prompt characters over `CHARS_PER_TOKEN`; output is
 `ASSUMED_OUTPUT_TOKENS_PER_CALL` per reply (adaptive thinking bills as output
-and cannot be predicted). The plan also prints the ceiling, every reply at
+and is not known in advance). The plan also prints the ceiling, every reply at
 `max_tokens`. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
 The API's token counter is itself an API call, so it is not used.
 

@@ -42,8 +42,8 @@ from evals.schemas import GoldenThread, PredictionResult, RunMeta
 from llm_client import LLMClient, LLMContentError
 
 # The population both arms see: Stage 2 on reviewed person threads, i.e.
-# `run_eval --local-only`. Person bodies are the only traffic the local model
-# serves, so this is the leg issue #92 would move.
+# `run_eval --local-only`. The local model serves person bodies, so this is
+# the leg issue #92 would move.
 STAGES = "stage2_only"
 SENDER_TYPE = "person"
 
@@ -194,7 +194,7 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
 # characters per token is deliberately below the common rule of thumb of 4,
 # because current Claude tokenizers produce up to ~1.35x more tokens than older
 # ones. Output is an assumption per call (adaptive thinking is billed as
-# output and cannot be predicted), so the plan also prints the ceiling: every
+# output and is not known in advance), so the plan also prints the ceiling: every
 # reply running to max_tokens.
 CHARS_PER_TOKEN = 3.5
 ASSUMED_OUTPUT_TOKENS_PER_CALL = 1000
@@ -243,7 +243,7 @@ class Plan:
 
 def format_plan(plan: Plan) -> str:
     """The dry-run text: sets, models, calls, estimated tokens and cost, and
-    what leaves the house. It holds counts only, never a subject or sender."""
+    what leaves the house. It holds counts, no subject or sender."""
     est = plan.estimate
     price_in, price_out = PRICES_PER_MTOK[plan.model]
     if plan.local_error is None:

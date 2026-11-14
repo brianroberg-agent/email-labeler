@@ -11,8 +11,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # The Claude comparison eval (evals/compare.py, issue #92). An extra, not a main
-# dependency: the daemon never calls Anthropic, and the Docker image installs
-# main dependencies only (`uv sync --no-dev`), so the SDK stays out of it.
+# dependency: the daemon does not use the SDK (its newsletter tier speaks the
+# OpenAI-compatible API over httpx), and the Docker image installs main
+# dependencies only (`uv sync --no-dev`), so the SDK stays out of it.
 compare = [
     "anthropic>=1.0.0",
 ]

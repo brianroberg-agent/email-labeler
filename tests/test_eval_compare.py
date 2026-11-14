@@ -84,9 +84,10 @@ class TestAnthropicLLMClient:
         assert body["messages"] == [{"role": "user", "content": "USER CONTENT"}]
         assert body["max_tokens"] == compare.ANTHROPIC_MAX_TOKENS
         assert body["output_config"] == {"effort": compare.ANTHROPIC_EFFORT}
-        # temperature is rejected by current models; thinking cannot be disabled
-        # on them and is left to its adaptive default; fallbacks would change
-        # which model answered, which an eval must not do.
+        # Per the claude-api skill's model notes, current models reject a
+        # temperature and Opus 5.5 rejects disabled thinking, so thinking is
+        # left at its adaptive default; fallbacks would change which model
+        # answered, which an eval must not do.
         for absent in ("temperature", "thinking", "fallbacks"):
             assert absent not in body
 
