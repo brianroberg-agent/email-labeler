@@ -238,7 +238,10 @@ rejected by Opus 5.5. The report holds counts only, no subject, sender, body or
 thread id (`test_report_holds_no_message_content`,
 `test_holds_counts_only_no_thread_ids`). Next to it are two ordinary results
 files, `*_stage2_only_compare-A-*.jsonl` and `*_stage2_only_compare-B-*.jsonl`,
-which `evals.report --compare` reads like any other run.
+which `evals.report --compare` reads like any other run, by its own rules: it
+leaves errors out of its figures and prints no error count, so its figures
+differ from the comparison report's. Read the comparison report for errors
+and threads not sent.
 
 ## Newsletter Evaluation CLI Reference
 
