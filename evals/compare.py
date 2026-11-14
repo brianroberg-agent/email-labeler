@@ -8,6 +8,7 @@ in evals/README.md.
 """
 
 import argparse
+import asyncio
 import getpass
 import hashlib
 import json
@@ -613,3 +614,35 @@ async def run_comparison(
     print("\n" + text)
     print(f"Report: {report_path}\nPer-arm results: {path_a}, {path_b}")
     return 0
+
+
+DEFAULT_MODEL = "claude-opus-5-5"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Compare the local model with a Claude model on the golden set (issue #92). "
+                    "Prints the plan, asks for a typed yes, then runs both arms and writes a report.",
+    )
+    parser.add_argument("--golden-set", default="evals/golden_set.jsonl", help="Path to golden set JSONL")
+    parser.add_argument("--config", help="Path to config.toml (default: the repo-root config.toml)")
+    parser.add_argument("--output-dir", default="evals/results/",
+                        help="Directory for the report and the two per-arm results files")
+    parser.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(PRICES_PER_MTOK),
+                        help=f"Claude model for arm B (default: {DEFAULT_MODEL})")
+    parser.add_argument("--anthropic-key-file", type=Path, metavar="PATH",
+                        help="Read the Anthropic API key from this owner-only file "
+                             "(default: prompt for it, input hidden)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the plan (sets, models, calls, estimated tokens and cost) and stop")
+    parser.add_argument("--max-threads", type=int, help="Use at most this many person threads")
+    return parser
+
+
+def cli():
+    args = build_parser().parse_args()
+    raise SystemExit(asyncio.run(run_comparison(args)))
+
+
+if __name__ == "__main__":
+    cli()

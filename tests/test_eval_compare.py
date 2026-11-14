@@ -688,3 +688,33 @@ class TestRunComparison:
 
         assert local.calls == 2
         assert len(router.message_requests()) == 2
+
+
+class TestParser:
+    def _options(self):
+        return {opt for action in compare.build_parser()._actions for opt in action.option_strings}
+
+    def test_flags(self):
+        assert self._options() == {
+            "-h", "--help", "--golden-set", "--config", "--output-dir", "--model",
+            "--anthropic-key-file", "--dry-run", "--max-threads",
+        }
+
+    def test_no_flag_takes_the_key_itself(self):
+        # The key comes from a file or a hidden prompt, never argv: the only
+        # key-related flag names a file.
+        assert [opt for opt in self._options() if "key" in opt] == ["--anthropic-key-file"]
+
+    def test_model_defaults_to_opus_and_accepts_only_priced_models(self):
+        parser = compare.build_parser()
+        assert parser.parse_args([]).model == "claude-opus-5-5"
+        assert parser.parse_args(["--model", "claude-haiku-5-5"]).model == "claude-haiku-5-5"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--model", "claude-unpriced-9"])
+
+    def test_defaults_match_run_eval_paths(self):
+        args = compare.build_parser().parse_args([])
+        assert args.golden_set == "evals/golden_set.jsonl"
+        assert args.output_dir == "evals/results/"
+        assert args.anthropic_key_file is None
+        assert args.dry_run is False
