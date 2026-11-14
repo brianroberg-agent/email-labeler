@@ -203,6 +203,14 @@ and the key, it runs the local arm, then the Claude arm, and writes
 thread the local model was unavailable for during its arm (the MacBook fell
 asleep partway) is not sent to Anthropic; a thread it answered unusably is
 (`test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is`).
+
+The classifier prompt asks the model to write its reasoning in its reply,
+which current Claude models may decline as `reasoning_extraction`. The report
+counts each arm's errors by kind, refusals by category, and says above the
+table when refusals are more than half of arm B's replies. Arm B stops sending
+once at least 5 replies are in and more than half are refusals, and reports
+the rest as not sent; the one yes still covers the run. Details:
+[README-technical.md](README-technical.md#compare).
 `--model` picks another Claude model; flags and details are in
 [README-technical.md](README-technical.md#compare).
 

@@ -30,18 +30,27 @@ SENTINEL_KEY = "sk-ant-test-SENTINEL-0000"
 
 
 def _message(text="<think>it asks for a date</think>\nNEEDS_RESPONSE", *, stop_reason="end_turn",
-             input_tokens=120, output_tokens=30, thinking=None):
+             input_tokens=120, output_tokens=30, thinking=None, stop_details=None):
     content = []
     if thinking is not None:
         content.append({"type": "thinking", "thinking": thinking, "signature": "sig"})
     if text is not None:
         content.append({"type": "text", "text": text})
-    return {
+    message = {
         "id": "msg_900001", "type": "message", "role": "assistant",
         "model": "claude-opus-5-5", "content": content,
         "stop_reason": stop_reason, "stop_sequence": None,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     }
+    if stop_details is not None:
+        message["stop_details"] = stop_details
+    return message
+
+
+def _refusal(category="reasoning_extraction"):
+    """A declined reply, as the API returns it: HTTP 200, stop_reason "refusal"."""
+    return _message("", stop_reason="refusal", input_tokens=900, output_tokens=7, stop_details={
+        "type": "refusal", "category": category, "explanation": "EXPLANATION-MARKER free text"})
 
 
 class _Transport:
@@ -108,6 +117,39 @@ class TestAnthropicLLMClient:
         with pytest.raises(LLMContentError, match=stop_reason):
             await llm.complete("S", "U", include_thinking=True)
 
+    @pytest.mark.parametrize("reply, kind", [
+        (_refusal("reasoning_extraction"), "refusal: reasoning_extraction"),
+        (_refusal(None), "refusal: uncategorised"),
+        (_message("FYI", stop_reason="refusal"), "refusal: uncategorised"),  # no stop_details
+        (_message("FY", stop_reason="max_tokens"), "max_tokens"),
+    ])
+    async def test_an_unusable_reply_records_its_kind(self, reply, kind):
+        # The row keeps only the error text, so the refusal's category (the
+        # prompt's <think> instruction is a documented reasoning_extraction
+        # trigger) must be in it. The explanation is free text and stays out.
+        transport = _Transport((200, reply, None))
+        llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
+
+        with pytest.raises(LLMContentError) as raised:
+            await llm.complete("S", "U", include_thinking=True)
+
+        assert compare.error_kind(str(raised.value)) == kind
+        assert "EXPLANATION-MARKER" not in str(raised.value)
+
+    async def test_a_timeout_records_its_kind(self):
+        def no_reply(request):
+            raise httpx2.ReadTimeout("synthetic read timeout", request=request)
+
+        http_client = anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(no_reply))
+        # No retries, so the test does not sit through the SDK's backoff.
+        client = compare.build_anthropic_client(SENTINEL_KEY, http_client=http_client)
+        llm = compare.AnthropicLLMClient(client.with_options(max_retries=0), model="claude-opus-5-5")
+
+        with pytest.raises(TimeoutError) as raised:
+            await llm.complete("S", "U", include_thinking=True)
+
+        assert compare.error_kind(str(raised.value)) == "timeout"
+
     async def test_reply_with_only_reasoning_is_an_error(self):
         transport = _Transport((200, _message("<think>hmm</think>", thinking="native"), None))
         llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
@@ -123,6 +165,36 @@ class TestAnthropicLLMClient:
 
         assert answer == "FYI"
         assert thinking == "native\n\ninline"
+
+
+class TestRefusalEarlyStop:
+    @pytest.mark.parametrize("refused, answered, next_is_sent", [
+        (5, 0, False),  # five replies, all refused
+        (3, 2, False),  # five replies, more than half refused
+        (4, 0, True),   # all refused, but fewer than five replies
+        (3, 3, True),   # six replies, exactly half refused
+    ])
+    async def test_arm_b_stops_once_five_replies_are_in_and_most_are_refusals(
+        self, refused, answered, next_is_sent,
+    ):
+        # Answers first, so the rule is checked on the full count each time.
+        transport = _Transport(*[(200, _message("FYI"), None)] * answered,
+                               *[(200, _refusal(), None)] * refused, (200, _message("FYI"), None))
+        llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
+        for _ in range(answered):
+            await llm.complete("S", "U")
+        for _ in range(refused):
+            with pytest.raises(LLMContentError):
+                await llm.complete("S", "U")
+
+        if next_is_sent:
+            assert await llm.complete("S", "U") == "FYI"
+            assert len(transport.requests) == refused + answered + 1
+        else:
+            with pytest.raises(Exception) as raised:
+                await llm.complete("S", "U")
+            assert compare.error_kind(str(raised.value)) == "not sent"
+            assert len(transport.requests) == refused + answered
 
 
 def _error(kind):
@@ -383,6 +455,12 @@ class TestPlan:
         assert "input tokens are estimated" in text
         assert "retried attempts are not counted" in text
 
+    def test_states_the_refusal_early_stop(self):
+        text = compare.format_plan(_plan())
+
+        assert ("stops sending once at least 5 replies are in and more than half of them are "
+                "refusals") in text
+
     def test_says_plainly_that_real_mail_goes_to_anthropic(self):
         text = compare.format_plan(_plan())
 
@@ -564,6 +642,45 @@ class TestReport:
         # $0.08 over the two messages sent, not over three threads.
         assert rows["Cost per message"][1] == "$0.0400"
 
+    def test_errors_are_counted_by_kind_and_the_kinds_sum_to_the_errors(self):
+        nr, fyi = "needs_response", "fyi"
+        unparseable = "No email label keyword in LLM output: synthetic"
+        arm_a = compare.ArmRun(name="Arm A", parallelism=1, results=[
+            *[_pred(f"90070{i}", nr, nr) for i in range(5)], _pred("900705", fyi, None, error=unparseable)])
+        arm_b = compare.ArmRun(name="Arm B", parallelism=4, priced_model="claude-opus-5-5", results=[
+            _pred("900700", nr, None, error="[refusal: reasoning_extraction] synthetic"),
+            _pred("900701", nr, None, error="[refusal: reasoning_extraction] synthetic"),
+            _pred("900702", nr, None, error="[max_tokens] synthetic"),
+            _pred("900703", nr, None, error="[timeout] synthetic"),
+            _pred("900704", nr, nr),
+            _pred("900705", fyi, None, error=unparseable),
+        ])
+
+        rows, _ = _rows(compare.build_report(
+            arm_a, arm_b, golden_set_path="evals/golden_set.jsonl", reviewed_threads=6,
+            timestamp="2026-11-13T12:00:00+00:00"))
+
+        assert rows["Errors by kind"] == [
+            "other 1", "max_tokens 1, refusal: reasoning_extraction 2, timeout 1, other 1"]
+        for errors, kinds in zip(rows["Errors (no usable answer)"], rows["Errors by kind"]):
+            assert int(errors.split("/")[0]) == sum(int(kind.rsplit(" ", 1)[1]) for kind in kinds.split(", "))
+
+    @pytest.mark.parametrize("replies, refusals, marked", [(3, 3, True), (6, 4, True), (6, 3, False)])
+    def test_a_refusal_dominated_arm_b_is_marked_not_meaningful_above_the_table(
+        self, replies, refusals, marked,
+    ):
+        arm_a, arm_b = _arms()
+        arm_b.replies, arm_b.refusals = replies, refusals
+
+        text = compare.build_report(arm_a, arm_b, golden_set_path="evals/golden_set.jsonl",
+                                    reviewed_threads=20, timestamp="2026-11-13T12:00:00+00:00")
+
+        if marked:
+            assert text.index("Not a meaningful comparison") < text.index("| Metric")
+            assert f"{refusals} of its {replies} replies" in text
+        else:
+            assert "Not a meaningful comparison" not in text
+
     def test_holds_counts_only_no_thread_ids(self):
         report = _report()
 
@@ -617,8 +734,9 @@ class _FakeLocal:
 class _Router:
     """Answers the SDK by path: the model lookup, then message requests."""
 
-    def __init__(self, model_status=200):
+    def __init__(self, model_status=200, reply=None):
         self.model_status = model_status
+        self.reply = reply or _message("<think>reasoning</think>\nNEEDS_RESPONSE")
         self.requests: list[httpx2.Request] = []
 
     def __call__(self, request):
@@ -630,7 +748,7 @@ class _Router:
                 "type": "model", "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5",
                 "created_at": "2026-01-01T00:00:00Z",
             })
-        return httpx2.Response(200, json=_message("<think>reasoning</think>\nNEEDS_RESPONSE"))
+        return httpx2.Response(200, json=self.reply)
 
     def message_requests(self):
         return [r for r in self.requests if r.url.path == "/v1/messages"]
@@ -785,6 +903,45 @@ class TestRunComparison:
         rows, _ = _rows(text)
         assert rows["Threads not sent"] == ["0", "1 (local model unavailable 1)"]
         assert "Scored on the 2 threads both arms were sent" in text
+
+    async def test_a_run_whose_replies_are_all_refusals_is_marked_not_meaningful(self, golden_file, tmp_path):
+        router = _Router(reply=_refusal("reasoning_extraction"))
+
+        await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(router, []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        # Three replies are below the early stop's minimum, so all were sent.
+        assert len(router.message_requests()) == 3
+        [report_file] = (tmp_path / "results").glob("*.md")
+        text = report_file.read_text()
+        assert text.index("Not a meaningful comparison") < text.index("| Metric")
+        rows, _ = _rows(text)
+        assert rows["Errors by kind"][1] == "refusal: reasoning_extraction 3"
+
+    async def test_arm_b_sends_nothing_more_once_refusals_dominate(self, tmp_path):
+        golden = tmp_path / "golden.jsonl"
+        golden.write_text("".join(json.dumps(_thread(f"9008{i:02d}").to_dict()) + "\n" for i in range(12)))
+        router = _Router(reply=_refusal())
+
+        await compare.run_comparison(
+            _args(golden, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(router, []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        sent = len(router.message_requests())
+        # Up to four requests are in flight when the fifth refusal lands, and
+        # they still land; nothing is sent after that.
+        assert 5 <= sent <= 8
+        [path_b] = (tmp_path / "results").glob("*compare-B-*.jsonl")
+        rows_b = report.load_results(path_b)[1]
+        assert sum(1 for r in rows_b if compare.error_kind(r.error) == "not sent") == 12 - sent
+        [report_file] = (tmp_path / "results").glob("*.md")
+        text = report_file.read_text()
+        rows, _ = _rows(text)
+        assert rows["Threads not sent"][1] == f"{12 - sent} (stopped after refusals {12 - sent})"
+        assert text.index("Arm B stopped sending") < text.index("| Metric")
 
     async def test_full_run_compares_both_arms_on_person_threads(self, golden_file, tmp_path):
         router, keys, local = _Router(), [], _FakeLocal()

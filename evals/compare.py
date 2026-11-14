@@ -147,8 +147,11 @@ def build_anthropic_client(api_key: str, *, http_client=None) -> anthropic.Async
 # the message, and error_kind() reads it back for the report. An untagged error
 # (an unparseable reply, say) is "other".
 UNAVAILABLE = "unavailable"
+TIMEOUT = "timeout"
+MAX_TOKENS = "max_tokens"
 NOT_SENT = "not sent"
 NOT_SENT_LOCAL_UNAVAILABLE = f"[{NOT_SENT}] local model unavailable"
+NOT_SENT_REFUSALS = f"[{NOT_SENT}] stopped after refusals"
 _KIND_TAG = re.compile(r"\[([^\]]+)\] ")
 
 
@@ -165,12 +168,31 @@ def error_kind(error: str | None) -> str | None:
     return match.group(1) if match else "other"
 
 
+# The classifier prompt asks the model to reason step by step in its reply, which
+# the claude-api skill documents as a trigger for declines with stop_details
+# category "reasoning_extraction". A run those declines dominate measures nothing,
+# so arm B stops sending once this many replies are in and more than half of
+# them are refusals, before the rest of the mail goes out. One yes still
+# covers the run: there is no second prompt.
+REFUSAL_STOP_MIN_REPLIES = 5
+
+
+def refusals_dominate(refusals: int, replies: int) -> bool:
+    """More than half of the replies were refusals."""
+    return refusals * 2 > replies
+
+
+class NotSentError(Exception):
+    """A thread arm B did not send; its row records it as not sent."""
+
+
 class AnthropicLLMClient:
     """Puts a Claude model behind ``LLMClient.complete``'s interface.
 
     ``EmailClassifier`` calls ``complete(system, user, include_thinking=True)``
     and parses the returned answer; this adapter makes that one call through the
-    Messages API, so the classifier's prompt is used unchanged.
+    Messages API, so the classifier's prompt is used unchanged. It sends nothing
+    more once refusals dominate (REFUSAL_STOP_MIN_REPLIES).
     """
 
     def __init__(self, client: anthropic.AsyncAnthropic, model: str):
@@ -179,29 +201,46 @@ class AnthropicLLMClient:
         # Totals over every reply received, usable or not: a reply cut at
         # max_tokens is billed like any other.
         self.calls = 0
+        self.refusals = 0
         self.input_tokens = 0
         self.output_tokens = 0
 
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
-        response = await self._client.messages.create(
-            model=self.model,
-            max_tokens=ANTHROPIC_MAX_TOKENS,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
-            output_config={"effort": ANTHROPIC_EFFORT},
-        )
+        if self.calls >= REFUSAL_STOP_MIN_REPLIES and refusals_dominate(self.refusals, self.calls):
+            raise NotSentError(NOT_SENT_REFUSALS)
+        try:
+            response = await self._client.messages.create(
+                model=self.model,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+                output_config={"effort": ANTHROPIC_EFFORT},
+            )
+        except anthropic.APITimeoutError:
+            raise TimeoutError(tag(TIMEOUT, (
+                f"Claude {self.model} did not answer within {ANTHROPIC_TIMEOUT_SECONDS:.0f} s "
+                "on any attempt"))) from None
         self.calls += 1
         self.input_tokens += response.usage.input_tokens
         self.output_tokens += response.usage.output_tokens
         # Checked before the content is read: a reply cut at max_tokens or
         # declined by a safety classifier carries no trustworthy label, so it is
         # an error for this arm (as llm_client treats finish_reason "length").
-        if response.stop_reason in ("max_tokens", "refusal"):
-            raise LLMContentError(
-                f"Claude {self.model} stopped with stop_reason={response.stop_reason!r}; no answer used"
-            )
+        if response.stop_reason == "refusal":
+            self.refusals += 1
+            # The category only: the explanation is free text, kept out of rows.
+            details = response.stop_details
+            category = (details.category if details is not None else None) or "uncategorised"
+            raise LLMContentError(tag(
+                f"refusal: {category}",
+                f"Claude {self.model} stopped with stop_reason='refusal'; no answer used"))
+        if response.stop_reason == "max_tokens":
+            raise LLMContentError(tag(
+                MAX_TOKENS,
+                f"Claude {self.model} stopped with stop_reason='max_tokens' at "
+                f"{ANTHROPIC_MAX_TOKENS}; no answer used"))
         text = "".join(block.text for block in response.content if block.type == "text")
         stripped = LLMClient._strip_thinking(text)
         if not stripped:
@@ -309,6 +348,8 @@ def format_plan(plan: Plan) -> str:
         f"API calls:   up to {est.calls:,} message requests to Anthropic (one per thread; a thread "
         "the local model was unavailable for in arm A is not sent; a rate-limit or overload reply "
         "is retried) and 1 model lookup that sends no mail.",
+        f"Refusals:    arm B stops sending once at least {REFUSAL_STOP_MIN_REPLIES} replies are in "
+        "and more than half of them are refusals; the threads left are reported as not sent.",
         f"Tokens:      about {est.input_tokens:,} input tokens ({est.input_chars:,} prompt "
         f"characters at {CHARS_PER_TOKEN} per token) and {est.output_tokens:,} output tokens "
         f"({ASSUMED_OUTPUT_TOKENS_PER_CALL:,} per reply assumed, thinking included).",
@@ -351,6 +392,8 @@ class ArmRun:
     priced_model: str | None = None  # None: a local model, no API charge
     input_tokens: int = 0
     output_tokens: int = 0
+    replies: int = 0  # API replies received, refusals included
+    refusals: int = 0
 
     @property
     def cost(self) -> float:
@@ -417,6 +460,10 @@ def _arm_cells(rows: list[PredictionResult], arm: ArmRun) -> dict[str, str]:
     cells["Errors (no usable answer)"] = (
         f"{errored.total()}/{len(rows)}" + (f" ({by_label})" if by_label else "")
     )
+    kinds = Counter(error_kind(r.error) for r in rows if r.error is not None)
+    cells["Errors by kind"] = ", ".join(
+        f"{kind} {kinds[kind]}" for kind in sorted(kinds, key=lambda kind: (kind == "other", kind))
+    ) or "none"
     not_sent = Counter(r.error.split("] ", 1)[1] for r in arm.results if error_kind(r.error) == NOT_SENT)
     reasons = ", ".join(f"{reason} {n}" for reason, n in not_sent.items())
     cells["Threads not sent"] = f"{not_sent.total()}" + (f" ({reasons})" if reasons else "")
@@ -444,7 +491,7 @@ _ROW_ORDER = (
     + [label for label, _ in COST_ORDER]
     + ["needs_response precision", "fyi recall", "fyi precision",
        "low_priority recall", "low_priority precision",
-       "Errors (no usable answer)", "Threads not sent",
+       "Errors (no usable answer)", "Errors by kind", "Threads not sent",
        "Latency per message, median", "Latency per message, p90",
        "Cost per message", "Cost, total"]
 )
@@ -457,9 +504,23 @@ def build_report(
     subject, sender, body or thread id."""
     rows_a, rows_b = _scored(arm_a, arm_b)
     cells_a, cells_b = _arm_cells(rows_a, arm_a), _arm_cells(rows_b, arm_b)
-    lines = [
-        f"# Claude comparison: {arm_a.name} vs {arm_b.name}",
-        "",
+    lines = [f"# Claude comparison: {arm_a.name} vs {arm_b.name}", ""]
+    if refusals_dominate(arm_b.refusals, arm_b.replies):
+        lines += [
+            f"**Not a meaningful comparison.** Arm B refused {arm_b.refusals} of its {arm_b.replies} "
+            "replies, more than half, so its column measures refusals, not classification. The "
+            "refusal categories are in the \"Errors by kind\" row.",
+            "",
+        ]
+    stopped = sum(1 for r in arm_b.results if r.error == NOT_SENT_REFUSALS)
+    if stopped:
+        lines += [
+            f"**Arm B stopped sending** once at least {REFUSAL_STOP_MIN_REPLIES} replies were in and "
+            f"more than half were refusals; {stopped} threads were not sent and are scored for "
+            "neither arm.",
+            "",
+        ]
+    lines += [
         f"- Run: {timestamp}",
         f"- Golden set: `{golden_set_path}`, {reviewed_threads} reviewed threads; both arms ran "
         f"Stage 2 on its {len(arm_a.results)} person threads (the `run_eval --local-only` population).",
@@ -714,7 +775,7 @@ async def run_comparison(
         ArmRun(name=f"Arm A: local {local_llm.model}", results=results_a, parallelism=local_parallel),
         ArmRun(name=f"Arm B: {args.model}", results=results_b, parallelism=ANTHROPIC_PARALLELISM,
                priced_model=args.model, input_tokens=claude.input_tokens,
-               output_tokens=claude.output_tokens),
+               output_tokens=claude.output_tokens, replies=claude.calls, refusals=claude.refusals),
         golden_set_path=str(golden_path), reviewed_threads=len(reviewed), timestamp=now.isoformat(),
     )
     report_path = output_dir / (

@@ -158,7 +158,25 @@ default: the claude-api skill's model notes (2026-11) list a temperature as
 rejected by the current models and disabled thinking as rejected by Opus 5.5.
 No `fallbacks` model is set: a fallback would change which model answered. A reply
 stopped at `max_tokens` or by a refusal, or one with no answer outside its
-reasoning, raises `LLMContentError` and counts as that arm's error. The SDK
+reasoning, raises `LLMContentError` and counts as that arm's error. Where the
+cause is known by type, the row's error starts with a bracketed kind:
+`[refusal: <category>]` (the reply's `stop_details.category`, or
+`uncategorised`; the free-text explanation is not recorded), `[max_tokens]`, or
+`[timeout]` (the SDK's `APITimeoutError` after its retries); anything else is
+"other" in the report (`test_an_unusable_reply_records_its_kind`,
+`test_a_timeout_records_its_kind`).
+
+**Refusals.** The classifier prompt asks the model to reason step by step in
+`<think>` tags in its reply. The claude-api skill documents that kind of
+instruction as a trigger for declines with category `reasoning_extraction` on
+current models; whether it fires on this prompt is not known until a run. The
+prompt is unchanged here, so both arms see the same one. Arm B stops sending
+once `REFUSAL_STOP_MIN_REPLIES` replies are in and more than half of them are
+refusals; threads not sent after that are recorded as `[not sent] stopped after
+refusals` (`test_arm_b_stops_once_five_replies_are_in_and_most_are_refusals`,
+`test_arm_b_sends_nothing_more_once_refusals_dominate`). Requests already in
+flight when the rule trips still land. The one typed yes covers the run; the
+stop asks nothing. The SDK
 client is built from the given key and the fixed base URL with the
 `ANTHROPIC_*` variables hidden, because `daemon.py` loads `.env` at import
 (`test_uses_only_the_given_key_whatever_the_environment_holds`). One SDK
@@ -192,8 +210,11 @@ as a miss for the thread's expected label, so it lowers that arm's recall
 (`test_an_arms_error_counts_as_a_miss_for_its_expected_label`). It leads with
 needs_response recall, then the error classes in the cost order of
 `docs/labeling-rubric.md` §3 (D21), then per-category precision/recall, errors
-per arm by expected label, median and p90 latency per answered message, and
-cost. The report holds counts only, no subject, sender, body or
+per arm by expected label and by kind, threads not sent, median and p90
+latency per answered message, and cost. When refusals are more than half of
+arm B's replies, a line above the table says the comparison is not meaningful
+(`test_a_refusal_dominated_arm_b_is_marked_not_meaningful_above_the_table`),
+and another says so when arm B stopped early. The report holds counts only, no subject, sender, body or
 thread id (`test_report_holds_no_message_content`,
 `test_holds_counts_only_no_thread_ids`). Next to it are two ordinary results
 files, `*_stage2_only_compare-A-*.jsonl` and `*_stage2_only_compare-B-*.jsonl`,
