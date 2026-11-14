@@ -579,7 +579,7 @@ async def run_comparison(
     if unreachable:
         return 1
     if args.dry_run:
-        print("\nDry run: nothing was sent anywhere.")
+        print("\nDry run: no mail was sent; the local model received one probe.")
         return 0
 
     answer = input_fn(f"\nType yes to send these {len(threads)} threads to Anthropic and run both arms: ")

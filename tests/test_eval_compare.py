@@ -550,8 +550,10 @@ class _FakeLocal:
         self.reachable = reachable
         self.fail = fail
         self.calls = 0
+        self.probes = 0
 
     async def probe(self, timeout=None):
+        self.probes += 1
         if self.reachable:
             return AvailabilityResult(ok=True, status_code=200)
         return AvailabilityResult(ok=False, error="ConnectError: connection refused")
@@ -637,6 +639,10 @@ class TestRunComparison:
         assert "The golden sets are real mail, and arm B sends them to Anthropic" in out
         assert "reachable" in out
         assert local.calls == 0
+        # The probe is the one request a dry run makes, and it carries no mail.
+        assert local.probes == 1
+        assert "Dry run: no mail was sent; the local model received one probe." in out
+        assert "nothing was sent anywhere" not in out
         assert not (tmp_path / "results").exists()
         for content in ("Synthetic subject alpha", "Synthetic body alpha", "pat@example.test"):
             assert content not in out
