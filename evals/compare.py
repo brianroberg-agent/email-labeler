@@ -153,7 +153,10 @@ MAX_TOKENS = "max_tokens"
 NOT_SENT = "not sent"
 NOT_SENT_LOCAL_UNAVAILABLE = f"[{NOT_SENT}] local model unavailable"
 NOT_SENT_REFUSALS = f"[{NOT_SENT}] stopped after refusals"
-_KIND_TAG = re.compile(r"\[([^\]]+)\] ")
+# Only the tags above, plus "refusal: <category>": an untagged error that starts
+# with brackets of its own (an OS error's "[Errno 61]") stays "other".
+_KIND_TAG = re.compile(
+    rf"\[({UNAVAILABLE}|{TIMEOUT}|{MAX_TOKENS}|{NOT_SENT}|refusal: [a-z_]+)\] ")
 
 
 def tag(kind: str, message: str) -> str:

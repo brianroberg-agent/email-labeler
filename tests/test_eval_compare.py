@@ -137,6 +137,16 @@ class TestAnthropicLLMClient:
         assert compare.error_kind(str(raised.value)) == kind
         assert "EXPLANATION-MARKER" not in str(raised.value)
 
+    @pytest.mark.parametrize("error, kind", [
+        ("[refusal: reasoning_extraction] synthetic", "refusal: reasoning_extraction"),
+        ("[not sent] stopped after refusals", "not sent"),
+        ("[Errno 61] Connection refused", "other"),  # an OS error's own brackets
+        ("No email label keyword in LLM output: synthetic", "other"),
+        (None, None),
+    ])
+    def test_error_kind_reads_only_the_comparisons_own_tags(self, error, kind):
+        assert compare.error_kind(error) == kind
+
     async def test_a_timeout_records_its_kind(self):
         def no_reply(request):
             raise httpx2.ReadTimeout("synthetic read timeout", request=request)
