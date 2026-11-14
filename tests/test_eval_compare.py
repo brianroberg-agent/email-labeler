@@ -153,3 +153,82 @@ class TestBuildAnthropicClient:
 
         assert client.max_retries == compare.ANTHROPIC_MAX_RETRIES
         assert client.timeout == compare.ANTHROPIC_TIMEOUT_SECONDS
+
+
+class TestUsageAndCost:
+    async def test_usage_counts_every_billed_reply_including_unusable_ones(self):
+        transport = _Transport(
+            (200, _message("FYI", input_tokens=1000, output_tokens=200), None),
+            (200, _message("FY", stop_reason="max_tokens", input_tokens=3000, output_tokens=16000), None),
+        )
+        llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
+
+        await llm.complete("S", "U")
+        with pytest.raises(LLMContentError):
+            await llm.complete("S", "U")
+
+        assert (llm.calls, llm.input_tokens, llm.output_tokens) == (2, 4000, 16200)
+
+    def test_prices_cover_the_selectable_models(self):
+        assert set(compare.PRICES_PER_MTOK) == {
+            "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2",
+        }
+        assert compare.PRICES_AS_OF == "2026-11-03"
+
+    @pytest.mark.parametrize("model, expected", [
+        ("claude-opus-5-5", 4.00 + 20.00),
+        ("claude-haiku-5-5", 0.10 + 0.50),
+        ("claude-sonnet-5-5", 2.00 + 10.00),
+        ("claude-fable-5-2", 8.00 + 40.00),
+    ])
+    def test_cost_is_tokens_times_published_price(self, model, expected):
+        assert compare.cost_usd(model, 1_000_000, 1_000_000) == pytest.approx(expected)
+
+
+class TestObtainKey:
+    def test_key_file_is_read_and_stripped(self, tmp_path):
+        key_file = tmp_path / "key"
+        key_file.write_text(SENTINEL_KEY + "\n")
+        key_file.chmod(0o600)
+
+        assert compare.obtain_key(key_file, getpass_fn=_no_prompt) == SENTINEL_KEY
+
+    @pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
+    def test_key_file_readable_by_others_is_refused(self, tmp_path, mode):
+        key_file = tmp_path / "key"
+        key_file.write_text(SENTINEL_KEY)
+        key_file.chmod(mode)
+
+        with pytest.raises(compare.ApiKeyError, match="chmod 600"):
+            compare.obtain_key(key_file, getpass_fn=_no_prompt)
+
+    def test_empty_key_file_is_refused(self, tmp_path):
+        key_file = tmp_path / "key"
+        key_file.write_text("\n")
+        key_file.chmod(0o600)
+
+        with pytest.raises(compare.ApiKeyError, match="empty"):
+            compare.obtain_key(key_file, getpass_fn=_no_prompt)
+
+    def test_missing_key_file_is_refused_without_a_traceback(self, tmp_path):
+        with pytest.raises(compare.ApiKeyError, match="cannot read"):
+            compare.obtain_key(tmp_path / "absent", getpass_fn=_no_prompt)
+
+    def test_without_a_key_file_the_key_is_typed_not_taken_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env-file")
+        prompts = []
+
+        def fake_getpass(prompt):
+            prompts.append(prompt)
+            return f"  {SENTINEL_KEY}  "
+
+        assert compare.obtain_key(None, getpass_fn=fake_getpass) == SENTINEL_KEY
+        assert len(prompts) == 1
+
+    def test_an_empty_typed_key_is_refused(self):
+        with pytest.raises(compare.ApiKeyError, match="empty"):
+            compare.obtain_key(None, getpass_fn=lambda prompt: "   ")
+
+
+def _no_prompt(prompt):
+    raise AssertionError("getpass must not be called when a key file is given")

@@ -8,7 +8,9 @@ in evals/README.md.
 """
 
 import os
+import stat
 from contextlib import contextmanager
+from pathlib import Path
 
 import anthropic
 
@@ -25,6 +27,57 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # by the timeout, which matches [llm.local]'s 180 s request budget.
 ANTHROPIC_MAX_RETRIES = 4
 ANTHROPIC_TIMEOUT_SECONDS = 180.0
+
+# USD per million tokens, (input, output), from the claude-api skill's model
+# table (cached 2026-11-03; Anthropic first-party rates). These are also the
+# models --model accepts, so every run can be costed. Haiku 5.5's rate is for
+# prompts up to 100K tokens; a golden-set prompt is far below that.
+PRICES_AS_OF = "2026-11-03"
+PRICES_PER_MTOK = {
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-fable-5-2": (8.00, 40.00),
+}
+
+
+def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Dollar cost of the given token counts at *model*'s published price."""
+    price_in, price_out = PRICES_PER_MTOK[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+
+class ApiKeyError(Exception):
+    """The Anthropic key could not be taken from the source Brian named."""
+
+
+def obtain_key(key_file: Path | None, *, getpass_fn) -> str:
+    """The Anthropic API key, from *key_file* or else typed at a hidden prompt.
+
+    These are the only two sources: the key is not read from argv or from the
+    environment (daemon.py loads the agent-stack .env, and issue #92 keeps the
+    key out of that stack). A key file must be private to its owner (no group
+    or other permission bits), so a root-only file deleted after the run is
+    the file route the README describes.
+    """
+    if key_file is None:
+        key = getpass_fn("Anthropic API key (input hidden): ").strip()
+        if not key:
+            raise ApiKeyError("the typed key is empty")
+        return key
+    try:
+        mode = key_file.stat().st_mode
+        key = key_file.read_text().strip()
+    except OSError as exc:
+        raise ApiKeyError(f"cannot read --anthropic-key-file {key_file}: {exc.strerror}") from None
+    if mode & 0o077:
+        raise ApiKeyError(
+            f"--anthropic-key-file {key_file} is readable beyond its owner "
+            f"(mode {stat.S_IMODE(mode):o}); chmod 600 it first"
+        )
+    if not key:
+        raise ApiKeyError(f"--anthropic-key-file {key_file} is empty")
+    return key
 
 
 @contextmanager
@@ -66,6 +119,11 @@ class AnthropicLLMClient:
     def __init__(self, client: anthropic.AsyncAnthropic, model: str):
         self._client = client
         self.model = model
+        # Totals over every reply received, usable or not: a reply cut at
+        # max_tokens is billed like any other.
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
 
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
@@ -77,6 +135,9 @@ class AnthropicLLMClient:
             messages=[{"role": "user", "content": user_content}],
             output_config={"effort": ANTHROPIC_EFFORT},
         )
+        self.calls += 1
+        self.input_tokens += response.usage.input_tokens
+        self.output_tokens += response.usage.output_tokens
         # Checked before the content is read: a reply cut at max_tokens or
         # declined by a safety classifier carries no trustworthy label, so it is
         # an error for this arm (as llm_client treats finish_reason "length").
