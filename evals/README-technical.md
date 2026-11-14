@@ -174,8 +174,10 @@ id) → arm A → stop if arm A produced no result → arm B → report.
 a recorder in the local slot, so the estimate counts the exact Stage 2 prompts.
 Input tokens are prompt characters over `CHARS_PER_TOKEN`; output is
 `ASSUMED_OUTPUT_TOKENS_PER_CALL` per reply (adaptive thinking bills as output
-and is not known in advance). The plan also prints the ceiling, every reply at
-`max_tokens`. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
+and is not known in advance). The plan also prints the cost if every reply ran
+to `max_tokens`. That is an estimate too, not a ceiling: its input tokens are
+estimated, and it prices one attempt per thread, so retried attempts are not
+counted. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
 The API's token counter is itself an API call, so it is not used.
 
 **Outputs.** `<timestamp>_compare_<local>_vs_<model>.md`: one Markdown table,

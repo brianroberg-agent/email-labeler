@@ -338,7 +338,7 @@ class TestEstimate:
         assert est.output_tokens == 2 * compare.ASSUMED_OUTPUT_TOKENS_PER_CALL
         assert est.cost == pytest.approx(
             compare.cost_usd("claude-opus-5-5", est.input_tokens, est.output_tokens))
-        assert est.ceiling == pytest.approx(
+        assert est.cost_at_max_tokens == pytest.approx(
             compare.cost_usd("claude-opus-5-5", est.input_tokens, 2 * compare.ANTHROPIC_MAX_TOKENS))
 
 
@@ -371,6 +371,16 @@ class TestPlan:
         assert "$0.12" in text  # 5,000 x $4 + 5,000 x $20 per million
         assert "$4.00 / $20.00 per million" in text and "2026-11-03" in text
         assert "estimate" in text.lower()
+
+    def test_cost_figures_are_estimates_that_name_what_they_leave_out(self):
+        # The max_tokens figure prices an estimated input count and one attempt
+        # per thread, so it is not a ceiling and must not be worded as one.
+        text = compare.format_plan(_plan())
+
+        assert "at most" not in text
+        assert "if every reply ran to max_tokens" in text
+        assert "input tokens are estimated" in text
+        assert "retried attempts are not counted" in text
 
     def test_says_plainly_that_real_mail_goes_to_anthropic(self):
         text = compare.format_plan(_plan())

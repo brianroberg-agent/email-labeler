@@ -212,8 +212,9 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
 # characters per token is deliberately below the common rule of thumb of 4,
 # because current Claude tokenizers produce up to ~1.35x more tokens than older
 # ones. Output is an assumption per call (adaptive thinking is billed as
-# output and is not known in advance), so the plan also prints the ceiling: every
-# reply running to max_tokens.
+# output and is not known in advance), so the plan also prints the cost if every
+# reply ran to max_tokens. That figure is an estimate too, not a ceiling: its
+# input is estimated, and it prices one attempt per thread, not retried ones.
 CHARS_PER_TOKEN = 3.5
 ASSUMED_OUTPUT_TOKENS_PER_CALL = 1000
 
@@ -225,7 +226,7 @@ class Estimate:
     input_tokens: int
     output_tokens: int
     cost: float
-    ceiling: float
+    cost_at_max_tokens: float
 
 
 def estimate(model: str, prompts: list[tuple[str, str]]) -> Estimate:
@@ -240,7 +241,7 @@ def estimate(model: str, prompts: list[tuple[str, str]]) -> Estimate:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cost=cost_usd(model, input_tokens, output_tokens),
-        ceiling=cost_usd(model, input_tokens, calls * ANTHROPIC_MAX_TOKENS),
+        cost_at_max_tokens=cost_usd(model, input_tokens, calls * ANTHROPIC_MAX_TOKENS),
     )
 
 
@@ -282,9 +283,11 @@ def format_plan(plan: Plan) -> str:
         f"Tokens:      about {est.input_tokens:,} input tokens ({est.input_chars:,} prompt "
         f"characters at {CHARS_PER_TOKEN} per token) and {est.output_tokens:,} output tokens "
         f"({ASSUMED_OUTPUT_TOKENS_PER_CALL:,} per reply assumed, thinking included).",
-        f"Cost:        about ${est.cost:,.2f}, and at most ${est.ceiling:,.2f} if every reply "
-        f"ran to max_tokens. Prices: ${price_in:.2f} / ${price_out:.2f} per million input / "
-        f"output tokens for {plan.model}, as of {PRICES_AS_OF}. This is an estimate, not a quote.",
+        f"Cost:        about ${est.cost:,.2f}, or about ${est.cost_at_max_tokens:,.2f} if every reply "
+        "ran to max_tokens. Both are estimates, not quotes: the input tokens are estimated from "
+        "characters, and retried attempts are not counted. "
+        f"Prices: ${price_in:.2f} / ${price_out:.2f} per million input / output tokens for "
+        f"{plan.model}, as of {PRICES_AS_OF}.",
         "",
         "Privacy:     The golden sets are real mail, and arm B sends them to Anthropic: "
         f"{plan.person_threads} threads, each with its senders, subject and transcript "
