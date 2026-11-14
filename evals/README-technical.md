@@ -218,7 +218,9 @@ per arm by expected label and by kind, threads not sent, median and p90
 latency per answered message, and cost. When refusals are more than half of
 arm B's replies, a line above the table says the comparison is not meaningful
 (`test_a_refusal_dominated_arm_b_is_marked_not_meaningful_above_the_table`),
-and another says so when arm B stopped early. Above the table, one line per
+and another says when arm B stopped early and how many threads it did not
+send; that line does not itself mark the comparison as not meaningful. Above
+the table, one line per
 arm gives its request settings as sent: arm A's from `[llm.local]`
 (temperature, `max_tokens`, timeout, `extra_body` verbatim), arm B's from the
 module constants (default sampling, adaptive thinking, effort, `max_tokens`,
