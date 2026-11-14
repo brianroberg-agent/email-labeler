@@ -193,6 +193,10 @@ uv run --extra compare python -m evals.compare             # the plan, one typed
 
 The plan names the golden set and its counts, both models, whether the local
 model answered, the number of API calls, and the estimated tokens and cost.
+It also gives each arm's request settings as sent (arm A's from `[llm.local]`
+in `config.toml`, arm B's from `evals/compare.py`), because the arms differ in
+more than the model, and says this is one run with no repeat. The report
+repeats both above its table.
 It says plainly that the golden sets are real mail and arm B sends them to
 Anthropic, and names the host arm A sends them to (the `MLX_URL` host), as an
 API stand-in (decision D4) when `MLX_API_KEY` is set. If the local model does not answer (the MacBook asleep), the run

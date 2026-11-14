@@ -310,6 +310,29 @@ def estimate(model: str, prompts: list[tuple[str, str]]) -> Estimate:
     )
 
 
+# The arms differ in more than the model. The claude-api skill (2026-11) lists a
+# temperature as rejected by the current Claude models and disabled thinking as
+# rejected by Opus 5.5, so the settings are disclosed rather than aligned: the
+# plan and the report state what each arm was sent, from the values the run
+# used (REVIEW.md, "Eval comparisons that cannot carry the claim").
+def describe_local_settings(local_cfg: dict) -> str:
+    """Arm A's request settings: [llm.local] as LLMClient sends it."""
+    extra_body = json.dumps(local_cfg.get("extra_body") or {}, sort_keys=True)
+    return (f"temperature {local_cfg['temperature']}, max_tokens {local_cfg['max_tokens']}, "
+            f"timeout {local_cfg['timeout']} s per request, extra_body {extra_body}")
+
+
+def describe_claude_settings() -> str:
+    """Arm B's request settings, as AnthropicLLMClient sends them."""
+    return (f"default sampling (no temperature is sent), adaptive thinking (no thinking field is "
+            f"sent), effort {ANTHROPIC_EFFORT}, max_tokens {ANTHROPIC_MAX_TOKENS} with thinking "
+            f"included, timeout {ANTHROPIC_TIMEOUT_SECONDS:.0f} s per attempt with up to "
+            f"{ANTHROPIC_MAX_RETRIES} retries, no fallback model")
+
+
+ONE_RUN = "One run of each arm, with no repeat. Arm B's sampling is not fixed, so a rerun can differ"
+
+
 @dataclass(frozen=True)
 class Plan:
     """What a run would do, as the dry run states it."""
@@ -322,6 +345,7 @@ class Plan:
     local_url: str
     local_error: str | None  # None when the local endpoint answered its probe
     local_stand_in: bool  # MLX_API_KEY is set: a public API stands in (decision D4)
+    local_settings: str  # describe_local_settings() of the config the run uses
     model: str
     estimate: Estimate
 
@@ -342,9 +366,9 @@ def format_plan(plan: Plan) -> str:
         f"Golden set:  {plan.golden_set_path}: {plan.reviewed_threads} reviewed threads, of which "
         f"{plan.person_threads} person threads are used (Stage 2, the local model's traffic).",
         f"Arm A:       local model {plan.local_model} at {plan.local_url or '<unset MLX_URL>'}: "
-        f"{local_state}.",
-        f"Arm B:       {plan.model} through the Anthropic API, effort {ANTHROPIC_EFFORT}, "
-        f"max_tokens {ANTHROPIC_MAX_TOKENS}, no fallback model.",
+        f"{local_state}. Sent with {plan.local_settings}.",
+        f"Arm B:       {plan.model} through the Anthropic API, sent with {describe_claude_settings()}.",
+        f"Runs:        {ONE_RUN}.",
         f"API calls:   up to {est.calls:,} message requests to Anthropic (one per thread; a thread "
         "the local model was unavailable for in arm A is not sent; a rate-limit or overload reply "
         "is retried) and 1 model lookup that sends no mail.",
@@ -394,6 +418,8 @@ class ArmRun:
     output_tokens: int = 0
     replies: int = 0  # API replies received, refusals included
     refusals: int = 0
+    settings: str = ""  # the request settings as sent (describe_*_settings)
+    temperature: float | None = None  # the temperature sent, where one is
 
     @property
     def cost(self) -> float:
@@ -528,6 +554,9 @@ def build_report(
         "for the thread's expected label, lowering that arm's recall; it has no predicted label, so "
         "precision and the error classes do not count it. A thread not sent to an arm is counted in "
         "its own row and scored for neither arm.",
+        *[f"- {arm.name}, sent with {arm.settings}." for arm in (arm_a, arm_b) if arm.settings],
+        f"- {ONE_RUN}"
+        + (f"; arm A ran at temperature {arm_a.temperature}." if arm_a.temperature is not None else "."),
         "- Error classes follow the cost order of `docs/labeling-rubric.md` section 3 (decision D21), "
         "worst first.",
         "",
@@ -539,8 +568,7 @@ def build_report(
         "",
         f"- Concurrency: arm A {arm_a.parallelism} at a time (`LOCAL_PARALLEL` or `local_parallel`), arm B "
         f"{arm_b.parallelism} at a time. Latency is wall time per answered message, retries included.",
-        f"- Arm B: effort {ANTHROPIC_EFFORT}, max_tokens {ANTHROPIC_MAX_TOKENS}, no temperature, no "
-        "fallback model; a refusal or a reply cut at max_tokens counts as an error.",
+        "- A refusal, or a reply cut at max_tokens, counts as an error for arm B.",
         "- Neither arm used the eval response cache, so latency and cost are measured, not replayed.",
         "",
     ]
@@ -702,6 +730,7 @@ async def run_comparison(
         local_url=local_llm.base_url,
         local_error="; ".join(unreachable) if unreachable else None,
         local_stand_in=bool(getattr(local_llm, "api_key", "")),
+        local_settings=describe_local_settings(local_cfg),
         model=args.model,
         estimate=estimate(args.model, await capture_prompts(threads, config)),
     )
@@ -772,10 +801,12 @@ async def run_comparison(
 
     now = datetime.now(timezone.utc)
     text = build_report(
-        ArmRun(name=f"Arm A: local {local_llm.model}", results=results_a, parallelism=local_parallel),
+        ArmRun(name=f"Arm A: local {local_llm.model}", results=results_a, parallelism=local_parallel,
+               settings=describe_local_settings(local_cfg), temperature=local_cfg["temperature"]),
         ArmRun(name=f"Arm B: {args.model}", results=results_b, parallelism=ANTHROPIC_PARALLELISM,
                priced_model=args.model, input_tokens=claude.input_tokens,
-               output_tokens=claude.output_tokens, replies=claude.calls, refusals=claude.refusals),
+               output_tokens=claude.output_tokens, replies=claude.calls, refusals=claude.refusals,
+               settings=describe_claude_settings()),
         golden_set_path=str(golden_path), reviewed_threads=len(reviewed), timestamp=now.isoformat(),
     )
     report_path = output_dir / (

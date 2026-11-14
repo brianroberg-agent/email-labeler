@@ -214,7 +214,17 @@ per arm by expected label and by kind, threads not sent, median and p90
 latency per answered message, and cost. When refusals are more than half of
 arm B's replies, a line above the table says the comparison is not meaningful
 (`test_a_refusal_dominated_arm_b_is_marked_not_meaningful_above_the_table`),
-and another says so when arm B stopped early. The report holds counts only, no subject, sender, body or
+and another says so when arm B stopped early. Above the table, one line per
+arm gives its request settings as sent: arm A's from `[llm.local]`
+(temperature, `max_tokens`, timeout, `extra_body` verbatim), arm B's from the
+module constants (default sampling, adaptive thinking, effort, `max_tokens`,
+timeout and retries). A further line says this is one run with no repeat and
+that arm B's sampling is not fixed. The plan states the same
+(`test_the_plan_states_each_arms_settings_and_one_run`,
+`test_the_report_states_each_arms_settings_above_the_table`). They are
+disclosed rather than aligned because the claude-api skill (2026-11) lists a
+temperature as rejected by the current Claude models and disabled thinking as
+rejected by Opus 5.5. The report holds counts only, no subject, sender, body or
 thread id (`test_report_holds_no_message_content`,
 `test_holds_counts_only_no_thread_ids`). Next to it are two ordinary results
 files, `*_stage2_only_compare-A-*.jsonl` and `*_stage2_only_compare-B-*.jsonl`,

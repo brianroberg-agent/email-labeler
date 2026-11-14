@@ -421,6 +421,7 @@ def _plan(**kw):
         max_thread_chars=16000, local_model="qwen-synthetic:8b",
         local_url="http://ollama.example.test:11434/v1/chat/completions", local_error=None,
         local_stand_in=False,
+        local_settings="temperature 0, max_tokens 4096, timeout 180 s per request, extra_body {}",
         model="claude-opus-5-5", estimate=compare.estimate("claude-opus-5-5", prompts),
     )
     base.update(kw)
@@ -1098,6 +1099,58 @@ class TestBuildLocalLlm:
         assert (llm.model, llm.max_tokens, llm.temperature, llm.timeout) == (
             "qwen-synthetic:8b", 4096, 0, 180)
         assert llm.extra_body == extra
+
+
+class TestArmSettingsDisclosed:
+    """The arms differ in more than the model, and the settings are disclosed
+    rather than aligned, so the plan and the report state what each arm was
+    sent."""
+
+    @pytest.fixture
+    def unusual_local_config(self, monkeypatch):
+        # Values unlike the shipped config's, so only text built from the
+        # config that ran can pass.
+        config, path = compare.load_config(None)
+        config["llm"]["local"].update(
+            temperature=0.35, max_tokens=2345, timeout=123,
+            extra_body={"reasoning_effort": "synthetic-effort"})
+        monkeypatch.setattr(compare, "load_config", lambda _path: (config, path))
+
+    @staticmethod
+    def _assert_settings(text):
+        for local in ("temperature 0.35", "max_tokens 2345", "timeout 123 s",
+                      '{"reasoning_effort": "synthetic-effort"}'):
+            assert local in text
+        for claude in (f"effort {compare.ANTHROPIC_EFFORT}", f"max_tokens {compare.ANTHROPIC_MAX_TOKENS}",
+                       "adaptive thinking", "default sampling", "no temperature",
+                       f"timeout {compare.ANTHROPIC_TIMEOUT_SECONDS:.0f} s"):
+            assert claude in text
+        assert "one run" in text.lower() and "a rerun can differ" in text
+        assert "deterministic" not in text.lower()
+
+    async def test_the_plan_states_each_arms_settings_and_one_run(
+        self, golden_file, tmp_path, capsys, unusual_local_config,
+    ):
+        await compare.run_comparison(
+            _args(golden_file, tmp_path, dry_run=True), local_llm=_FakeLocal(),
+            client_factory=_never, getpass_fn=_never, input_fn=_never,
+        )
+
+        self._assert_settings(capsys.readouterr().out)
+
+    async def test_the_report_states_each_arms_settings_above_the_table(
+        self, golden_file, tmp_path, unusual_local_config,
+    ):
+        await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(_Router(), []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        [report_file] = (tmp_path / "results").glob("*.md")
+        text = report_file.read_text()
+        self._assert_settings(text)
+        assert text.index("max_tokens 2345") < text.index("| Metric")
+        assert "arm A ran at temperature 0.35" in text
 
 
 class TestRunComparisonExits:
