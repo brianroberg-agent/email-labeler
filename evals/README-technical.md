@@ -163,10 +163,16 @@ stopped at `max_tokens` or by a refusal, or one with no answer outside its
 reasoning, raises `LLMContentError` and counts as that arm's error. Where the
 cause is known by type, the row's error starts with a bracketed kind:
 `[refusal: <category>]` (the reply's `stop_details.category`, or
-`uncategorised`; the free-text explanation is not recorded), `[max_tokens]`, or
-`[timeout]` (the SDK's `APITimeoutError` after its retries); anything else is
-"other" in the report (`test_an_unusable_reply_records_its_kind`,
-`test_a_timeout_records_its_kind`).
+`uncategorised`; the free-text explanation is not recorded), `[max_tokens]`,
+`[timeout]` (a read timeout, the SDK's `APITimeoutError` after its retries), or
+`[unavailable]`: an outage, that is, a 429 or a 5xx (529 "overloaded"
+included) left after the SDK's retries, a connection failure, or a connect
+timeout. A rejected request (another 4xx) and anything else are "other" in
+the report (`test_an_unusable_reply_records_its_kind`,
+`test_a_timeout_records_its_kind`,
+`test_an_api_outage_after_retries_records_its_kind`,
+`test_a_connection_failure_records_its_kind`,
+`test_a_rejected_request_is_not_an_outage`).
 
 **Refusals.** The classifier prompt asks the model to reason step by step in
 `<think>` tags in its reply. The claude-api skill documents that kind of
@@ -213,8 +219,14 @@ counted. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
 The API's token counter is itself an API call, so it is not used.
 
 **Outputs.** `<timestamp>_compare_<local>_vs_<model>.md`: one Markdown table,
-scored on the threads both arms were sent. An arm's error stays in its figures
-as a miss for the thread's expected label, so it lowers that arm's recall
+scored on the threads both arms were sent and neither lost to an outage. A
+thread either arm lost to an outage (`[unavailable]`: the local model or the
+Anthropic API unreachable, or overloaded after retries) is scored for neither
+arm, alike for both, and counted in that arm's "Lost to an outage" row
+(`test_a_thread_either_arm_lost_to_an_outage_is_scored_for_neither`,
+`test_a_thread_arm_b_lost_to_an_outage_is_scored_for_neither_arm`). An arm's
+other errors stay in its figures as a miss for the thread's expected label,
+so they lower that arm's recall
 (`test_an_arms_error_counts_as_a_miss_for_its_expected_label`). It leads with
 needs_response recall, then the error classes in the cost order of
 `docs/labeling-rubric.md` §3 (D21), then per-category precision/recall, errors

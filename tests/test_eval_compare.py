@@ -161,6 +161,45 @@ class TestAnthropicLLMClient:
 
         assert compare.error_kind(str(raised.value)) == "timeout"
 
+    @pytest.mark.parametrize("status, error_type", [
+        (529, "overloaded_error"), (429, "rate_limit_error"), (500, "api_error")])
+    async def test_an_api_outage_after_retries_records_its_kind(self, status, error_type):
+        # An exhausted 429 or a 5xx means Anthropic could not serve anyone, as
+        # LLMUnavailableError means for the local model: an outage, not a miss.
+        transport = _Transport((status, _error(error_type), None))
+        llm = compare.AnthropicLLMClient(_sdk_client(transport).with_options(max_retries=0),
+                                         model="claude-opus-5-5")
+
+        with pytest.raises(Exception) as raised:
+            await llm.complete("S", "U", include_thinking=True)
+
+        assert compare.error_kind(str(raised.value)) == "unavailable"
+
+    @pytest.mark.parametrize("failure", [httpx2.ConnectError, httpx2.ConnectTimeout])
+    async def test_a_connection_failure_records_its_kind(self, failure):
+        # A connect timeout is an unreachable endpoint, as llm_client treats it
+        # for the local model, not a slow reply.
+        def unreachable(request):
+            raise failure("synthetic connection failure", request=request)
+
+        http_client = anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(unreachable))
+        client = compare.build_anthropic_client(SENTINEL_KEY, http_client=http_client)
+        llm = compare.AnthropicLLMClient(client.with_options(max_retries=0), model="claude-opus-5-5")
+
+        with pytest.raises(Exception) as raised:
+            await llm.complete("S", "U", include_thinking=True)
+
+        assert compare.error_kind(str(raised.value)) == "unavailable"
+
+    async def test_a_rejected_request_is_not_an_outage(self):
+        transport = _Transport((400, _error("invalid_request_error"), None))
+        llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
+
+        with pytest.raises(anthropic.BadRequestError) as raised:
+            await llm.complete("S", "U", include_thinking=True)
+
+        assert compare.error_kind(str(raised.value)) == "other"
+
     async def test_reply_with_only_reasoning_is_an_error(self):
         transport = _Transport((200, _message("<think>hmm</think>", thinking="native"), None))
         llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
@@ -697,6 +736,26 @@ class TestReport:
         # $0.08 over the two messages sent, not over three threads.
         assert rows["Cost per message"][1] == "$0.0400"
 
+    def test_a_thread_either_arm_lost_to_an_outage_is_scored_for_neither(self):
+        nr = "needs_response"
+        arm_a = compare.ArmRun(name="Arm A", parallelism=1, results=[
+            _pred("900521", nr, nr),
+            _pred("900522", nr, None, error="[unavailable] synthetic local outage"),
+            _pred("900523", nr, nr)])
+        arm_b = compare.ArmRun(name="Arm B", parallelism=4, priced_model="claude-opus-5-5", results=[
+            _pred("900521", nr, None, error="[unavailable] synthetic API overload"),
+            _pred("900522", nr, None, error=compare.NOT_SENT_LOCAL_UNAVAILABLE),
+            _pred("900523", nr, nr)])
+
+        text = compare.build_report(arm_a, arm_b, golden_set_path="evals/golden_set.jsonl",
+                                    reviewed_threads=3, timestamp="2026-11-13T12:00:00+00:00")
+
+        rows, _ = _rows(text)
+        assert rows["needs_response recall"] == ["100.0% (1/1)", "100.0% (1/1)"]
+        assert rows["Errors (no usable answer)"] == ["0/1", "0/1"]
+        assert rows["Lost to an outage"] == ["1", "1"]
+        assert "Scored on the 1 threads both arms were sent and neither lost to an outage" in text
+
     def test_the_header_says_arm_b_ran_only_the_threads_it_was_sent(self):
         nr, fyi = "needs_response", "fyi"
         arm_a = compare.ArmRun(name="Arm A", parallelism=1, results=[
@@ -803,9 +862,13 @@ class _FakeLocal:
 class _Router:
     """Answers the SDK by path: the model lookup, then message requests."""
 
-    def __init__(self, model_status=200, reply=None):
+    def __init__(self, model_status=200, reply=None, fail_on=None, failure=None):
         self.model_status = model_status
         self.reply = reply or _message("<think>reasoning</think>\nNEEDS_RESPONSE")
+        # The message request whose body holds fail_on gets failure: an HTTP
+        # status, or an exception class the transport raises.
+        self.fail_on = fail_on
+        self.failure = failure
         self.requests: list[httpx2.Request] = []
 
     def __call__(self, request):
@@ -817,6 +880,10 @@ class _Router:
                 "type": "model", "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5",
                 "created_at": "2026-01-01T00:00:00Z",
             })
+        if self.fail_on and self.fail_on in request.content.decode():
+            if isinstance(self.failure, int):
+                return httpx2.Response(self.failure, json=_error("overloaded_error"))
+            raise self.failure("synthetic failure", request=request)
         return httpx2.Response(200, json=self.reply)
 
     def message_requests(self):
@@ -1013,6 +1080,30 @@ class TestRunComparison:
         rows, _ = _rows(text)
         assert rows["Threads not sent"][1] == f"{12 - sent} (stopped after refusals {12 - sent})"
         assert text.index("Arm B stopped sending") < text.index("| Metric")
+
+    @pytest.mark.parametrize("failure", [529, httpx2.ConnectError], ids=["overloaded", "connection"])
+    async def test_a_thread_arm_b_lost_to_an_outage_is_scored_for_neither_arm(
+        self, golden_file, tmp_path, failure,
+    ):
+        # Alpha is the golden file's one needs_response thread. Anthropic is
+        # overloaded or unreachable for it: an outage, as a local one is for arm A.
+        router = _Router(fail_on="Synthetic subject alpha", failure=failure)
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(),
+            client_factory=lambda key: _sdk_client(router).with_options(max_retries=0),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        assert code == 0
+        [path_b] = (tmp_path / "results").glob("*compare-B-*.jsonl")
+        rows_b = {r.thread_id: r for r in report.load_results(path_b)[1]}
+        assert compare.error_kind(rows_b["900101"].error) == "unavailable"
+        [report_file] = (tmp_path / "results").glob("*.md")
+        rows, _ = _rows(report_file.read_text())
+        assert rows["needs_response recall"] == ["N/A (0/0)", "N/A (0/0)"]
+        assert rows["Errors (no usable answer)"] == ["0/2", "0/2"]
+        assert rows["Lost to an outage"] == ["0", "1"]
 
     async def test_full_run_compares_both_arms_on_person_threads(self, golden_file, tmp_path):
         router, keys, local = _Router(), [], _FakeLocal()

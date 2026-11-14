@@ -30,6 +30,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import anthropic
+import httpx2
 
 from classifier import EmailClassifier
 from config_utils import substitute_env_vars
@@ -214,6 +215,13 @@ class AnthropicLLMClient:
         # ratio back to half, but arm B stays stopped.
         self.stopped = False
 
+    def _outage(self, exc: anthropic.APIError) -> LLMUnavailableError:
+        """*exc*, after the SDK's retries, as an outage tagged "unavailable"."""
+        status = getattr(exc, "status_code", None)
+        return LLMUnavailableError(tag(UNAVAILABLE, (
+            f"Claude {self.model} unavailable after retries ({type(exc).__name__}"
+            f"{f', HTTP {status}' if status else ''})")))
+
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
@@ -229,10 +237,23 @@ class AnthropicLLMClient:
                 messages=[{"role": "user", "content": user_content}],
                 output_config={"effort": ANTHROPIC_EFFORT},
             )
-        except anthropic.APITimeoutError:
+        except anthropic.APITimeoutError as exc:
+            # A connect or pool timeout is an unreachable endpoint, an outage as
+            # llm_client counts it for the local model; a read timeout is a slow reply.
+            if isinstance(exc.__cause__, (httpx2.ConnectTimeout, httpx2.PoolTimeout)):
+                raise self._outage(exc) from None
             raise TimeoutError(tag(TIMEOUT, (
                 f"Claude {self.model} did not answer within {ANTHROPIC_TIMEOUT_SECONDS:.0f} s "
                 "on any attempt"))) from None
+        except anthropic.APIConnectionError as exc:
+            raise self._outage(exc) from None
+        except anthropic.APIStatusError as exc:
+            # After the SDK's retries, an exhausted 429 or a 5xx (529 "overloaded"
+            # included) means Anthropic could not serve anyone: an outage, not a
+            # miss. Any other status is a rejected request, an ordinary error.
+            if exc.status_code == 429 or exc.status_code >= 500:
+                raise self._outage(exc) from None
+            raise
         self.calls += 1
         self.input_tokens += response.usage.input_tokens
         self.output_tokens += response.usage.output_tokens
@@ -463,14 +484,20 @@ def _sent(arm: ArmRun) -> set[str]:
     return {r.thread_id for r in arm.results if error_kind(r.error) != NOT_SENT}
 
 
+def _lost_to_outage(arm: ArmRun) -> set[str]:
+    return {r.thread_id for r in arm.results if error_kind(r.error) == UNAVAILABLE}
+
+
 def _scored(arm_a: ArmRun, arm_b: ArmRun) -> tuple[list[PredictionResult], list[PredictionResult]]:
     """Each arm's rows for the threads both arms were sent, errors included.
 
     An error stays in its arm's figures as a miss: in production a failed thread
     is deferred, so its action is late (rubric cost class 2 for needs_response).
-    A thread one arm was not sent is scored for neither.
+    A thread one arm was not sent is scored for neither, and so is a thread
+    either arm lost to an outage of its endpoint: that is the provider's
+    failure, not the model's, and it is treated alike for both arms.
     """
-    both = _sent(arm_a) & _sent(arm_b)
+    both = (_sent(arm_a) & _sent(arm_b)) - _lost_to_outage(arm_a) - _lost_to_outage(arm_b)
     return ([r for r in arm_a.results if r.thread_id in both],
             [r for r in arm_b.results if r.thread_id in both])
 
@@ -504,6 +531,7 @@ def _arm_cells(rows: list[PredictionResult], arm: ArmRun) -> dict[str, str]:
     not_sent = Counter(r.error.split("] ", 1)[1] for r in arm.results if error_kind(r.error) == NOT_SENT)
     reasons = ", ".join(f"{reason} {n}" for reason, n in not_sent.items())
     cells["Threads not sent"] = f"{not_sent.total()}" + (f" ({reasons})" if reasons else "")
+    cells["Lost to an outage"] = str(len(_lost_to_outage(arm)))
     seconds = [r.duration_seconds for r in rows if r.error is None]
     cells["Latency per message, median"] = f"{statistics.median(seconds):.1f} s" if seconds else "N/A"
     cells["Latency per message, p90"] = f"{percentile(seconds, 90):.1f} s" if seconds else "N/A"
@@ -528,7 +556,7 @@ _ROW_ORDER = (
     + [label for label, _ in COST_ORDER]
     + ["needs_response precision", "fyi recall", "fyi precision",
        "low_priority recall", "low_priority precision",
-       "Errors (no usable answer)", "Errors by kind", "Threads not sent",
+       "Errors (no usable answer)", "Errors by kind", "Threads not sent", "Lost to an outage",
        "Latency per message, median", "Latency per message, p90",
        "Cost per message", "Cost, total"]
 )
@@ -562,10 +590,12 @@ def build_report(
         f"- Golden set: `{golden_set_path}`, {reviewed_threads} reviewed threads, of which "
         f"{len(arm_a.results)} are person threads (the `run_eval --local-only` population); arm A ran "
         f"Stage 2 on all {len(arm_a.results)} of them and arm B on the {len(_sent(arm_b))} it was sent.",
-        f"- Scored on the {len(rows_a)} threads both arms were sent. An arm's error counts as a miss "
-        "for the thread's expected label, lowering that arm's recall; it has no predicted label, so "
-        "precision and the error classes do not count it. A thread not sent to an arm is counted in "
-        "its own row and scored for neither arm.",
+        f"- Scored on the {len(rows_a)} threads both arms were sent and neither lost to an outage. An "
+        "arm's error counts as a miss for the thread's expected label, lowering that arm's recall; it "
+        "has no predicted label, so precision and the error classes do not count it. A thread not "
+        "sent to an arm is counted in its own row and scored for neither arm. So is a thread either "
+        "arm lost to an outage (its endpoint unreachable, or a 429 or 5xx left after retries), counted "
+        "in that arm's \"Lost to an outage\" row.",
         *[f"- {arm.name}, sent with {arm.settings}." for arm in (arm_a, arm_b) if arm.settings],
         f"- {ONE_RUN}"
         + (f"; arm A ran at temperature {arm_a.temperature}." if arm_a.temperature is not None else "."),

@@ -211,6 +211,10 @@ unusably is
 A request already in flight when the MacBook sleeps usually ends as a read
 timeout and is sent, counted as arm A's error. If arm A answered no thread
 usably, arm B is not run (`test_arm_b_is_not_run_when_arm_a_produced_nothing`).
+A thread either arm lost to an outage (the local model, or Anthropic,
+unreachable or overloaded after retries) is scored for neither arm and counted
+in that arm's "Lost to an outage" row
+(`test_a_thread_either_arm_lost_to_an_outage_is_scored_for_neither`).
 
 The classifier prompt asks the model to write its reasoning in its reply,
 which current Claude models may decline as `reasoning_extraction`. The report
