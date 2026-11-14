@@ -16,7 +16,7 @@ import pytest
 from classifier import EmailClassifier
 from daemon import load_config
 from evals import compare
-from evals.schemas import GoldenThread
+from evals.schemas import GoldenThread, PredictionResult
 from llm_client import LLMContentError
 
 SENTINEL_KEY = "sk-ant-test-SENTINEL-0000"
@@ -354,3 +354,119 @@ class TestConfirmation:
     @pytest.mark.parametrize("answer", ["", "y", "no", "yes please", "sure"])
     def test_anything_else_stops(self, answer):
         assert not compare.confirmed(answer)
+
+
+def _pred(tid, expected, predicted, seconds=1.0, error=None):
+    return PredictionResult(
+        thread_id=tid, expected_sender_type="person", expected_label=expected,
+        predicted_sender_type="person", predicted_label=None if error else predicted,
+        label_correct=None if error else expected == predicted,
+        duration_seconds=seconds, error=error,
+    )
+
+
+def _arms():
+    nr, fyi, low = "needs_response", "fyi", "low_priority"
+    arm_a = compare.ArmRun(name="Arm A: local qwen-synthetic:8b", parallelism=1, results=[
+        _pred("900001", nr, low, 1.0),   # person mail archived
+        _pred("900002", fyi, low, 2.0),  # person mail archived
+        _pred("900003", nr, fyi, 3.0),   # needs_response read as FYI
+        _pred("900004", fyi, nr, 4.0),   # FYI read as needs_response
+        _pred("900005", low, fyi, 5.0),  # cold pitch kept
+        _pred("900006", nr, nr, 6.0),
+        _pred("900007", nr, None, 9.0, error="LLM endpoint unavailable"),
+        _pred("900008", fyi, fyi, 7.0),
+    ])
+    arm_b = compare.ArmRun(
+        name="Arm B: claude-opus-5-5", parallelism=4, priced_model="claude-opus-5-5",
+        input_tokens=10_000, output_tokens=2_000, results=[
+            _pred("900001", nr, nr, 0.5), _pred("900002", fyi, fyi, 0.5),
+            _pred("900003", nr, nr, 0.5), _pred("900004", fyi, fyi, 0.5),
+            _pred("900005", low, low, 0.5), _pred("900006", nr, nr, 0.5),
+            _pred("900007", nr, nr, 0.5),
+            _pred("900008", fyi, None, 0.5, error="stop_reason='refusal'"),
+        ])
+    return arm_a, arm_b
+
+
+def _report():
+    arm_a, arm_b = _arms()
+    return compare.build_report(
+        arm_a, arm_b, golden_set_path="evals/golden_set.jsonl", reviewed_threads=20,
+        timestamp="2026-11-13T12:00:00+00:00",
+    )
+
+
+def _rows(report):
+    rows = {}
+    order = []
+    for line in report.splitlines():
+        if line.startswith("| ") and not line.startswith("| Metric") and not line.startswith("|---"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            rows[cells[0]] = cells[1:]
+            order.append(cells[0])
+    return rows, order
+
+
+class TestReport:
+    def test_scores_both_arms_on_the_threads_both_answered(self):
+        rows, _ = _rows(_report())
+
+        # 900007 failed in arm A and 900008 in arm B, so six threads are scored.
+        assert rows["needs_response recall"] == ["33.3% (1/3)", "100.0% (3/3)"]
+        assert rows["Errors (no usable answer)"] == ["1/8", "1/8"]
+        assert "Scored on the 6 threads both arms answered" in _report()
+
+    def test_needs_response_recall_leads_and_error_classes_follow_the_cost_order(self):
+        rows, order = _rows(_report())
+
+        assert order[0] == "needs_response recall"
+        cost_order = [
+            "1. Person mail archived (needs_response/fyi → low_priority)",
+            "2. needs_response read as FYI",
+            "3. FYI read as needs_response",
+            "4. Cold pitch kept (low_priority → needs_response/fyi)",
+        ]
+        assert [label for label in order if label[:2] in ("1.", "2.", "3.", "4.")] == cost_order
+        assert [rows[label][0] for label in cost_order] == ["2", "1", "1", "1"]
+        assert [rows[label][1] for label in cost_order] == ["0", "0", "0", "0"]
+
+    def test_per_category_precision_and_recall(self):
+        rows, _ = _rows(_report())
+
+        assert rows["needs_response precision"] == ["50.0% (1/2)", "100.0% (3/3)"]
+        assert rows["fyi recall"] == ["0.0% (0/2)", "100.0% (2/2)"]
+        assert rows["fyi precision"] == ["0.0% (0/2)", "100.0% (2/2)"]
+        assert rows["low_priority recall"] == ["0.0% (0/1)", "100.0% (1/1)"]
+        assert rows["low_priority precision"] == ["0.0% (0/2)", "100.0% (1/1)"]
+
+    def test_latency_median_and_p90_per_message(self):
+        rows, _ = _rows(_report())
+
+        assert rows["Latency per message, median"] == ["3.5 s", "0.5 s"]
+        assert rows["Latency per message, p90"] == ["6.0 s", "0.5 s"]
+
+    def test_cost_per_message_and_total(self):
+        rows, _ = _rows(_report())
+
+        # 10,000 x $4 + 2,000 x $20 per million = $0.08 over 8 threads sent.
+        assert rows["Cost per message"] == ["$0 (local)", "$0.0100"]
+        assert rows["Cost, total"][0] == "$0 (local)"
+        assert rows["Cost, total"][1].startswith("$0.08")
+        assert "2026-11-03" in rows["Cost, total"][1]
+
+    def test_holds_counts_only_no_thread_ids(self):
+        report = _report()
+
+        for tid in ("900001", "900005", "900008"):
+            assert tid not in report
+
+
+class TestPercentile:
+    @pytest.mark.parametrize("values, expected", [
+        ([5.0], 5.0),
+        ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], 9.0),
+        ([3.0, 1.0, 2.0], 3.0),
+    ])
+    def test_p90_is_nearest_rank(self, values, expected):
+        assert compare.percentile(values, 90) == expected

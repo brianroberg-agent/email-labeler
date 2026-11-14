@@ -7,8 +7,10 @@ local slot, so both arms see the identical prompt. Usage and the run order are
 in evals/README.md.
 """
 
+import math
 import os
 import stat
+import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,8 +18,9 @@ from pathlib import Path
 import anthropic
 
 from classifier import EmailClassifier
+from evals import report
 from evals.run_eval import evaluate_single, resolve_max_thread_chars
-from evals.schemas import GoldenThread
+from evals.schemas import GoldenThread, PredictionResult
 from llm_client import LLMClient, LLMContentError
 
 # The population both arms see: Stage 2 on reviewed person threads, i.e.
@@ -154,6 +157,133 @@ def format_plan(plan: Plan) -> str:
 def confirmed(answer: str) -> bool:
     """True only for a typed "yes": the one approval the run asks for."""
     return answer.strip().lower() == "yes"
+
+
+@dataclass
+class ArmRun:
+    """One arm's results and, for the API arm, the usage it was billed for."""
+
+    name: str
+    results: list[PredictionResult]
+    parallelism: int
+    priced_model: str | None = None  # None: a local model, no API charge
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def cost(self) -> float:
+        if self.priced_model is None:
+            return 0.0
+        return cost_usd(self.priced_model, self.input_tokens, self.output_tokens)
+
+
+def percentile(values: list[float], q: float) -> float:
+    """Nearest-rank percentile: the smallest value with at least q% of values at or below it."""
+    ordered = sorted(values)
+    rank = max(1, math.ceil(q / 100 * len(ordered)))
+    return ordered[rank - 1]
+
+
+# The recorded error-cost order, worst first: docs/labeling-rubric.md section 3
+# (decision D21). Each class is a set of (expected, predicted) label pairs; on
+# person threads an expected low_priority is a cold pitch (rubric rule P1).
+COST_ORDER = [
+    ("1. Person mail archived (needs_response/fyi → low_priority)",
+     [("needs_response", "low_priority"), ("fyi", "low_priority")]),
+    ("2. needs_response read as FYI", [("needs_response", "fyi")]),
+    ("3. FYI read as needs_response", [("fyi", "needs_response")]),
+    ("4. Cold pitch kept (low_priority → needs_response/fyi)",
+     [("low_priority", "needs_response"), ("low_priority", "fyi")]),
+]
+
+
+def _paired(arm_a: ArmRun, arm_b: ArmRun) -> tuple[list[PredictionResult], list[PredictionResult]]:
+    """Each arm's rows for the threads that both arms answered without error."""
+    ok_b = {r.thread_id for r in arm_b.results if r.error is None}
+    both = {r.thread_id for r in arm_a.results if r.error is None} & ok_b
+    return ([r for r in arm_a.results if r.thread_id in both],
+            [r for r in arm_b.results if r.thread_id in both])
+
+
+def _ratio(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return f"N/A ({numerator}/{denominator})"
+    return f"{numerator / denominator:.1%} ({numerator}/{denominator})"
+
+
+def _arm_cells(rows: list[PredictionResult], arm: ArmRun) -> dict[str, str]:
+    matrix = report.compute_confusion_matrix(rows, "expected_label", "predicted_label", report.LABEL_CLASSES)
+    cells = {}
+    for cls in report.LABEL_CLASSES:
+        tp = matrix[cls][cls]
+        cells[f"{cls} recall"] = _ratio(tp, sum(matrix[cls].values()))
+        cells[f"{cls} precision"] = _ratio(tp, sum(matrix[other][cls] for other in report.LABEL_CLASSES))
+    for label, pairs in COST_ORDER:
+        cells[label] = str(sum(matrix[expected][predicted] for expected, predicted in pairs))
+    errors = sum(1 for r in arm.results if r.error is not None)
+    cells["Errors (no usable answer)"] = f"{errors}/{len(arm.results)}"
+    seconds = [r.duration_seconds for r in rows]
+    cells["Latency per message, median"] = f"{statistics.median(seconds):.1f} s" if seconds else "N/A"
+    cells["Latency per message, p90"] = f"{percentile(seconds, 90):.1f} s" if seconds else "N/A"
+    if arm.priced_model is None:
+        cells["Cost per message"] = cells["Cost, total"] = "$0 (local)"
+    else:
+        price_in, price_out = PRICES_PER_MTOK[arm.priced_model]
+        sent = len(arm.results)
+        cells["Cost per message"] = f"${arm.cost / sent:.4f}" if sent else "N/A"
+        cells["Cost, total"] = (
+            f"${arm.cost:.2f} ({arm.input_tokens:,} input / {arm.output_tokens:,} output tokens "
+            f"at ${price_in:.2f} / ${price_out:.2f} per million, prices of {PRICES_AS_OF})"
+        )
+    return cells
+
+
+# Row order of the report table: needs_response recall first (the rubric's
+# second-worst error is its complement), then the cost-ordered error classes,
+# the remaining per-category figures, errors, latency and cost.
+_ROW_ORDER = (
+    ["needs_response recall"]
+    + [label for label, _ in COST_ORDER]
+    + ["needs_response precision", "fyi recall", "fyi precision",
+       "low_priority recall", "low_priority precision",
+       "Errors (no usable answer)",
+       "Latency per message, median", "Latency per message, p90",
+       "Cost per message", "Cost, total"]
+)
+
+
+def build_report(
+    arm_a: ArmRun, arm_b: ArmRun, *, golden_set_path: str, reviewed_threads: int, timestamp: str,
+) -> str:
+    """The side-by-side Markdown report. It holds counts and figures only: no
+    subject, sender, body or thread id."""
+    rows_a, rows_b = _paired(arm_a, arm_b)
+    cells_a, cells_b = _arm_cells(rows_a, arm_a), _arm_cells(rows_b, arm_b)
+    lines = [
+        f"# Claude comparison: {arm_a.name} vs {arm_b.name}",
+        "",
+        f"- Run: {timestamp}",
+        f"- Golden set: `{golden_set_path}`, {reviewed_threads} reviewed threads; both arms ran "
+        f"Stage 2 on its {len(arm_a.results)} person threads (the `run_eval --local-only` population).",
+        f"- Scored on the {len(rows_a)} threads both arms answered; each arm's errors are counted "
+        "in their own row.",
+        "- Error classes follow the cost order of `docs/labeling-rubric.md` section 3 (decision D21), "
+        "worst first.",
+        "",
+        f"| Metric | {arm_a.name} | {arm_b.name} |",
+        "|---|---|---|",
+    ]
+    lines += [f"| {row} | {cells_a[row]} | {cells_b[row]} |" for row in _ROW_ORDER]
+    lines += [
+        "",
+        f"- Concurrency: arm A {arm_a.parallelism} at a time (`local_parallel`), arm B "
+        f"{arm_b.parallelism} at a time. Latency is wall time per message, retries included.",
+        f"- Arm B: effort {ANTHROPIC_EFFORT}, max_tokens {ANTHROPIC_MAX_TOKENS}, no temperature, no "
+        "fallback model; a refusal or a reply cut at max_tokens counts as an error.",
+        "- Neither arm used the eval response cache, so latency and cost are measured, not replayed.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 class CloudNotUsed:
