@@ -7,6 +7,7 @@ fixture is synthetic mail (``example.test`` addresses, invented names).
 """
 
 import argparse
+import asyncio
 import base64
 import functools
 import getpass
@@ -195,6 +196,42 @@ class TestRefusalEarlyStop:
                 await llm.complete("S", "U")
             assert compare.error_kind(str(raised.value)) == "not sent"
             assert len(transport.requests) == refused + answered
+
+
+    async def test_once_stopped_arm_b_stays_stopped_when_answers_in_flight_land(self):
+        # A request in flight when the rule trips still lands. If it is an
+        # answer, the ratio falls back to half (3 of 6), but nothing more may
+        # be sent.
+        arrived, release = asyncio.Event(), asyncio.Event()
+        queue = [_refusal(), _refusal(), _refusal(), _message("FYI"), _message("FYI"), _message("FYI")]
+        seen = []
+
+        async def handler(request):
+            seen.append(request)
+            if len(seen) == 1:  # held in flight until after the stop
+                arrived.set()
+                await release.wait()
+                return httpx2.Response(200, json=_message("FYI"))
+            return httpx2.Response(200, json=queue.pop(0))
+
+        http_client = anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler))
+        llm = compare.AnthropicLLMClient(
+            compare.build_anthropic_client(SENTINEL_KEY, http_client=http_client), model="claude-opus-5-5")
+        held = asyncio.create_task(llm.complete("S", "U"))
+        await arrived.wait()
+        for _ in range(3):
+            with pytest.raises(LLMContentError):
+                await llm.complete("S", "U")
+        for _ in range(2):
+            await llm.complete("S", "U")
+        with pytest.raises(compare.NotSentError):
+            await llm.complete("S", "U")
+
+        release.set()
+        assert await held == "FYI"
+        with pytest.raises(compare.NotSentError):
+            await llm.complete("S", "U")
+        assert len(seen) == 6
 
 
 def _error(kind):

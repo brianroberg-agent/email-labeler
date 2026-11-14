@@ -175,7 +175,9 @@ once `REFUSAL_STOP_MIN_REPLIES` replies are in and more than half of them are
 refusals; threads not sent after that are recorded as `[not sent] stopped after
 refusals` (`test_arm_b_stops_once_five_replies_are_in_and_most_are_refusals`,
 `test_arm_b_sends_nothing_more_once_refusals_dominate`). Requests already in
-flight when the rule trips still land. The one typed yes covers the run; the
+flight when the rule trips still land; if they are answers and bring the ratio
+back to half, arm B stays stopped
+(`test_once_stopped_arm_b_stays_stopped_when_answers_in_flight_land`). The one typed yes covers the run; the
 stop asks nothing. The SDK
 client is built from the given key and the fixed base URL with the
 `ANTHROPIC_*` variables hidden, because `daemon.py` loads `.env` at import

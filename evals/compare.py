@@ -204,11 +204,16 @@ class AnthropicLLMClient:
         self.refusals = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        # Latched: answers already in flight when the rule trips can bring the
+        # ratio back to half, but arm B stays stopped.
+        self.stopped = False
 
     async def complete(
         self, system_prompt: str, user_content: str, include_thinking: bool = False,
     ) -> str | tuple[str, str]:
         if self.calls >= REFUSAL_STOP_MIN_REPLIES and refusals_dominate(self.refusals, self.calls):
+            self.stopped = True
+        if self.stopped:
             raise NotSentError(NOT_SENT_REFUSALS)
         try:
             response = await self._client.messages.create(
