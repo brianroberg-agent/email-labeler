@@ -986,12 +986,14 @@ class TestRunComparison:
         golden = tmp_path / "golden.jsonl"
         golden.write_text("".join(json.dumps(_thread(f"9008{i:02d}").to_dict()) + "\n" for i in range(12)))
         router = _Router(reply=_refusal())
+        asked = []
 
         await compare.run_comparison(
             _args(golden, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(router, []),
-            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: asked.append(prompt) or "yes",
         )
 
+        assert len(asked) == 1  # the one typed yes; the stop asks nothing
         sent = len(router.message_requests())
         # Up to four requests are in flight when the fifth refusal lands, and
         # they still land; nothing is sent after that.

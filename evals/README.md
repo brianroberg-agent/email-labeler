@@ -204,9 +204,13 @@ stops at the plan, before the yes, the key, or anything sent to Anthropic
 (`test_unreachable_local_model_refuses_before_anything_is_sent`). After "yes"
 and the key, it runs the local arm, then the Claude arm, and writes
 `evals/results/<timestamp>_compare_<local>_vs_<model>.md` (git-ignored). A
-thread the local model was unavailable for during its arm (the MacBook fell
-asleep partway) is not sent to Anthropic; a thread it answered unusably is
+thread the local model could not be reached for (the endpoint unreachable or
+the connection dropped) is not sent to Anthropic; a thread it answered
+unusably is
 (`test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is`).
+A request already in flight when the MacBook sleeps usually ends as a read
+timeout and is sent, counted as arm A's error. If arm A answered no thread
+usably, arm B is not run (`test_arm_b_is_not_run_when_arm_a_produced_nothing`).
 
 The classifier prompt asks the model to write its reasoning in its reply,
 which current Claude models may decline as `reasoning_extraction`. The report

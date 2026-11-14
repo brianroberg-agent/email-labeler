@@ -180,7 +180,7 @@ refusals` (`test_arm_b_stops_once_five_replies_are_in_and_most_are_refusals`,
 flight when the rule trips still land; if they are answers and bring the ratio
 back to half, arm B stays stopped
 (`test_once_stopped_arm_b_stays_stopped_when_answers_in_flight_land`). The one typed yes covers the run; the
-stop asks nothing. The SDK
+stop asks nothing (`test_arm_b_sends_nothing_more_once_refusals_dominate`). The SDK
 client is built from the given key and the fixed base URL with the
 `ANTHROPIC_*` variables hidden, because `daemon.py` loads `.env` at import
 (`test_uses_only_the_given_key_whatever_the_environment_holds`). One SDK
@@ -194,9 +194,13 @@ id) → arm A → stop if arm A produced no result → arm B on the threads arm 
 did not lose to an outage of the local model → report. Arm A's client is
 wrapped so an `LLMUnavailableError` is tagged in its row; arm B is not sent
 those threads, and its results file records them as `[not sent] local model
-unavailable`. A thread arm A failed on content is sent. The report counts the
+unavailable`. A thread arm A failed on content is sent, unless arm A answered
+no thread usably: then arm B is not run
+(`test_arm_b_is_not_run_when_arm_a_produced_nothing`). The report counts the
 threads not sent in their own row and scores them for neither arm, and arm
-B's cost per message is over the threads it sent.
+B's cost per message is over the threads it sent
+(`test_a_thread_arm_a_lost_to_an_outage_is_not_sent_but_a_content_failure_is`,
+`test_threads_not_sent_are_neither_errors_nor_billed_messages`).
 
 **Estimate.** `capture_prompts()` runs the threads through the classifier with
 a recorder in the local slot, so the estimate counts the exact Stage 2 prompts.
