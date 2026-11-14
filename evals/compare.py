@@ -583,7 +583,7 @@ async def run_comparison(
         max_tokens=local_cfg["max_tokens"], extra_body=local_cfg.get("extra_body"),
     )
     if all(r.error is not None for r in results_a):
-        print(f"Arm A produced no results (see {path_a}), so arm B was not run and nothing "
+        print(f"Arm A produced no results (see {path_a}), so arm B was not run and no mail "
               "was sent to Anthropic.")
         return 1
 

@@ -626,7 +626,9 @@ class TestRunComparison:
 
         assert code == 1
         assert router.message_requests() == []
-        assert "arm B was not run" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The model lookup did reach Anthropic; what was not sent is mail.
+        assert "arm B was not run and no mail was sent to Anthropic" in out
 
     async def test_full_run_compares_both_arms_on_person_threads(self, golden_file, tmp_path):
         router, keys, local = _Router(), [], _FakeLocal()
