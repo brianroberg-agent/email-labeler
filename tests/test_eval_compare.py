@@ -12,6 +12,7 @@ import functools
 import getpass
 import io
 import json
+import logging
 import sys
 import warnings
 
@@ -775,6 +776,29 @@ class TestParser:
         assert args.output_dir == "evals/results/"
         assert args.anthropic_key_file is None
         assert args.dry_run is False
+
+
+class TestEntryPoint:
+    def test_sdk_debug_logging_does_not_write_the_mail(self, monkeypatch, caplog):
+        # ANTHROPIC_LOG=debug sets the anthropic logger to DEBUG when the SDK is
+        # imported, and the SDK then logs each request's options, body
+        # included. The entry point must pin that logger before anything is sent.
+        caplog.set_level(logging.DEBUG, logger="anthropic")
+
+        async def one_request(args):
+            transport = _Transport((200, _message("FYI"), None))
+            llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
+            await llm.complete("SYSTEM-MARKER-900301", "BODY-MARKER-900301")
+            return 0
+
+        monkeypatch.setattr(compare, "run_comparison", one_request)
+        monkeypatch.setattr(sys, "argv", ["evals.compare"])
+        with pytest.raises(SystemExit):
+            compare.cli()
+
+        assert "BODY-MARKER-900301" not in caplog.text
+        assert "SYSTEM-MARKER-900301" not in caplog.text
+        assert logging.getLogger("anthropic").level == logging.INFO
 
 
 class TestBuildLocalLlm:

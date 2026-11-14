@@ -12,6 +12,7 @@ import asyncio
 import getpass
 import hashlib
 import json
+import logging
 import math
 import os
 import stat
@@ -658,7 +659,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def pin_sdk_logging() -> None:
+    """Hold the ``anthropic`` logger at INFO, so its DEBUG output stays off.
+
+    ``ANTHROPIC_LOG=debug`` in the shell sets that logger to DEBUG when the SDK
+    is imported, and the SDK then logs each request's options, the system
+    prompt and the thread transcript among them. Called by the entry point, not
+    at import, as daemon.quiet_http_logging is.
+    """
+    logging.getLogger("anthropic").setLevel(logging.INFO)
+
+
 def cli():
+    pin_sdk_logging()
     args = build_parser().parse_args()
     raise SystemExit(asyncio.run(run_comparison(args)))
 

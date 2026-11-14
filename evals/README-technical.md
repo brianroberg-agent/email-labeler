@@ -161,7 +161,10 @@ stopped at `max_tokens` or by a refusal, or one with no answer outside its
 reasoning, raises `LLMContentError` and counts as that arm's error. The SDK
 client is built from the given key and the fixed base URL with the
 `ANTHROPIC_*` variables hidden, because `daemon.py` loads `.env` at import
-(`test_uses_only_the_given_key_whatever_the_environment_holds`).
+(`test_uses_only_the_given_key_whatever_the_environment_holds`). One SDK
+variable acts earlier, at import: `ANTHROPIC_LOG=debug` in the shell makes the
+SDK log each request body, the mail included, so the entry point holds the
+`anthropic` logger at INFO (`test_sdk_debug_logging_does_not_write_the_mail`).
 
 **Order of a run.** Plan → stop if the local model did not answer → typed
 `yes` → key → a model lookup that sends no mail (checks the key and the model
