@@ -120,6 +120,64 @@ the dialect it accepts via `--extra-body`/`--local-extra-body`.
 
 **Assistant-field metrics** (issue #78). Reported separately from the three-way label accuracy, as binary precision/recall/F1 over the threads whose expected label is `needs_response` AND which carry a non-null `expected_assistant`; that n is printed alongside every figure. Within that set a thread counts as a positive prediction only when `predicted_assistant` is `True`, so an absent prediction counts as a negative — which is what the absence of the marker label means in practice. A positive prediction on a thread outside the set (wrong label, or not yet annotated) is reported on its own line as `out_of_scope_positives` instead of entering precision. While a run contains no `predicted_assistant` values at all, the block prints annotation progress — `assistant: no predictions in this run (N of M needs_response threads annotated)` — rather than a 0% that would read as a measured failure. `print_trend` carries an `Assistant` column (the F1, `N/A` with no predictions); `--compare` prints a precision/recall/F1 block when both runs have predictions; `--format json` carries the whole `assistant` section.
 
+### compare
+
+The Claude comparison (issue #92); usage and where it runs are in
+[README.md](README.md#claude-comparison-issue-92).
+
+| Flag | Description |
+|---|---|
+| `--golden-set` | Path to golden set JSONL (default: `evals/golden_set.jsonl`). Its reviewed, non-excluded **person** threads are used |
+| `--config` | Path to config.toml (default: the repo-root `config.toml`) |
+| `--output-dir` | Where the report and the two per-arm results files are written (default: `evals/results/`, git-ignored) |
+| `--model` | Claude model for arm B, one of the priced models in `PRICES_PER_MTOK` (`evals/compare.py`); default `claude-opus-5-5`. Any other value is an argparse error, so every run can be costed |
+| `--anthropic-key-file` | Read the API key from this file instead of the hidden prompt. The file must be owner-only (`chmod 600`); a wider mode, an empty file or an unreadable path stops the run with a one-line reason |
+| `--dry-run` | Print the plan and stop. Exits 1 when the local model did not answer its probe, as a real run would |
+| `--max-threads` | Use at most this many person threads (a cheap first run) |
+
+**Population and arms.** Both arms run Stage 2 on the same person threads, the
+`--local-only` population, through the real `EmailClassifier`, so the prompt is
+the one in `config.toml`, unchanged. Arm A is the `[llm.local]` client built as
+`run_eval` builds it (`MLX_URL`, so where `MLX_URL` points decides where arm A's
+mail goes — decision D4). Arm B puts `AnthropicLLMClient` in the local slot. The
+cloud slot holds a stand-in that fails any call, so neither arm reaches the
+cloud tier. Arm A runs at `local_parallel`, not `run_eval`'s `cloud_parallel`,
+so its latency is the latency production sees. Neither arm uses the response
+cache: a hit has no latency and no usage, and arm A may already be cached from
+earlier runs.
+
+**Arm B's request.** Model, effort, `max_tokens`, retry budget, per-request
+timeout and concurrency are module constants in `evals/compare.py`, each with
+its reason. No `temperature` is sent (current models reject it), thinking is
+left at its adaptive default (it cannot be turned off on them), and no
+`fallbacks` model is set: a fallback would change which model answered. A reply
+stopped at `max_tokens` or by a refusal, or one with no answer outside its
+reasoning, raises `LLMContentError` and counts as that arm's error. The SDK
+client is built from the given key and the fixed base URL with every
+`ANTHROPIC_*` variable hidden, because `daemon.py` loads `.env` at import.
+
+**Order of a run.** Plan → stop if the local model did not answer → typed
+`yes` → key → a model lookup that sends no mail (checks the key and the model
+id) → arm A → stop if arm A produced no result → arm B → report.
+
+**Estimate.** `capture_prompts()` runs the threads through the classifier with
+a recorder in the local slot, so the estimate counts the exact Stage 2 prompts.
+Input tokens are prompt characters over `CHARS_PER_TOKEN`; output is
+`ASSUMED_OUTPUT_TOKENS_PER_CALL` per reply (adaptive thinking bills as output
+and cannot be predicted). The plan also prints the ceiling, every reply at
+`max_tokens`. Prices and their date are `PRICES_PER_MTOK` / `PRICES_AS_OF`.
+The API's token counter is itself an API call, so it is not used.
+
+**Outputs.** `<timestamp>_compare_<local>_vs_<model>.md`: one Markdown table,
+scored on the threads both arms answered. It leads with needs_response recall,
+then the error classes in the cost order of `docs/labeling-rubric.md` §3 (D21),
+then per-category precision/recall, errors per arm, median and p90 latency per
+message, and cost. The report holds counts only, no subject, sender, body or
+thread id (`test_report_holds_no_message_content`,
+`test_holds_counts_only_no_thread_ids`). Next to it are two ordinary results
+files, `*_stage2_only_compare-A-*.jsonl` and `*_stage2_only_compare-B-*.jsonl`,
+which `evals.report --compare` reads like any other run.
+
 ## Newsletter Evaluation CLI Reference
 
 The newsletter eval harness mirrors the email eval's 4-stage shape

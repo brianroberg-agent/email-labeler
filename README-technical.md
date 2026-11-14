@@ -28,6 +28,7 @@ email-labeler/
 │   ├── review.py       Interactive CLI for label review and correction
 │   ├── run_eval.py     Replay golden set through real classifier
 │   ├── report.py       Metrics: accuracy, confusion matrix, P/R/F1, privacy
+│   ├── compare.py      Local model vs a Claude model side by side (issue #92)
 │   ├── newsletter_schemas.py  Newsletter golden-set and result dataclasses
 │   ├── newsletter_harvest.py  Pull candidate newsletters → golden set (unlabeled)
 │   ├── newsletter_label.py    Hand-label story quality scores and themes
@@ -557,6 +558,7 @@ Conventions shared by every TUI:
 | `test_eval_schemas.py` | `evals/schemas.py` | GoldenThread/PredictionResult/RunMeta serialization round-trips |
 | `test_eval_harvest.py` | `evals/harvest.py` | Ground truth inference from labels, deduplication and pre-fetch skip of known threads, Gmail query building (`--label`/`--gmail-label` resolution, quoting, ordering, validation), append-only writes, `main()` wiring |
 | `test_eval_report.py` | `evals/report.py` | Confusion matrix, precision/recall/F1, accuracy, privacy violation metrics |
+| `test_eval_compare.py` | `evals/compare.py` | Claude adapter over the real SDK on a mock transport (request shape: effort, no temperature/thinking/fallbacks; `max_tokens`/refusal/reasoning-only replies raise `LLMContentError`; usage totals), client built from the given key alone with `ANTHROPIC_*` set, 429/529 retried, key intake (owner-only file or hidden prompt, never env or argv), price table and cost, prompt capture and estimate, plan text (counts, cost with price date, the real-mail statement, unreachable local model), typed-yes gate, report (paired scoring, cost-ordered error classes, latency, cost, no content), orchestration order (dry run, refusals before any Anthropic call, arm B skipped when arm A produced nothing), key absent from output, CLI flags |
 | `test_eval_newsletter_schemas.py` | `evals/newsletter_schemas.py` | Golden-set/result dataclass round-trips, missing-key tolerance |
 | `test_eval_newsletter_harvest.py` | `evals/newsletter_harvest.py` | Newsletter filtering, body build, dedup, no ground-truth inference |
 | `test_eval_newsletter_label.py` | `evals/newsletter_label.py` | Story curation + per-story scoring/theme pure functions, tier derivation, undo + Pilot UI tests (seed guard, undo stack, delete/label flows, selection, skip-through, autosave) |
