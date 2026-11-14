@@ -18,6 +18,7 @@ import stat
 import statistics
 import tomllib
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,9 +77,21 @@ def obtain_key(key_file: Path | None, *, getpass_fn) -> str:
     key out of that stack). A key file must be private to its owner (no group
     or other permission bits), so a root-only file deleted after the run is
     the file route the README describes.
+
+    Without a terminal, getpass warns (GetPassWarning) and then reads the key
+    with echo on. The warning is raised as an error here, so it stops getpass
+    before the read and the run asks for the key file instead.
     """
     if key_file is None:
-        key = getpass_fn("Anthropic API key (input hidden): ").strip()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            try:
+                key = getpass_fn("Anthropic API key (input hidden): ").strip()
+            except getpass.GetPassWarning:
+                raise ApiKeyError(
+                    "there is no terminal to hide the typed key, so it was not read; put the key "
+                    "in an owner-only file and pass --anthropic-key-file PATH"
+                ) from None
         if not key:
             raise ApiKeyError("the typed key is empty")
         return key

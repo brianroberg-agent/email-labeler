@@ -8,7 +8,12 @@ fixture is synthetic mail (``example.test`` addresses, invented names).
 
 import argparse
 import base64
+import functools
+import getpass
+import io
 import json
+import sys
+import warnings
 
 import anthropic
 import httpx2
@@ -242,6 +247,31 @@ class TestObtainKey:
     def test_an_empty_typed_key_is_refused(self):
         with pytest.raises(compare.ApiKeyError, match="empty"):
             compare.obtain_key(None, getpass_fn=lambda prompt: "   ")
+
+    def test_a_prompt_that_cannot_hide_the_key_is_refused_before_it_is_read(self):
+        # Without a terminal (ssh host 'cmd' without -t), getpass warns with
+        # GetPassWarning and then reads the key with echo on, so it can land in
+        # scrollback. The warning must stop the read and point to the key file.
+        read = []
+
+        def no_terminal_getpass(prompt):
+            warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning, stacklevel=2)
+            read.append(prompt)
+            return SENTINEL_KEY
+
+        with pytest.raises(compare.ApiKeyError, match="--anthropic-key-file"):
+            compare.obtain_key(None, getpass_fn=no_terminal_getpass)
+        assert read == []
+
+    def test_getpass_fallback_leaves_the_key_unread(self, monkeypatch):
+        # The standard library's own no-terminal path, reading from stdin.
+        stdin = io.StringIO(SENTINEL_KEY + "\n")
+        monkeypatch.setattr(sys, "stdin", stdin)
+        fallback = functools.partial(getpass.fallback_getpass, stream=io.StringIO())
+
+        with pytest.raises(compare.ApiKeyError, match="--anthropic-key-file"):
+            compare.obtain_key(None, getpass_fn=fallback)
+        assert stdin.read() == SENTINEL_KEY + "\n"
 
 
 def _no_prompt(prompt):

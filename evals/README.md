@@ -181,7 +181,10 @@ taken from the command line or the environment
 `test_uses_only_the_given_key_whatever_the_environment_holds`), so it does not
 go into agent-stack's `.env` or the assistant's container. The run does not
 print the key or write it to its output files
-(`test_key_is_never_printed_or_written`).
+(`test_key_is_never_printed_or_written`). Without a terminal (for example
+`ssh host 'cmd'` without `-t`) the prompt cannot hide what is typed, so the
+run stops before reading the key and asks for `--anthropic-key-file`
+(`test_getpass_fallback_leaves_the_key_unread`).
 
 ```bash
 uv run --extra compare python -m evals.compare --dry-run   # the plan only
