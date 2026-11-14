@@ -143,15 +143,18 @@ class TestBuildAnthropicClient:
         assert request.url.host == "api.anthropic.com"
 
     async def test_rate_limit_and_overload_replies_are_retried(self):
+        # Three retries: one more than the SDK's default budget of two, so this
+        # passes only with the builder's own retry budget.
         transport = _Transport(
             (429, _error("rate_limit_error"), {"retry-after-ms": "1"}),
             (529, _error("overloaded_error"), {"retry-after-ms": "1"}),
+            (429, _error("rate_limit_error"), {"retry-after-ms": "1"}),
             (200, _message("FYI"), None),
         )
         llm = compare.AnthropicLLMClient(_sdk_client(transport), model="claude-opus-5-5")
 
         assert await llm.complete("S", "U") == "FYI"
-        assert len(transport.requests) == 3
+        assert len(transport.requests) == 4
 
     def test_retry_budget_and_per_request_timeout_are_set(self):
         client = compare.build_anthropic_client(SENTINEL_KEY)
