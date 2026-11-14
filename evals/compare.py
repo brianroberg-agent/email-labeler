@@ -7,20 +7,37 @@ local slot, so both arms see the identical prompt. Usage and the run order are
 in evals/README.md.
 """
 
+import argparse
+import getpass
+import hashlib
+import json
 import math
 import os
 import stat
 import statistics
+import tomllib
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
 
 from classifier import EmailClassifier
+from config_utils import substitute_env_vars
 from evals import report
-from evals.run_eval import evaluate_single, resolve_max_thread_chars
-from evals.schemas import GoldenThread, PredictionResult
+from evals.run_eval import (
+    build_output_path,
+    evaluate_single,
+    load_golden_set,
+    preflight_check,
+    resolve_max_thread_chars,
+    run_evaluation,
+    sanitize_tag,
+    write_results,
+)
+from evals.schemas import GoldenThread, PredictionResult, RunMeta
 from llm_client import LLMClient, LLMContentError
 
 # The population both arms see: Stage 2 on reviewed person threads, i.e.
@@ -40,6 +57,116 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # by the timeout, which matches [llm.local]'s 180 s request budget.
 ANTHROPIC_MAX_RETRIES = 4
 ANTHROPIC_TIMEOUT_SECONDS = 180.0
+
+class ApiKeyError(Exception):
+    """The Anthropic key could not be taken from the source Brian named."""
+
+
+def obtain_key(key_file: Path | None, *, getpass_fn) -> str:
+    """The Anthropic API key, from *key_file* or else typed at a hidden prompt.
+
+    These are the only two sources: the key is not read from argv or from the
+    environment (daemon.py loads the agent-stack .env, and issue #92 keeps the
+    key out of that stack). A key file must be private to its owner (no group
+    or other permission bits), so a root-only file deleted after the run is
+    the file route the README describes.
+    """
+    if key_file is None:
+        key = getpass_fn("Anthropic API key (input hidden): ").strip()
+        if not key:
+            raise ApiKeyError("the typed key is empty")
+        return key
+    try:
+        mode = key_file.stat().st_mode
+        key = key_file.read_text().strip()
+    except OSError as exc:
+        raise ApiKeyError(f"cannot read --anthropic-key-file {key_file}: {exc.strerror}") from None
+    if mode & 0o077:
+        raise ApiKeyError(
+            f"--anthropic-key-file {key_file} is readable beyond its owner "
+            f"(mode {stat.S_IMODE(mode):o}); chmod 600 it first"
+        )
+    if not key:
+        raise ApiKeyError(f"--anthropic-key-file {key_file} is empty")
+    return key
+
+
+@contextmanager
+def _without_anthropic_environment():
+    """Hide every ANTHROPIC_* variable while the SDK client is constructed.
+
+    daemon.py loads .env at import, and the eval README symlinks .env to
+    agent-stack's, so the environment may hold credentials the eval must not
+    use (issue #92). An explicit api_key already stops the SDK reading
+    ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, but it still reads
+    ANTHROPIC_BASE_URL, ANTHROPIC_CUSTOM_HEADERS and the tracing switches at
+    construction; hiding them all keeps the request to the key given here and
+    the fixed base URL.
+    """
+    hidden = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("ANTHROPIC_")}
+    try:
+        yield
+    finally:
+        os.environ.update(hidden)
+
+
+def build_anthropic_client(api_key: str, *, http_client=None) -> anthropic.AsyncAnthropic:
+    """The SDK client for arm B, built from *api_key* alone."""
+    with _without_anthropic_environment():
+        return anthropic.AsyncAnthropic(
+            api_key=api_key, base_url=ANTHROPIC_BASE_URL, http_client=http_client,
+            max_retries=ANTHROPIC_MAX_RETRIES, timeout=ANTHROPIC_TIMEOUT_SECONDS,
+        )
+
+
+class AnthropicLLMClient:
+    """Puts a Claude model behind ``LLMClient.complete``'s interface.
+
+    ``EmailClassifier`` calls ``complete(system, user, include_thinking=True)``
+    and parses the returned answer; this adapter makes that one call through the
+    Messages API, so the classifier's prompt is used unchanged.
+    """
+
+    def __init__(self, client: anthropic.AsyncAnthropic, model: str):
+        self._client = client
+        self.model = model
+        # Totals over every reply received, usable or not: a reply cut at
+        # max_tokens is billed like any other.
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    async def complete(
+        self, system_prompt: str, user_content: str, include_thinking: bool = False,
+    ) -> str | tuple[str, str]:
+        response = await self._client.messages.create(
+            model=self.model,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
+            output_config={"effort": ANTHROPIC_EFFORT},
+        )
+        self.calls += 1
+        self.input_tokens += response.usage.input_tokens
+        self.output_tokens += response.usage.output_tokens
+        # Checked before the content is read: a reply cut at max_tokens or
+        # declined by a safety classifier carries no trustworthy label, so it is
+        # an error for this arm (as llm_client treats finish_reason "length").
+        if response.stop_reason in ("max_tokens", "refusal"):
+            raise LLMContentError(
+                f"Claude {self.model} stopped with stop_reason={response.stop_reason!r}; no answer used"
+            )
+        text = "".join(block.text for block in response.content if block.type == "text")
+        stripped = LLMClient._strip_thinking(text)
+        if not stripped:
+            raise LLMContentError(f"Claude {self.model} returned no answer outside its reasoning")
+        if include_thinking:
+            native = [block.thinking for block in response.content
+                      if block.type == "thinking" and block.thinking]
+            thinking = "\n\n".join(part for part in (*native, LLMClient._extract_thinking(text)) if part)
+            return stripped, thinking
+        return stripped
+
 
 # USD per million tokens, (input, output), from the claude-api skill's model
 # table (cached 2026-11-03; Anthropic first-party rates). These are also the
@@ -320,111 +447,169 @@ async def capture_prompts(threads: list[GoldenThread], config: dict) -> list[tup
     return recorder.prompts
 
 
-class ApiKeyError(Exception):
-    """The Anthropic key could not be taken from the source Brian named."""
+# Arm B's concurrency: modest, so a normal account's rate limit is not the
+# bottleneck; 429s that do occur are retried by the SDK (see above).
+ANTHROPIC_PARALLELISM = 4
+DEFAULT_CONFIG = Path(__file__).parent.parent / "config.toml"
 
 
-def obtain_key(key_file: Path | None, *, getpass_fn) -> str:
-    """The Anthropic API key, from *key_file* or else typed at a hidden prompt.
+def load_config(path: str | None) -> tuple[dict, Path]:
+    config_path = Path(path) if path else DEFAULT_CONFIG
+    with open(config_path, "rb") as f:
+        return substitute_env_vars(tomllib.load(f)), config_path
 
-    These are the only two sources: the key is not read from argv or from the
-    environment (daemon.py loads the agent-stack .env, and issue #92 keeps the
-    key out of that stack). A key file must be private to its owner (no group
-    or other permission bits), so a root-only file deleted after the run is
-    the file route the README describes.
+
+def build_local_llm(config: dict) -> LLMClient:
+    """Arm A's client, built as run_eval builds the local tier (MLX_URL /
+    MLX_API_KEY / [llm.local]). Where MLX_URL points decides where arm A's
+    mail goes: a public stand-in sends it off-network (decision D4)."""
+    local = config["llm"]["local"]
+    return LLMClient(
+        base_url=os.environ.get("MLX_URL", ""),
+        api_key=os.environ.get("MLX_API_KEY", ""),
+        model=local["model"],
+        max_tokens=local["max_tokens"],
+        temperature=local["temperature"],
+        timeout=local["timeout"],
+        extra_body=local.get("extra_body"),
+    )
+
+
+def _write_arm_results(
+    output_dir: Path, tag: str, results: list[PredictionResult], *, config: dict,
+    config_path: Path, golden_path: Path, classifier: EmailClassifier, model: str,
+    parallelism: int, temperature: float | None, max_tokens: int, extra_body: dict | None,
+) -> Path:
+    """One arm's rows as an ordinary run_eval results file (git-ignored), so
+    `evals.report --compare` can re-read the two arms without re-running them."""
+    run_id = uuid.uuid4().hex
+    categories = list(config["prompts"]["email_classification"]["categories"])
+    meta = RunMeta(
+        run_id=run_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        config_hash=hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16],
+        config_path=str(config_path),
+        cloud_model=CloudNotUsed.model,
+        local_model=model,
+        golden_set_path=str(golden_path),
+        golden_set_count=len(results),
+        stages=STAGES,
+        parallelism=parallelism,
+        tag=tag,
+        local_temperature=temperature,
+        local_max_tokens=max_tokens,
+        local_extra_body=extra_body,
+        email_system_prompt=classifier._build_email_prompt(categories),
+    )
+    path = build_output_path(output_dir, STAGES, tag, run_id)
+    write_results(path, meta, results)
+    return path
+
+
+async def run_comparison(
+    args: argparse.Namespace, *, local_llm=None, client_factory=build_anthropic_client,
+    getpass_fn=getpass.getpass, input_fn=input,
+) -> int:
+    """Plan, one typed yes, then both arms and the report. Returns the exit code.
+
+    Order matters: nothing is sent to Anthropic before the plan has been shown,
+    the local model has answered its probe, "yes" has been typed and the key
+    and model have passed a lookup that carries no mail; arm B runs only after
+    arm A has produced results.
     """
-    if key_file is None:
-        key = getpass_fn("Anthropic API key (input hidden): ").strip()
-        if not key:
-            raise ApiKeyError("the typed key is empty")
-        return key
+    config, config_path = load_config(args.config)
+    golden_path = Path(args.golden_set)
+    reviewed = load_golden_set(golden_path, reviewed_only=True)
+    threads = [t for t in reviewed if t.expected_sender_type == SENDER_TYPE]
+    if args.max_threads:
+        threads = threads[:args.max_threads]
+    if not threads:
+        print(f"No reviewed person threads in {golden_path}; nothing to compare.")
+        return 1
+
+    if local_llm is None:
+        local_llm = build_local_llm(config)
+    local_cfg = config["llm"]["local"]
+    unreachable = await preflight_check(
+        None, local_llm, need_cloud=False, need_local=True, local_timeout=local_cfg["timeout"],
+    )
+    max_chars = resolve_max_thread_chars(config)
+    plan = Plan(
+        golden_set_path=str(golden_path),
+        reviewed_threads=len(reviewed),
+        person_threads=len(threads),
+        max_thread_chars=max_chars,
+        local_model=local_llm.model,
+        local_url=local_llm.base_url,
+        local_error="; ".join(unreachable) if unreachable else None,
+        model=args.model,
+        estimate=estimate(args.model, await capture_prompts(threads, config)),
+    )
+    print(format_plan(plan))
+    if unreachable:
+        return 1
+    if args.dry_run:
+        print("\nDry run: nothing was sent anywhere.")
+        return 0
+
+    answer = input_fn(f"\nType yes to send these {len(threads)} threads to Anthropic and run both arms: ")
+    if not confirmed(answer):
+        print("Stopped. Nothing was sent to Anthropic.")
+        return 1
     try:
-        mode = key_file.stat().st_mode
-        key = key_file.read_text().strip()
-    except OSError as exc:
-        raise ApiKeyError(f"cannot read --anthropic-key-file {key_file}: {exc.strerror}") from None
-    if mode & 0o077:
-        raise ApiKeyError(
-            f"--anthropic-key-file {key_file} is readable beyond its owner "
-            f"(mode {stat.S_IMODE(mode):o}); chmod 600 it first"
-        )
-    if not key:
-        raise ApiKeyError(f"--anthropic-key-file {key_file} is empty")
-    return key
-
-
-@contextmanager
-def _without_anthropic_environment():
-    """Hide every ANTHROPIC_* variable while the SDK client is constructed.
-
-    daemon.py loads .env at import, and the eval README symlinks .env to
-    agent-stack's, so the environment may hold credentials the eval must not
-    use (issue #92). An explicit api_key already stops the SDK reading
-    ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, but it still reads
-    ANTHROPIC_BASE_URL, ANTHROPIC_CUSTOM_HEADERS and the tracing switches at
-    construction; hiding them all keeps the request to the key given here and
-    the fixed base URL.
-    """
-    hidden = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("ANTHROPIC_")}
+        client = client_factory(obtain_key(args.anthropic_key_file, getpass_fn=getpass_fn))
+    except ApiKeyError as exc:
+        print(f"Error: {exc}. Nothing was sent to Anthropic.")
+        return 1
     try:
-        yield
-    finally:
-        os.environ.update(hidden)
+        await client.models.retrieve(args.model)
+    except anthropic.APIError as exc:
+        status = getattr(exc, "status_code", None)
+        print(f"Error: Anthropic did not accept the key or the model {args.model} "
+              f"({type(exc).__name__}{f', HTTP {status}' if status else ''}). No mail was sent.")
+        return 1
 
+    output_dir = Path(args.output_dir)
+    local_parallel = config.get("daemon", {}).get("local_parallel", 1)
+    classifier_a = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=local_llm, config=config)
+    print(f"\nArm A: {local_llm.model}, {len(threads)} threads, {local_parallel} at a time...")
+    results_a, _ = await run_evaluation(threads, classifier_a, STAGES, max_chars, parallelism=local_parallel)
+    path_a = _write_arm_results(
+        output_dir, f"compare-A-{sanitize_tag(local_llm.model)}", results_a, config=config,
+        config_path=config_path, golden_path=golden_path, classifier=classifier_a,
+        model=local_llm.model, parallelism=local_parallel, temperature=local_cfg["temperature"],
+        max_tokens=local_cfg["max_tokens"], extra_body=local_cfg.get("extra_body"),
+    )
+    if all(r.error is not None for r in results_a):
+        print(f"Arm A produced no results (see {path_a}), so arm B was not run and nothing "
+              "was sent to Anthropic.")
+        return 1
 
-def build_anthropic_client(api_key: str, *, http_client=None) -> anthropic.AsyncAnthropic:
-    """The SDK client for arm B, built from *api_key* alone."""
-    with _without_anthropic_environment():
-        return anthropic.AsyncAnthropic(
-            api_key=api_key, base_url=ANTHROPIC_BASE_URL, http_client=http_client,
-            max_retries=ANTHROPIC_MAX_RETRIES, timeout=ANTHROPIC_TIMEOUT_SECONDS,
-        )
+    claude = AnthropicLLMClient(client, args.model)
+    classifier_b = EmailClassifier(cloud_llm=CloudNotUsed(), local_llm=claude, config=config)
+    print(f"\nArm B: {args.model}, {len(threads)} threads, {ANTHROPIC_PARALLELISM} at a time...")
+    results_b, _ = await run_evaluation(
+        threads, classifier_b, STAGES, max_chars, parallelism=ANTHROPIC_PARALLELISM,
+    )
+    path_b = _write_arm_results(
+        output_dir, f"compare-B-{args.model}", results_b, config=config,
+        config_path=config_path, golden_path=golden_path, classifier=classifier_b,
+        model=args.model, parallelism=ANTHROPIC_PARALLELISM, temperature=None,
+        max_tokens=ANTHROPIC_MAX_TOKENS, extra_body={"output_config": {"effort": ANTHROPIC_EFFORT}},
+    )
 
-
-class AnthropicLLMClient:
-    """Puts a Claude model behind ``LLMClient.complete``'s interface.
-
-    ``EmailClassifier`` calls ``complete(system, user, include_thinking=True)``
-    and parses the returned answer; this adapter makes that one call through the
-    Messages API, so the classifier's prompt is used unchanged.
-    """
-
-    def __init__(self, client: anthropic.AsyncAnthropic, model: str):
-        self._client = client
-        self.model = model
-        # Totals over every reply received, usable or not: a reply cut at
-        # max_tokens is billed like any other.
-        self.calls = 0
-        self.input_tokens = 0
-        self.output_tokens = 0
-
-    async def complete(
-        self, system_prompt: str, user_content: str, include_thinking: bool = False,
-    ) -> str | tuple[str, str]:
-        response = await self._client.messages.create(
-            model=self.model,
-            max_tokens=ANTHROPIC_MAX_TOKENS,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
-            output_config={"effort": ANTHROPIC_EFFORT},
-        )
-        self.calls += 1
-        self.input_tokens += response.usage.input_tokens
-        self.output_tokens += response.usage.output_tokens
-        # Checked before the content is read: a reply cut at max_tokens or
-        # declined by a safety classifier carries no trustworthy label, so it is
-        # an error for this arm (as llm_client treats finish_reason "length").
-        if response.stop_reason in ("max_tokens", "refusal"):
-            raise LLMContentError(
-                f"Claude {self.model} stopped with stop_reason={response.stop_reason!r}; no answer used"
-            )
-        text = "".join(block.text for block in response.content if block.type == "text")
-        stripped = LLMClient._strip_thinking(text)
-        if not stripped:
-            raise LLMContentError(f"Claude {self.model} returned no answer outside its reasoning")
-        if include_thinking:
-            native = [block.thinking for block in response.content
-                      if block.type == "thinking" and block.thinking]
-            thinking = "\n\n".join(part for part in (*native, LLMClient._extract_thinking(text)) if part)
-            return stripped, thinking
-        return stripped
+    now = datetime.now(timezone.utc)
+    text = build_report(
+        ArmRun(name=f"Arm A: local {local_llm.model}", results=results_a, parallelism=local_parallel),
+        ArmRun(name=f"Arm B: {args.model}", results=results_b, parallelism=ANTHROPIC_PARALLELISM,
+               priced_model=args.model, input_tokens=claude.input_tokens,
+               output_tokens=claude.output_tokens),
+        golden_set_path=str(golden_path), reviewed_threads=len(reviewed), timestamp=now.isoformat(),
+    )
+    report_path = output_dir / (
+        f"{now.strftime('%Y%m%d_%H%M%S')}_compare_{sanitize_tag(local_llm.model)}_vs_{args.model}.md"
+    )
+    report_path.write_text(text)
+    print("\n" + text)
+    print(f"Report: {report_path}\nPer-arm results: {path_a}, {path_b}")
+    return 0

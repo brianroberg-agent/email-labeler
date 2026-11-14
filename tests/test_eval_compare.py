@@ -6,6 +6,7 @@ SDK's own; the local arm and the cloud tier are plain fake classes. Every
 fixture is synthetic mail (``example.test`` addresses, invented names).
 """
 
+import argparse
 import base64
 import json
 
@@ -15,9 +16,9 @@ import pytest
 
 from classifier import EmailClassifier
 from daemon import load_config
-from evals import compare
+from evals import compare, report
 from evals.schemas import GoldenThread, PredictionResult
-from llm_client import LLMContentError
+from llm_client import AvailabilityResult, LLMContentError, LLMUnavailableError
 
 SENTINEL_KEY = "sk-ant-test-SENTINEL-0000"
 
@@ -470,3 +471,220 @@ class TestPercentile:
     ])
     def test_p90_is_nearest_rank(self, values, expected):
         assert compare.percentile(values, 90) == expected
+
+
+class _FakeLocal:
+    """The local slot for orchestration tests: a plain class, as evaluate_single
+    probes its clients with hasattr."""
+
+    model = "qwen-synthetic:8b"
+    base_url = "http://ollama.example.test:11434/v1/chat/completions"
+
+    def __init__(self, *, reachable=True, fail=False):
+        self.reachable = reachable
+        self.fail = fail
+        self.calls = 0
+
+    async def probe(self, timeout=None):
+        if self.reachable:
+            return AvailabilityResult(ok=True, status_code=200)
+        return AvailabilityResult(ok=False, error="ConnectError: connection refused")
+
+    async def complete(self, system_prompt, user_content, include_thinking=False):
+        self.calls += 1
+        if self.fail:
+            raise LLMUnavailableError("synthetic outage", tier="local")
+        return ("FYI", "") if include_thinking else "FYI"
+
+
+class _Router:
+    """Answers the SDK by path: the model lookup, then message requests."""
+
+    def __init__(self, model_status=200):
+        self.model_status = model_status
+        self.requests: list[httpx2.Request] = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        if request.url.path.startswith("/v1/models/"):
+            if self.model_status != 200:
+                return httpx2.Response(self.model_status, json=_error("authentication_error"))
+            return httpx2.Response(200, json={
+                "type": "model", "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+        return httpx2.Response(200, json=_message("<think>reasoning</think>\nNEEDS_RESPONSE"))
+
+    def message_requests(self):
+        return [r for r in self.requests if r.url.path == "/v1/messages"]
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("must not be called on this path")
+
+
+@pytest.fixture
+def golden_file(tmp_path):
+    path = tmp_path / "golden.jsonl"
+    threads = [
+        _thread("900101", label="needs_response", subject="Synthetic subject alpha",
+                body="Synthetic body alpha, can you reply?"),
+        _thread("900102", label="fyi", subject="Synthetic subject beta", body="Synthetic body beta."),
+        _thread("900103", label="low_priority", subject="Synthetic subject gamma",
+                body="Synthetic body gamma, a pitch."),
+        _thread("900104", sender_type="service", label="low_priority",
+                sender="Example Shop <news@shop.example.test>"),
+        _thread("900105", reviewed=False),
+    ]
+    path.write_text("".join(json.dumps(t.to_dict()) + "\n" for t in threads))
+    return path
+
+
+def _args(golden_file, tmp_path, **kw):
+    base = dict(
+        golden_set=str(golden_file), config=None, output_dir=str(tmp_path / "results"),
+        model="claude-opus-5-5", anthropic_key_file=None, dry_run=False, max_threads=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _factory(router, keys):
+    def make(key):
+        keys.append(key)
+        return _sdk_client(router)
+    return make
+
+
+class TestRunComparison:
+    async def test_dry_run_states_the_plan_and_sends_nothing(self, golden_file, tmp_path, capsys):
+        local = _FakeLocal()
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path, dry_run=True), local_llm=local,
+            client_factory=_never, getpass_fn=_never, input_fn=_never,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "3 person threads" in out
+        assert "The golden sets are real mail, and arm B sends them to Anthropic" in out
+        assert "reachable" in out
+        assert local.calls == 0
+        assert not (tmp_path / "results").exists()
+        for content in ("Synthetic subject alpha", "Synthetic body alpha", "pat@example.test"):
+            assert content not in out
+
+    async def test_unreachable_local_model_refuses_before_anything_is_sent(
+        self, golden_file, tmp_path, capsys,
+    ):
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(reachable=False),
+            client_factory=_never, getpass_fn=_never, input_fn=_never,
+        )
+
+        assert code == 1
+        assert "NOT reachable" in capsys.readouterr().out
+
+    async def test_anything_but_yes_stops_before_the_key_is_asked(self, golden_file, tmp_path, capsys):
+        local = _FakeLocal()
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=local,
+            client_factory=_never, getpass_fn=_never, input_fn=lambda prompt: "no",
+        )
+
+        assert code == 1
+        assert local.calls == 0
+        assert "Nothing was sent to Anthropic" in capsys.readouterr().out
+
+    async def test_rejected_key_or_model_stops_before_arm_a(self, golden_file, tmp_path, capsys):
+        router, keys, local = _Router(model_status=401), [], _FakeLocal()
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=local, client_factory=_factory(router, keys),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        assert code == 1
+        assert local.calls == 0
+        assert router.message_requests() == []
+        assert "AuthenticationError" in capsys.readouterr().out
+
+    async def test_arm_b_is_not_run_when_arm_a_produced_nothing(self, golden_file, tmp_path, capsys):
+        router, keys = _Router(), []
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(fail=True),
+            client_factory=_factory(router, keys),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        assert code == 1
+        assert router.message_requests() == []
+        assert "arm B was not run" in capsys.readouterr().out
+
+    async def test_full_run_compares_both_arms_on_person_threads(self, golden_file, tmp_path):
+        router, keys, local = _Router(), [], _FakeLocal()
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=local, client_factory=_factory(router, keys),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        assert code == 0
+        assert keys == [SENTINEL_KEY]
+        assert local.calls == 3
+        assert len(router.message_requests()) == 3
+        results_dir = tmp_path / "results"
+        [report_file] = list(results_dir.glob("*.md"))
+        text = report_file.read_text()
+        rows, _ = _rows(text)
+        assert rows["Errors (no usable answer)"] == ["0/3", "0/3"]  # the cloud slot was never called
+        assert rows["needs_response recall"] == ["0.0% (0/1)", "100.0% (1/1)"]
+        runs = sorted(results_dir.glob("*.jsonl"))
+        assert len(runs) == 2
+        metas = [report.load_results(path)[0] for path in runs]
+        assert {m.local_model for m in metas} == {"qwen-synthetic:8b", "claude-opus-5-5"}
+        assert {m.stages for m in metas} == {"stage2_only"}
+
+    async def test_report_holds_no_message_content(self, golden_file, tmp_path):
+        router = _Router()
+
+        await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(router, []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        [report_file] = list((tmp_path / "results").glob("*.md"))
+        text = report_file.read_text()
+        for content in ("Synthetic subject", "Synthetic body", "pat@example.test", "Pat Example",
+                        "900101", "900102", "900103"):
+            assert content not in text
+
+    async def test_key_is_never_printed_or_written(self, golden_file, tmp_path, capsys):
+        router = _Router()
+
+        await compare.run_comparison(
+            _args(golden_file, tmp_path), local_llm=_FakeLocal(), client_factory=_factory(router, []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        captured = capsys.readouterr()
+        assert SENTINEL_KEY not in captured.out + captured.err
+        written = list((tmp_path / "results").iterdir())
+        assert written
+        for path in written:
+            assert SENTINEL_KEY not in path.read_text()
+
+    async def test_max_threads_caps_what_is_sent(self, golden_file, tmp_path):
+        router, local = _Router(), _FakeLocal()
+
+        await compare.run_comparison(
+            _args(golden_file, tmp_path, max_threads=2), local_llm=local,
+            client_factory=_factory(router, []),
+            getpass_fn=lambda prompt: SENTINEL_KEY, input_fn=lambda prompt: "yes",
+        )
+
+        assert local.calls == 2
+        assert len(router.message_requests()) == 2
