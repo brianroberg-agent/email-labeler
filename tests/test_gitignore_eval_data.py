@@ -19,6 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTENT_BEARING_PATHS = [
     "evals/golden_set.jsonl",
     "evals/results/run.jsonl",
+    # evals.compare's report: counts only, but kept local with the runs it summarizes
+    "evals/results/20261113_120000_compare_local_vs_claude-opus-5-5.md",
     "evals/cache/llm_cache.jsonl",
     "data/newsletter_assessments.jsonl",
     "evals/newsletter_golden_set.jsonl",

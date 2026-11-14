@@ -25,6 +25,8 @@ htmlcov/
 # Classification quality data (contains email content, keep local)
 evals/golden_set.jsonl
 evals/results/*.jsonl
+# evals.compare report (counts only; kept local with the runs it summarizes)
+evals/results/*.md
 evals/cache/
 newsletter_assessments.jsonl
 # Newsletter eval data: golden records hold full newsletter bodies, results and
