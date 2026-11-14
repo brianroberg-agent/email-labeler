@@ -721,3 +721,56 @@ class TestParser:
         assert args.output_dir == "evals/results/"
         assert args.anthropic_key_file is None
         assert args.dry_run is False
+
+
+class TestBuildLocalLlm:
+    def test_built_from_mlx_env_and_the_local_config_section(self, monkeypatch):
+        # Arm A must be the local tier as run_eval builds it: a dropped
+        # extra_body would turn the local model's thinking back on and skew
+        # the comparison without any error.
+        monkeypatch.setenv("MLX_URL", "http://ollama.example.test:11434/v1/chat/completions")
+        monkeypatch.setenv("MLX_API_KEY", "local-synthetic")
+        extra = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
+        config = {"llm": {"local": {
+            "model": "qwen-synthetic:8b", "max_tokens": 4096, "temperature": 0, "timeout": 180,
+            "extra_body": extra,
+        }}}
+
+        llm = compare.build_local_llm(config)
+
+        assert llm.base_url == "http://ollama.example.test:11434/v1/chat/completions"
+        assert llm.api_key == "local-synthetic"
+        assert (llm.model, llm.max_tokens, llm.temperature, llm.timeout) == (
+            "qwen-synthetic:8b", 4096, 0, 180)
+        assert llm.extra_body == extra
+
+
+class TestRunComparisonExits:
+    async def test_a_refused_key_file_stops_before_any_call(self, golden_file, tmp_path, capsys):
+        key_file = tmp_path / "key"
+        key_file.write_text(SENTINEL_KEY)
+        key_file.chmod(0o644)
+        local = _FakeLocal()
+
+        code = await compare.run_comparison(
+            _args(golden_file, tmp_path, anthropic_key_file=key_file), local_llm=local,
+            client_factory=_never, getpass_fn=_never, input_fn=lambda prompt: "yes",
+        )
+
+        assert code == 1
+        assert local.calls == 0
+        out = capsys.readouterr().out
+        assert "chmod 600" in out
+        assert SENTINEL_KEY not in out
+
+    async def test_no_reviewed_person_threads_stops_at_once(self, tmp_path, capsys):
+        golden = tmp_path / "golden.jsonl"
+        golden.write_text(json.dumps(_thread("900201", sender_type="service").to_dict()) + "\n")
+
+        code = await compare.run_comparison(
+            _args(golden, tmp_path), local_llm=_FakeLocal(reachable=False),
+            client_factory=_never, getpass_fn=_never, input_fn=_never,
+        )
+
+        assert code == 1
+        assert "No reviewed person threads" in capsys.readouterr().out
