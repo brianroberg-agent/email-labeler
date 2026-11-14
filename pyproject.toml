@@ -10,7 +10,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The Claude comparison eval (evals/compare.py, issue #92). An extra, not a main
+# dependency: the daemon never calls Anthropic, and the Docker image installs
+# main dependencies only (`uv sync --no-dev`), so the SDK stays out of it.
+compare = [
+    "anthropic>=1.0.0",
+]
 dev = [
+    "anthropic>=1.0.0",
     "pytest>=9.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-subtests>=0.13.0",
