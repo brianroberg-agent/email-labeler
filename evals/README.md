@@ -194,7 +194,8 @@ uv run --extra compare python -m evals.compare             # the plan, one typed
 The plan names the golden set and its counts, both models, whether the local
 model answered, the number of API calls, and the estimated tokens and cost.
 It says plainly that the golden sets are real mail and arm B sends them to
-Anthropic. If the local model does not answer (the MacBook asleep), the run
+Anthropic, and names the host arm A sends them to (the `MLX_URL` host), as an
+API stand-in (decision D4) when `MLX_API_KEY` is set. If the local model does not answer (the MacBook asleep), the run
 stops at the plan, before the yes, the key, or anything sent to Anthropic
 (`test_unreachable_local_model_refuses_before_anything_is_sent`). After "yes"
 and the key, it runs the local arm, then the Claude arm, and writes

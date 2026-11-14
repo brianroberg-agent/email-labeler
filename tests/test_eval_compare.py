@@ -348,6 +348,7 @@ def _plan(**kw):
         golden_set_path="evals/golden_set.jsonl", reviewed_threads=12, person_threads=5,
         max_thread_chars=16000, local_model="qwen-synthetic:8b",
         local_url="http://ollama.example.test:11434/v1/chat/completions", local_error=None,
+        local_stand_in=False,
         model="claude-opus-5-5", estimate=compare.estimate("claude-opus-5-5", prompts),
     )
     base.update(kw)
@@ -388,6 +389,21 @@ class TestPlan:
         assert "The golden sets are real mail, and arm B sends them to Anthropic" in text
         assert ("inputs are deleted within 30 days, and zero retention is available "
                 "under an agreement") in text
+
+    def test_privacy_names_arm_a_destination_host(self):
+        text = compare.format_plan(_plan())
+        privacy = text[text.index("Privacy:"):]
+
+        assert "Arm A sends the same threads to ollama.example.test" in privacy
+        assert "D4" not in privacy
+
+    def test_privacy_flags_an_api_stand_in_for_arm_a(self):
+        text = compare.format_plan(_plan(
+            local_url="https://standin.example.test/v1/chat/completions", local_stand_in=True))
+        privacy = text[text.index("Privacy:"):]
+
+        assert "Arm A sends the same threads to standin.example.test" in privacy
+        assert "API stand-in (decision D4)" in privacy
 
     def test_an_unreachable_local_model_is_stated_and_the_run_refused(self):
         text = compare.format_plan(_plan(local_error="ConnectError: connection refused"))
@@ -624,6 +640,17 @@ class TestRunComparison:
         assert not (tmp_path / "results").exists()
         for content in ("Synthetic subject alpha", "Synthetic body alpha", "pat@example.test"):
             assert content not in out
+
+    async def test_dry_run_flags_an_api_stand_in_when_mlx_api_key_is_set(self, golden_file, tmp_path, capsys):
+        local = _FakeLocal()
+        local.api_key = "local-synthetic"  # build_local_llm puts MLX_API_KEY here
+
+        await compare.run_comparison(
+            _args(golden_file, tmp_path, dry_run=True), local_llm=local,
+            client_factory=_never, getpass_fn=_never, input_fn=_never,
+        )
+
+        assert "API stand-in (decision D4)" in capsys.readouterr().out
 
     async def test_unreachable_local_model_refuses_before_anything_is_sent(
         self, golden_file, tmp_path, capsys,

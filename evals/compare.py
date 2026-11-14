@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import anthropic
 
@@ -256,6 +257,7 @@ class Plan:
     local_model: str
     local_url: str
     local_error: str | None  # None when the local endpoint answered its probe
+    local_stand_in: bool  # MLX_API_KEY is set: a public API stands in (decision D4)
     model: str
     estimate: Estimate
 
@@ -269,6 +271,7 @@ def format_plan(plan: Plan) -> str:
         local_state = "reachable"
     else:
         local_state = f"NOT reachable ({plan.local_error})"
+    local_host = urlsplit(plan.local_url).hostname or "<unset MLX_URL>"
     lines = [
         "Claude comparison eval: plan",
         "",
@@ -294,6 +297,9 @@ def format_plan(plan: Plan) -> str:
         f"(up to {plan.max_thread_chars:,} characters).",
         "             Anthropic publishes its API retention: inputs are deleted within 30 days, "
         "and zero retention is available under an agreement (as issue #92 records it).",
+        f"             Arm A sends the same threads to {local_host}, the MLX_URL host."
+        + (" MLX_API_KEY is set, so that is an API stand-in (decision D4), and arm A's mail "
+           "leaves the network too." if plan.local_stand_in else ""),
     ]
     if plan.local_error is not None:
         lines += [
@@ -565,6 +571,7 @@ async def run_comparison(
         local_model=local_llm.model,
         local_url=local_llm.base_url,
         local_error="; ".join(unreachable) if unreachable else None,
+        local_stand_in=bool(getattr(local_llm, "api_key", "")),
         model=args.model,
         estimate=estimate(args.model, await capture_prompts(threads, config)),
     )
